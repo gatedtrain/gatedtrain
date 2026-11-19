@@ -140,8 +140,9 @@ the interpreter that runs the suite):
 .venv/bin/python -m unittest discover -s tests -t tests
 ```
 
-The full suite takes about 13 minutes on a CPU. Some tests read external sources and skip, naming the variable, when
-it is unset:
+The full suite takes about 13 minutes on a CPU; `.github/workflows/test.yml` runs it on Python 3.12 and 3.13 for
+every push and pull request, with the design set at `rev-19`. Some tests read external sources and skip, naming the
+variable, when it is unset:
 
 | Variable | Contents |
 |---|---|

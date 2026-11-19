@@ -1,0 +1,35 @@
+# Run the test suite on every push and pull request, on CPU, with the design set checked out for the tests that
+# read it. Tests that need NeMo RL or NeMo Evaluator clones or a GPU host's records skip (README "Tests").
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # The design revision this version implements (README "Design references"), outside the checkout.
+      - run: git clone --quiet --depth 1 --branch rev-19 https://github.com/gatedtrain/gatedtrain-design "$RUNNER_TEMP/gatedtrain-design"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install -e '.[tier-a]'
+      - run: python -m unittest discover -s tests -t tests
+        env:
+          GATEDTRAIN_DESIGN_DIR: ${{ runner.temp }}/gatedtrain-design
