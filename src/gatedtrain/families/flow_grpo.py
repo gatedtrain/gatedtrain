@@ -10,6 +10,7 @@ from typing import Any
 
 from ..canonical import canonical_json, file_sha256, manifest_entries, manifest_hash, sha256_bytes, text_lines
 from ..errors import Problem
+from ..paths import resolve
 from ..ext.sdk import (compact_sha256, derive_seed, is_int as _int, is_num as _num, plain_file as _plain_file,
                        read_cut_marker, read_json as _read_json, read_jsonl, read_run_args, safetensors_problem,
                        single_shard as _shard)
@@ -140,7 +141,7 @@ class FlowGrpoAdapter(DiffusersLoraAdapter):
     def _base_entries(self, base: Path) -> list[dict]:
         """The base directory's manifest entries without its `.cache/`, walked once per adapter instance (27.4 GB on
         the real base)."""
-        key = str(Path(base).resolve())
+        key = str(resolve(base))
         if key not in self._base_cache:
             self._base_cache[key] = manifest_entries(Path(base), exclude=self.BASE_EXCLUDES)
         return self._base_cache[key]

@@ -39,6 +39,7 @@ import yaml
 from .. import TAGS
 from ..canonical import canonical_json, file_sha256, sha256_bytes, text_lines
 from ..errors import Problem, Refused
+from ..paths import realpath as _realpath
 from ..renamed import old_schema_note
 
 RECORD_SCHEMA = "gatedtrain.launch_record"
@@ -359,50 +360,6 @@ def _norm(p: str) -> str:
     (EXT-56)."""
     n = posixpath.normpath(p)
     return "/" + n.lstrip("/") if n.startswith("//") else n
-
-
-def _realpath(p: str) -> str:
-    """Lenient `realpath` (the path need not exist), the same on every supported Python: a component that cannot
-    be inspected, or a symbolic link that cannot be read (`/proc/1/root` for another user), is kept as it is and
-    resolution goes on, as Python 3.13 does; Python 3.12's `os.path.realpath` raises on the unreadable link."""
-
-    def join(path: str, rest: str, seen: dict[str, str | None]) -> tuple[str, bool]:
-        if rest.startswith("/"):
-            rest, path = rest[1:], "/"
-        while rest:
-            name, _, rest = rest.partition("/")
-            if not name or name == ".":
-                continue
-            if name == "..":
-                if path:
-                    path, name = posixpath.split(path)
-                    if name == "..":
-                        path = posixpath.join(path, "..", "..")
-                else:
-                    path = ".."
-                continue
-            new = posixpath.join(path, name)
-            try:
-                link = stat.S_ISLNK(os.lstat(new).st_mode)
-                target = os.readlink(new) if link else ""
-            except OSError:
-                link = False
-            if not link:
-                path = new
-                continue
-            if new in seen:                                    # a link met again: resolved, or a loop
-                if seen[new] is not None:
-                    path = seen[new]
-                    continue
-                return posixpath.join(new, rest), False
-            seen[new] = None
-            path, ok = join(path, target, seen)
-            if not ok:
-                return posixpath.join(path, rest), False
-            seen[new] = path
-        return path, True
-
-    return posixpath.abspath(join("", os.fspath(p), {})[0])
 
 
 def _real(p: str) -> str:
@@ -1489,7 +1446,7 @@ def record_problems(record: Any, *, adapter: str, stage_out: Path | None, framew
                                      config=cfg, fresh_output=fresh_output):
         out.append(Problem("EXT-LAUNCH", f"{flag}.{f}", msg, fix))
     output = record.get("output_dir")
-    if stage_out is not None and _abs(output) and Path(output).resolve() != Path(stage_out).resolve():
+    if stage_out is not None and _abs(output) and _realpath(output) != _realpath(stage_out):
         out.append(Problem("EXT-LAUNCH", f"{flag}.output_dir",
                            f"the record's read-write output {output} is not --stage-out {stage_out}", fix))
     if "output_root" in record and (not _abs(record["output_root"])

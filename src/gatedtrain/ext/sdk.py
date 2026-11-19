@@ -17,6 +17,7 @@ from typing import Any
 
 from ..canonical import file_sha256, sha256_bytes, text_lines
 from ..errors import Problem
+from ..paths import resolve
 
 # File names of the launcher layout every area runtime writes (MULTIMODAL-SPEC section 5).
 RUN_ARGS = "run_args.json"                  # <stage-out>/run_args.json: the launcher's resolved arguments
@@ -201,10 +202,10 @@ def shards_concat_sha256(data: Path) -> str:
 
 def bound_mounts(mounts: Any, host: Path) -> list[dict]:
     """The launch record's read-only mounts whose host path resolves to `host`."""
-    want = Path(host).resolve()
+    want = resolve(host)
     return [m for m in mounts or [] if isinstance(m, dict) and m.get("mode") == "ro"
             and isinstance(m.get("host"), str) and PurePosixPath(m["host"]).is_absolute()
-            and Path(m["host"]).resolve() == want]
+            and resolve(m["host"]) == want]
 
 
 def runtime_script_problems(stage_out: Path, launch: dict) -> list[Problem]:

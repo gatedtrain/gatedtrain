@@ -34,6 +34,7 @@ from .. import ANALYSIS_CODE_VERSION, TAGS
 from ..canonical import (canonical_json, entries_hash, file_sha256, manifest_entries, manifest_hash, sha256_bytes,
                          text_lines, write_canonical)
 from ..errors import Problem, Refused
+from ..paths import resolve
 from . import registry
 from ..gates import _cluster_value_ok as cluster_value_ok
 from .arm import gate_record, meta_differences, provenance_problems, read_lines, read_meta
@@ -537,7 +538,7 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
         seen_paths: dict[Path, str] = {}
         for ci, pair in enumerate(arms_by_clause):
             for arm, info in pair.items():
-                key = Path(info["path"]).resolve()
+                key = resolve(info["path"])
                 if key in seen_paths:
                     problems.append(Problem("EXT-ARM", f"--eval-{arm}", f"{info['path']} is passed twice "
                                             f"({seen_paths[key]} and {arm} of clause {ci})",

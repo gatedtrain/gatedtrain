@@ -527,6 +527,10 @@ Source: the area runtime `<mm-root>/area10-agentic` (README section 0, in partic
   (`/proc/1/root`, `/proc/1/cwd`), where 3.13 keeps the component and goes on. The lenient resolution of a mount
   source (`_real`, used by the socket rule, EXT-40, before the strict EXT-51 check) therefore raised, and the CLI
   exited 1 with a traceback instead of 3 with the refusal (8 subtests of `test_ext_review2` on 3.12). No mount was
-  ever accepted. `_realpath` now resolves the same way on every supported version (an unreadable link is kept as it
-  is), and the two other lenient calls (`_in_tree`, EXT-113, and its message) use it; on 3.13 it returns what
-  `os.path.realpath` returns (4,000 random paths over a tree of links, loops and `..`, plus the `/proc` cases).
+  ever accepted. `Path.resolve()` (not strict) has the same problem, in the SDK's `bound_mounts` and the diffusers
+  family's mount checks among others. `gatedtrain.paths` now holds `realpath` and `resolve`, Python 3.13's lenient
+  `realpath` ported line for line, and every lenient resolution of a path from a request, a launch record or a run
+  output (`ext/` and `families/`) uses them; paths the user names on the command line keep `Path.resolve()`. On 3.13
+  the results are the standard library's; on 3.12 they differ only after a symbolic link loop, where 3.12 stops and
+  3.13 resolves the rest (`tests/test_paths.py`: 2,000 random paths over a tree of link chains, a loop and `..`; the
+  `/proc` cases where the link is not readable).

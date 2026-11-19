@@ -8,6 +8,7 @@ from typing import Any
 
 from ..canonical import canonical_json, entries_hash, manifest_entries, sha256_bytes
 from ..errors import Problem
+from ..paths import resolve
 from ..ext.registry import EVALUATOR_ROWS
 from ..ext.sdk import (compact_sha256, is_int as _int, read_cut_marker, read_json as _read_json, read_jsonl,
                        read_run_args, runtime_script_problems, sha_or_none as _sha_or_none, single_shard as _shard)
@@ -108,7 +109,7 @@ class DiffusersLoraAdapter:
         if entries is None:
             entries = manifest_entries(Path(cut))
         if not is_cut:
-            self._base_cache.setdefault(str(Path(cut).resolve()), entries)    # collect walks the base once
+            self._base_cache.setdefault(str(resolve(cut)), entries)    # collect walks the base once
             h = entries_hash(entries)
             return {"model_hash": h, "cut_hash": h, "components": [e["path"] for e in entries], "base_ref": None}
         if base is None:
@@ -166,10 +167,10 @@ class DiffusersLoraAdapter:
 
         table = _ro_table(mounts)
         out = []
-        if not any(_within(str(Path(base).resolve()), host) for _, host in table):
+        if not any(_within(str(resolve(base)), host) for _, host in table):
             out.append(Problem("EXT-BASE", base_field, f"{flag} mounts no read-only directory that is or holds the "
                                f"spec's base directory {base}", self.BASE_FIX))
-        if not any(_within(str(Path(data).resolve()), host) for _, host in table):
+        if not any(_within(str(resolve(data)), host) for _, host in table):
             out.append(Problem("EXT-DATA", data_field, f"{flag} mounts no read-only directory that is or holds the "
                                f"spec's training prompts {data}", self.DATA_FIX))
         return out
@@ -195,7 +196,7 @@ class DiffusersLoraAdapter:
         # base_ref.json names that base by a 40-hex revision and its files' SHA-256; adapter_config.json agrees.
         got = args.get("base_model")
         hit = container_file(f"{got.rstrip('/')}/model_index.json", mounts) if isinstance(got, str) and got else None
-        if hit is None or Path(hit[1]).parent.resolve() != Path(base).resolve():
+        if hit is None or resolve(Path(hit[1]).parent) != resolve(base):
             out.append(Problem("EXT-BASE", base_field, f"run_args.json base_model {got!r} is not, through a read-only "
                                f"mount, the spec's base directory {base} (MM-21)", self.BASE_FIX))
         rb = args.get("base_ref") if isinstance(args.get("base_ref"), dict) else {}
@@ -244,7 +245,7 @@ class DiffusersLoraAdapter:
                                    "point the training dataset at the run's prompt directory (one train.jsonl)"))
             else:
                 hit = container_file(path, mounts) if isinstance(path, str) else None
-                if hit is None or Path(hit[1]).resolve() != (Path(data) / shard).resolve():
+                if hit is None or resolve(hit[1]) != resolve(Path(data) / shard):
                     out.append(Problem("EXT-DATA", data_field, f"run_args.json train_file {path!r} is not, through a "
                                        f"read-only mount, the spec's shard {Path(data) / shard} (EXT-122)",
                                        self.DATA_FIX))

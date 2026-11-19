@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..canonical import canonical_json, file_sha256, text_lines
+from ..paths import resolve
 from ..renamed import old_schema_note
 
 META_SCHEMA = "gatedtrain.item_eval"
@@ -117,7 +118,7 @@ def _output_ref_problem(arm: Path, ref: Any) -> str | None:
         return f"output_ref path {ref['path']!r} names a file of the arm itself ({', '.join(RESERVED_FILES)})"
     target = (Path(arm) / ref["path"])
     try:
-        inside = target.resolve().is_relative_to(Path(arm).resolve())
+        inside = resolve(target).is_relative_to(resolve(arm))
     except OSError:
         inside = False
     if not inside:
