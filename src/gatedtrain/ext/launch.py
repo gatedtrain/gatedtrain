@@ -361,9 +361,53 @@ def _norm(p: str) -> str:
     return "/" + n.lstrip("/") if n.startswith("//") else n
 
 
+def _realpath(p: str) -> str:
+    """Lenient `realpath` (the path need not exist), the same on every supported Python: a component that cannot
+    be inspected, or a symbolic link that cannot be read (`/proc/1/root` for another user), is kept as it is and
+    resolution goes on, as Python 3.13 does; Python 3.12's `os.path.realpath` raises on the unreadable link."""
+
+    def join(path: str, rest: str, seen: dict[str, str | None]) -> tuple[str, bool]:
+        if rest.startswith("/"):
+            rest, path = rest[1:], "/"
+        while rest:
+            name, _, rest = rest.partition("/")
+            if not name or name == ".":
+                continue
+            if name == "..":
+                if path:
+                    path, name = posixpath.split(path)
+                    if name == "..":
+                        path = posixpath.join(path, "..", "..")
+                else:
+                    path = ".."
+                continue
+            new = posixpath.join(path, name)
+            try:
+                link = stat.S_ISLNK(os.lstat(new).st_mode)
+                target = os.readlink(new) if link else ""
+            except OSError:
+                link = False
+            if not link:
+                path = new
+                continue
+            if new in seen:                                    # a link met again: resolved, or a loop
+                if seen[new] is not None:
+                    path = seen[new]
+                    continue
+                return posixpath.join(new, rest), False
+            seen[new] = None
+            path, ok = join(path, target, seen)
+            if not ok:
+                return posixpath.join(path, rest), False
+            seen[new] = path
+        return path, True
+
+    return posixpath.abspath(join("", os.fspath(p), {})[0])
+
+
 def _real(p: str) -> str:
     """`realpath` of the normal form, lenient (the path need not exist)."""
-    return os.path.realpath(_norm(p))
+    return _realpath(_norm(p))
 
 
 def docker_socket_gids(paths: tuple[str, ...] | None = None) -> set[int]:
@@ -632,7 +676,7 @@ class ArgvBinding:
 
 def _in_tree(host: str, trees: tuple[str, ...]) -> bool:
     """EXT-113: whether the host file's resolved path lies strictly inside one of `trees` (lexical or resolved)."""
-    real = os.path.realpath(host)
+    real = _realpath(host)
     return any(_is_parent(t, real) for tree in trees for t in _variants(tree))
 
 
@@ -685,7 +729,7 @@ def bind_argv(argv: Any, mounts: Any, *, interpreter: str | None = None, trees: 
         return None, (f"argv[0] {argv[0]!r} resolves to {interp[0]}, not a python interpreter (python, python3, "
                       "python3.<N>)" + fix)
     if trees is not None and not _in_tree(interp[1], tuple(trees)):
-        return None, (f"argv[0] {argv[0]!r} resolves to {interp[0]} ({os.path.realpath(interp[1])} on this host), "
+        return None, (f"argv[0] {argv[0]!r} resolves to {interp[0]} ({_realpath(interp[1])} on this host), "
                       f"which lies in no interpreter tree of the adapter ({', '.join(trees) or 'none'}) (EXT-113)")
     si = script_index(argv, interpreter_flags)                                 # EXT-199: `python -I <script>`
     if argv[si].startswith("-"):

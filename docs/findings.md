@@ -519,3 +519,14 @@ Source: the area runtime `<mm-root>/area10-agentic` (README section 0, in partic
 - **Real host data without fixed directory names.** The real-data tests read `GATEDTRAIN_TEST_TIERB_ROOT` (the Tier B host work directory) and `GATEDTRAIN_TEST_MM_ROOT` (the multimodal recipes' root) instead of one data root with fixed subdirectories; the documents cite those files as `<tierb-root>/...` and `<mm-root>/...`.
 - **Kept bytes.** Copies of real outputs (`tests/fixtures/r11/longrun`) keep their old names; recipe runtime schema ids are cited as `<runtime>.<name>`, since the recipes may rename them.
 - **Packaging.** `uv.lock` regenerated without upgrades under the restored `[tool.uv] environments` (macOS only); the sdist holds the package, `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md` and `README.md`, not the tests (they need the full checkout).
+
+## Python 3.12: lenient `realpath` (found by the first CI dry run, 2026-11-19)
+
+- **`ext-launch` and `ext-collect` crashed on 3.12 where they must refuse.** `os.path.realpath` without `strict`
+  raises `PermissionError` on Python 3.12 when a path component is a symbolic link the user may not read
+  (`/proc/1/root`, `/proc/1/cwd`), where 3.13 keeps the component and goes on. The lenient resolution of a mount
+  source (`_real`, used by the socket rule, EXT-40, before the strict EXT-51 check) therefore raised, and the CLI
+  exited 1 with a traceback instead of 3 with the refusal (8 subtests of `test_ext_review2` on 3.12). No mount was
+  ever accepted. `_realpath` now resolves the same way on every supported version (an unreadable link is kept as it
+  is), and the two other lenient calls (`_in_tree`, EXT-113, and its message) use it; on 3.13 it returns what
+  `os.path.realpath` returns (4,000 random paths over a tree of links, loops and `..`, plus the `/proc` cases).
