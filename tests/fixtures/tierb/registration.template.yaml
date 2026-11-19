@@ -1,0 +1,48 @@
+# Tier B fixture registration (prototype, unpromotable).
+# Rendered by tests/_tierb.py: {prompt_set_hash} is replaced with the
+# manifest hash of the exported fixture held-out set. K = 2 keeps the
+# recorded fixture outputs small; the 4090 template (demo/tierb) uses K = 4.
+registration_version: 1
+registration_id: tierb-fixture-superiority-v1
+signed_by: prototype-unsigned
+workflow: tierb-fixture
+gate: quality_gate
+clause:
+  type: superiority
+  metric: reward
+  margin: 0.0
+  alpha: 0.025
+  power: 0.8
+  planning_effect: 0.30
+  sigma_plan: fixed
+  unit: prompt
+  samples_per_prompt: 2
+  eval_seeds: [11, 12]
+  interval: cluster_bootstrap
+  blocking: true
+margin_justification: Fixture value (superiority, delta_sup = 0).
+sigma_pilot:
+  sigma: 0.30
+  source: Fixture value; n_required = ceil((2.8016 * 0.30 / 0.30)^2) = 8 <= 30 prompts.
+prompt_set_hash: "{prompt_set_hash}"
+sampler:
+  name: deployment
+  temperature: 0.7
+  top_p: 1.0
+  max_new_tokens: 1024
+  enable_thinking: false
+evaluators:
+  - id: gsm8k.nemo_evaluator@0.1
+    # R10-5 (decision R10A-2): resolved evaluator identity hash, SHA-256 of the canonical JSON
+    # {benchmark: gsm8k, evaluator: gsm8k.nemo_evaluator@0.1, nemo_evaluator_commit: ea35ba3}.
+    # _tierb.with_scorer swaps in the identity hash that includes the scorer (decision D-4).
+    manifest_hash: "sha256:032ad6d4e93ce7d39a33641679b6bec9d534df21ba7af4b5738858531648739e"
+multiplicity:
+  plan: single_gate
+  family: null
+analysis_code_version: gatedtrain 0.3.0
+bootstrap:
+  replicates: 10000
+  seed: 20261109
+pairing:
+  max_unpaired: 0

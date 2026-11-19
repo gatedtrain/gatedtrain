@@ -1,0 +1,28 @@
+# Negative control: bad training, non-inferiority variant (MVP-SPEC
+# section 5). Same stage as spec-bad-train.yaml; the gate is
+# gate.noninferiority with margin 0.10. Expected: FAIL. prototype, unpromotable.
+workflow: skeleton-addition-demo-bad-train-ni
+version: 1
+budget: {gpu_hours: 0}
+artifacts:
+  base:         {type: model_checkpoint, uri: "file:baseline"}
+  train:        {type: training_dataset, uri: "file:data/train-shuffled"}
+  heldout:      {type: prompt_dataset, uri: "file:data/heldout", disjoint_from: [train]}
+  trainer_cfg:  {type: trainer_config, uri: "file:trainer.yaml"}
+  registration: {type: registration, uri: "file:registration-ni.yaml@sha256:1cf448541420ab3d22f0fdaabfcd329bd2fefb4061ee480913bee868c5b82e7f"}
+stages:
+  - id: sft
+    uses: sft.cpu_stub@0.1
+    algorithm: sft
+    model_family: llm.char_transformer@0.1
+    inputs: {model: base, data: train, config: trainer_cfg}
+    outputs: {model: sft_ckpt}
+  - id: quality_gate_ni
+    uses: gate.noninferiority@1.0
+    evaluator: addition_em.cpu_stub@0.1
+    sampler: deployment
+    inputs: {model: sft_ckpt, baseline: base, prompts: heldout, registration: registration}
+    test: {metric: exact_match, margin: 0.10, alpha: 0.025, power: 0.80, cluster_by: prompt, seeds: 4}
+    on_fail: stop
+    owner: skeleton-demo
+    escalation: [skeleton-demo-lead]

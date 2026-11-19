@@ -1,0 +1,28 @@
+# Area "CAD" GRPO trainer image: the Tier B NeMo RL image (nemo-rl:4f39fd8) with the vLLM files NeMo RL patches at
+# start-up (nemo_rl/models/generation/vllm/patches.py, _apply_vllm_patches) made writable by uid 1000. NeMo RL
+# rewrites those files and creates `<file>.patch_lock` beside them in the VllmGenerationWorker venv, which belongs to
+# nemo-runtime (uid 65532); the trainer runs as 1000:1000 (MM-34 refuses root), so the first GRPO smoke failed with
+# PermissionError on ray_executor.py.patch_lock. Only those ten files and their eight directories change owner;
+# nothing is added or upgraded. Build: docker [--context <context>] build -t gatedtrain-a6-nemo-rl:1 <this directory>
+# nemo-rl:4f39fd8 = a local tag of the image built from NeMo RL's own docker/Dockerfile at commit
+# 4f39fd86289a2ffd5aaf5d202702f7fd7185c924 (see README.md); the reference build had image ID
+# sha256:8cd5b714ea91ec7ea9a976c75b0ae6f6932140cf7a8aea803100de6331a2113a (checked after the build).
+# The final `USER root` is kept on purpose: it is part of the image configuration behind the pinned image ID, and the
+# launcher always runs the container with an explicit `--user` (1000:1000), so the image's default user is not used.
+FROM nemo-rl:4f39fd8
+USER root
+RUN set -eu; \
+    V=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker/lib/python3.13/site-packages/vllm; \
+    for f in distributed/device_communicators/shm_broadcast.py \
+             model_executor/layers/fused_moe/routed_experts_capturer.py \
+             model_executor/layers/fused_moe/runner/moe_runner.py \
+             model_executor/models/deepseek_v2.py \
+             model_executor/models/llama_eagle3.py \
+             model_executor/models/nano_nemotron_vl.py \
+             model_executor/models/radio.py \
+             tool_parsers/utils.py \
+             v1/executor/ray_executor.py \
+             v1/executor/ray_executor_v2.py; do \
+      test -f "$V/$f"; chown 1000:1000 "$V/$f" "$(dirname "$V/$f")"; \
+    done
+USER root

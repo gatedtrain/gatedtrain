@@ -1,0 +1,6 @@
+# Tier B trainer config (tests/README.md section 11.5): names the NeMo RL
+# recipe and the build_command profile. gatedtrain never runs it; see
+# docs/tier-b-runbook.md steps 6 and 7. Use `profile: smoke` for the smoke run.
+backend: nemo_rl
+recipe: examples/configs/grpo_smoke.yaml
+profile: long

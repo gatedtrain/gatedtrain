@@ -1,0 +1,55 @@
+"""Building blocks of registry rows (MULTIMODAL-SPEC section 6) that several adapters' rows share."""
+
+from __future__ import annotations
+
+# Deployable components of an HF LLM directory (08 section 3.6, R12-6; EXT-14, design choice of list):
+# weights, model config, tokenizer files, generation config. Top-level files only.
+HF_LLM_COMPONENTS = ("config.json", "generation_config.json", "model.safetensors", "model-*-of-*.safetensors",
+                     "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json",
+                     "special_tokens_map.json", "vocab.json", "merges.txt", "added_tokens.json",
+                     "chat_template.jinja", "tokenizer.model")
+
+# Read-only mounts can preserve their host path so absolute symlinks keep working.
+# ext-launch normalizes paths and applies system directory restrictions to this layout (EXT-112).
+CONTAINER_PATHS = {"ro_identity": True, "ro_under": ("/inputs",), "rw": ("/out",), "tmpfs": ("/tmp",)}
+
+
+# --- a recipe's runtime directory and its venv (rows that name no host path) ---
+
+def runtime_dir(env_var: str, anchor: str, parents: int = 2) -> str:
+    """The recipe's runtime directory: `env_var` when set, else `<repository>/runtime`, the repository being the
+    `parents`-th parent of `anchor` (the rows module's `__file__`; an editable or source checkout)."""
+    import os
+    from pathlib import Path
+
+    return os.environ.get(env_var) or str(Path(anchor).resolve().parents[parents] / "runtime")
+
+
+def python_tree(runtime: str) -> str | None:
+    """The interpreter tree the runtime's venv was made from (`.venv/pyvenv.cfg` `home` = `<tree>/bin`); None
+    without a venv (ext-launch then refuses the interpreter)."""
+    from pathlib import Path
+
+    try:
+        cfg = (Path(runtime) / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in cfg.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "home" and value.strip():
+            return str(Path(value.strip()).parent)
+    return None
+
+
+def venv_runtime_rows(runtime: str, out_name: str) -> dict:
+    """The host-path keys of a `venv_in_container` training row (EXT-79, EXT-93, EXT-113): the input roots (the
+    interpreter install directory, the runtime directory, the recipe's directory under the host's output root), the
+    scan skips (the runtime venv, the interpreter's site-packages), the interpreter trees and the interpreter."""
+    from pathlib import Path
+
+    tree = python_tree(runtime)
+    version = Path(tree).name.split("-")[1].rsplit(".", 1)[0] if tree else None    # cpython-3.12.16-... -> 3.12
+    return {"input_roots": tuple(([str(Path(tree).parent)] if tree else []) + [runtime, "{output_root}/" + out_name]),
+            "scan_skip": tuple([f"{runtime}/.venv"] + ([f"{tree}/lib/python{version}/site-packages"] if tree else [])),
+            "interpreter_trees": (tree,) if tree else (),
+            "interpreter": f"{runtime}/.venv/bin/python"}

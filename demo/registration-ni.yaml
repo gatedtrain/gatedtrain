@@ -1,0 +1,48 @@
+# Pre-registration for the non-inferiority variant of the bad-training
+# control (05 sections 3.1 and 3.7). prototype, unpromotable.
+# skeleton-stub demo, unsigned.
+registration_version: 1
+registration_id: skeleton-demo-noninferiority-v1
+signed_by: prototype-unsigned
+workflow: skeleton-addition-demo-bad-train-ni
+gate: quality_gate_ni
+clause:
+  type: non_inferiority
+  metric: exact_match
+  margin: 0.10
+  alpha: 0.025
+  power: 0.8
+  planning_effect: 0.0
+  sigma_plan: ucb80
+  unit: prompt
+  samples_per_prompt: 4
+  eval_seeds: [11, 12, 13, 14]
+  interval: cluster_bootstrap
+  blocking: true
+margin_justification: >-
+  Non-inferiority margin delta = 0.10 exact-match points: a loss larger than
+  10 points on 2-digit addition is a regression. Prototype value, not
+  reviewed by a named team.
+sigma_pilot:
+  s: 0.30
+  df: 4
+  source: >-
+    Verifier planning assumption for the prototype (no named-team evaluation
+    history exists).
+prompt_set_hash: "sha256:8a47168b15fd9d311709f0605b2fea4bcda6d9dec872679ae2cad85c22cf6aab"
+sampler:
+  name: deployment
+  temperature: 0.7
+  max_new_tokens: 4
+evaluators:
+  # R10-5 (decision R10A-2): manifest_hash is the resolved stand-in evaluator identity hash, which the
+  # report records as evaluator_hash (gatedtrain.runner.stub_evaluator_hash).
+  - id: addition_em.cpu_stub@0.1
+    manifest_hash: "sha256:e7d57d2f8255899295fa6c8149225f6a949fef00a2b59017c9d080a549aff54f"
+multiplicity:
+  plan: single_gate
+  family: null
+analysis_code_version: gatedtrain 0.3.0
+bootstrap:
+  replicates: 10000
+  seed: 20261109

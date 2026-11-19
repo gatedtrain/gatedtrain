@@ -1,0 +1,13 @@
+2026-11-11T03:17:03Z GUARD started pid=40852
+2026-11-11T09:00:00Z START ext-synthetic-full attempt=1
+2026-11-11T09:05:00Z PREEMPT container=C.123 killed=abc
+2026-11-11T09:05:02Z PREEMPTED ext-synthetic-full attempt=1 rc=137
+2026-11-11T09:05:10Z WAIT ext-synthetic-full: another tenant holds the GPU
+2026-11-11T09:20:00Z START ext-synthetic-full-eval attempt=1
+2026-11-11T09:25:00Z END ext-synthetic-full-eval attempt=1 rc=0
+2026-11-11T09:30:00Z START ext-synthetic-full attempt=2
+2026-11-11T10:00:00Z END ext-synthetic-full attempt=2 rc=1
+2026-11-11T10:10:00Z START ext-synthetic-full attempt=1
+2026-11-11T10:40:00Z END ext-synthetic-full attempt=1 rc=0
+2026-11-11T10:41:00Z REFUSED ext-synthetic-full: budget, projected 25.00 GPU-h > cap 24 (used 23, earlier attempts 0s, estimate 2)
+2026-11-11T10:42:00Z GUARD exited (docker events stream ended)

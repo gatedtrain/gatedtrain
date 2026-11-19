@@ -1,0 +1,30 @@
+# Walking-skeleton demo workflow (prototype, unpromotable).
+# A strict syntactic subset of the 04 section 3 workflow YAML: one training
+# stage and one gate. Stand-in backends are marked skeleton-stub.
+# URIs `file:<path>` are relative to this file's directory. The baseline
+# checkpoint is created first with `gatedtrain warmup demo/warmup.yaml --out demo/baseline`.
+workflow: skeleton-addition-demo
+version: 1
+budget: {gpu_hours: 0}
+artifacts:
+  base:         {type: model_checkpoint, uri: "file:baseline"}
+  train:        {type: training_dataset, uri: "file:data/train"}
+  heldout:      {type: prompt_dataset, uri: "file:data/heldout", disjoint_from: [train]}
+  trainer_cfg:  {type: trainer_config, uri: "file:trainer.yaml"}
+  registration: {type: registration, uri: "file:registration.yaml@sha256:1569326d583f024ee3576d4e59dcd4dca1f78de8b4d5551af4a8acd01a7f7328"}
+stages:
+  - id: sft
+    uses: sft.cpu_stub@0.1
+    algorithm: sft
+    model_family: llm.char_transformer@0.1
+    inputs: {model: base, data: train, config: trainer_cfg}
+    outputs: {model: sft_ckpt}
+  - id: quality_gate
+    uses: gate.superiority@1.0
+    evaluator: addition_em.cpu_stub@0.1
+    sampler: deployment
+    inputs: {model: sft_ckpt, baseline: base, prompts: heldout, registration: registration}
+    test: {metric: exact_match, alpha: 0.025, power: 0.80, mde: 0.10, cluster_by: prompt, seeds: 4}
+    on_fail: stop
+    owner: skeleton-demo
+    escalation: [skeleton-demo-lead]

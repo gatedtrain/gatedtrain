@@ -1,0 +1,11 @@
+# skeleton-stub trainer config for the batch-larger-than-data refusal (MVP
+# re-review finding L-3). batch_size 6000 exceeds the 5000 training rows in
+# data/train, so under drop_last (decision D-1) no batch ever fills; the run
+# must refuse in preflight (exit 3) before creating a run directory.
+# Other values as in trainer.yaml.
+backend: cpu_stub
+seed: 1234
+lr: 0.003
+batch_size: 6000
+max_steps: 2000
+save_period: 500

@@ -1,0 +1,130 @@
+{
+ "_comment": [
+  "Golden build_command contract (tests/README.md section 11.6). Overrides compare as sets per profile;",
+  "{out} and {export} are the out_dir and export_dir arguments. Sources (4f39fd8): draft section 1.4",
+  "(data, prompt, enable_thinking), 1.5 (long profile), 1.6 (save_consolidated=final), section 2 item 7",
+  "(keep_top_k=null); keys checked against the pinned recipe by test_tierb_citations.",
+  "F-17: policy.model_name={base_model} makes training start from the base-model directory the gate hashes;",
+  "{base_model} is launch_spec's base_model argument (a path inside the container for docker).",
+  "F-22: the training container runs with HF_HUB_OFFLINE=1 (base model and data are local after F-17)."
+ ],
+ "args": {
+  "nemo_rl_dir": "/opt/nemo-rl",
+  "out_dir": "/work/out/rl",
+  "export_dir": "/work/export",
+  "image": "nemo-rl:4f39fd8",
+  "work_dir": "/data/gatedtrain-tierb",
+  "hf_cache": "/data/hf-cache",
+  "base_model": "/work/tierb/base-model"
+ },
+ "common_overrides": [
+  "data_plane.enabled=true",
+  "data.shuffle=false",
+  "checkpointing.enabled=true",
+  "checkpointing.keep_top_k=null",
+  "checkpointing.checkpoint_dir={out}/checkpoints",
+  "logger.log_dir={out}/logs",
+  "data.train.dataset_name=ResponseDataset",
+  "++data.train.data_path={export}/train.jsonl",
+  "++data.train.input_key=question",
+  "++data.train.output_key=answer",
+  "data.train.split_validation_size=0",
+  "data.default.prompt_file={export}/nel_gsm8k_prompt.txt",
+  "policy.tokenizer.chat_template_kwargs={enable_thinking:false}",
+  "policy.automodel_cfg.checkpoint.save_consolidated=final",
+  "policy.model_name={base_model}"
+ ],
+ "profiles": {
+  "smoke": {
+   "overrides": [
+    "grpo.max_num_steps=10",
+    "checkpointing.save_period=5",
+    "grpo.num_prompts_per_step=2",
+    "grpo.num_generations_per_prompt=4"
+   ],
+   "samples_per_position": 4
+  },
+  "long": {
+   "overrides": [
+    "grpo.max_num_steps=150",
+    "checkpointing.save_period=25",
+    "grpo.num_prompts_per_step=32",
+    "grpo.num_generations_per_prompt=8",
+    "policy.train_global_batch_size=256",
+    "policy.train_micro_batch_size=8"
+   ],
+   "samples_per_position": 8
+  }
+ },
+ "program": {
+  "local": [
+   "uv",
+   "run",
+   "python",
+   "/opt/nemo-rl/examples/run_grpo.py",
+   "--config",
+   "/opt/nemo-rl/examples/configs/grpo_smoke.yaml"
+  ],
+  "docker": [
+   "uv",
+   "run",
+   "python",
+   "examples/run_grpo.py",
+   "--config",
+   "examples/configs/grpo_smoke.yaml"
+  ]
+ },
+ "cwd": {
+  "local": "/opt/nemo-rl",
+  "docker": "/opt/nemo-rl"
+ },
+ "docker_flag_groups": [
+  [
+   "--rm"
+  ],
+  [
+   "--runtime=nvidia"
+  ],
+  [
+   "--gpus",
+   "all"
+  ],
+  [
+   "--ulimit",
+   "memlock=-1"
+  ],
+  [
+   "--ulimit",
+   "nofile=65535:65535"
+  ],
+  [
+   "-e",
+   "TORCH_CUDA_ARCH_LIST=8.9"
+  ],
+  [
+   "-e",
+   "FLASHINFER_CUDA_ARCH_LIST=8.9"
+  ],
+  [
+   "-e",
+   "HF_HOME=/hf_home"
+  ],
+  [
+   "-v",
+   "/data/hf-cache:/hf_home"
+  ],
+  [
+   "-v",
+   "/data/gatedtrain-tierb:/work"
+  ],
+  [
+   "-w",
+   "/opt/nemo-rl"
+  ],
+  [
+   "-e",
+   "HF_HUB_OFFLINE=1"
+  ]
+ ],
+ "docker_shm_size_required": true
+}

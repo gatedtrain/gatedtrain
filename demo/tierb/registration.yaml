@@ -1,0 +1,61 @@
+# Tier B pre-registration template for the RTX 4090 run (05 section 3.7; TIER-B-SPEC H-8).
+# prototype, unpromotable. Unsigned: no named team has signed it.
+#
+# Before the run (docs/tier-b-runbook.md step 5):
+#   1. replace prompt_set_hash with `prompt_set_hash` from <export>/export.json (the GSM8K test split);
+#   2. put the new SHA-256 of this file into spec.yaml's registration uri;
+#   3. run `gatedtrain validate spec.yaml`.
+# Any later change is an amendment: a new registration and a new hash (05:142).
+# Version 2 is such an amendment of v1: the gate reads the numeric_match scorer (G-21).
+registration_version: 2
+registration_id: tierb-4090-gsm8k-superiority-v2
+signed_by: prototype-unsigned
+workflow: tierb-4090-gsm8k
+gate: quality_gate
+clause:
+  type: superiority
+  metric: reward              # per-sample reward; with evaluators[0].scorer the gate reads scorer_rewards (G-21)
+  margin: 0.0                 # internal_pilot placeholder: delta_sup = 0 (05 section 3.1, "usually 0")
+  alpha: 0.025
+  power: 0.8
+  planning_effect: 0.03       # internal_pilot placeholder: a 3-point gain (estimate; no Qwen3-0.6B curve in the pins)
+  sigma_plan: fixed           # internal_pilot placeholder: no pilot exists; see sigma_pilot below
+  unit: prompt
+  samples_per_prompt: 4
+  eval_seeds: [11, 12, 13, 14]
+  interval: cluster_bootstrap
+  blocking: true
+margin_justification: >-
+  internal_pilot placeholder. Superiority with delta_sup = 0: any held-out
+  GSM8K gain counts. Prototype value, not reviewed by a named team.
+sigma_pilot:
+  sigma: 0.25                 # internal_pilot placeholder SD of per-prompt paired differences (K = 4)
+  source: >-
+    internal_pilot placeholder (no pilot evaluation exists). With sigma 0.25
+    and a 0.03 planning effect, n_required = ceil((2.8016 x 0.25 / 0.03)^2) =
+    546 of the 1,319 test prompts. Replace with a pilot estimate when one exists.
+prompt_set_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"   # PLACEHOLDER: export.json prompt_set_hash
+sampler:
+  name: deployment
+  temperature: 0.7
+  top_p: 1.0
+  max_new_tokens: 1024
+  enable_thinking: false      # G-15: thinking off in training and evaluation
+evaluators:
+  - id: gsm8k.nemo_evaluator@0.1
+    # R10-5 (decision R10A-2): resolved evaluator identity hash (decision D-4), scorer included: SHA-256 of the
+    # canonical JSON {benchmark: gsm8k, evaluator: gsm8k.nemo_evaluator@0.1, nemo_evaluator_commit: ea35ba3,
+    # scorer: numeric_match}. Without a scorer it would be sha256:032ad6d4... (see gatedtrain.tierb).
+    manifest_hash: "sha256:2c196d9d5c5d5699d78e48edf437e3e8a14fe11afdab3d62a3862050965a78e9"
+    # G-21: the default gsm8k scorer (benchmarks/gsm8k.py:42-44) scores Qwen3-0.6B's answer format, not its
+    # answers; numeric_match (scoring/pattern.py:39-43 at ea35ba3) compares the last number instead.
+    scorer: numeric_match       # G-21 (prototype allowlist: numeric_match)
+multiplicity:
+  plan: single_gate
+  family: null
+analysis_code_version: gatedtrain 0.3.0
+bootstrap:
+  replicates: 10000
+  seed: 20261109
+pairing:
+  max_unpaired: 0             # 05 section 3.4 (R10-8): above this count of missing items the gate is MISSING

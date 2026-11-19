@@ -1,0 +1,6 @@
+# Tier B trainer config (test fixture; tests/README.md section 11.5).
+# Names the NeMo RL recipe and the build_command profile; the launch command
+# is built by gatedtrain.backends.nemo_rl, never run by gatedtrain.
+backend: nemo_rl
+recipe: examples/configs/grpo_smoke.yaml
+profile: smoke

@@ -1,0 +1,262 @@
+{
+ "baseline": [
+  {
+   "expected_answer": "18",
+   "extracted_answer": "The answer is: **The answer is $18**.",
+   "latency_ms": 2966.81,
+   "metadata": {
+    "answer": "18",
+    "benchmark": "gsm8k",
+    "eval_seed": 11,
+    "question": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+    "source": "byob"
+   },
+   "model_response": "Let's break down the problem step by step:\n\n1. **Janet's ducks lay 16 eggs per day.**\n   \n   So, each day, she lays 16 eggs.\n\n2. **She eats 3 eggs for breakfast.**\n   \n   So, she eats 3 eggs daily.\n\n3. **She bakes muffins for her friends every day with 4 eggs.**\n   \n   She uses 4 eggs per day for baking muffins.\n\n4. **She sells the remainder at the farmers' market for $2 per fresh duck egg.**\n\n   So, the eggs not used in breakfast or baking are:  \n   $ 16 \\text{ eggs/day} - 3 \\text{ eggs} - 4 \\text{ eggs} = 9 \\text{ eggs/day} $\n\n   These 9 eggs are sold at $2 per egg, so:\n   $ 9 \\times 2 = 18 \\text{ dollars} $\n\n---\n\n### Final Answer:\n\nThe answer is: **The answer is $18**.",
+   "problem_idx": 0,
+   "prompt": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+   "repeat": 0,
+   "reward": 0.0,
+   "scorer_rewards": {
+    "scorer:numeric_match": 1.0
+   },
+   "scoring_details": {
+    "correct": false,
+    "extracted": "The answer is: **The answer is $18**.",
+    "method": "byob_gsm8k",
+    "scorer:numeric_match": {
+     "correct": true,
+     "extracted": "18",
+     "reward": 1.0
+    }
+   },
+   "tokens": 319,
+   "trajectory": [
+    {
+     "agent": {
+      "model_name": "baseline",
+      "name": "nemo-evaluator",
+      "version": "0.1.0"
+     },
+     "final_metrics": {
+      "total_completion_tokens": 220,
+      "total_prompt_tokens": 99,
+      "total_steps": 2
+     },
+     "schema_version": "ATIF-v1.6",
+     "session_id": "da6d990cf27147db",
+     "steps": [
+      {
+       "message": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+       "source": "user",
+       "step_id": 1
+      },
+      {
+       "message": "Let's break down the problem step by step:\n\n1. **Janet's ducks lay 16 eggs per day.**\n   \n   So, each day, she lays 16 eggs.\n\n2. **She eats 3 eggs for breakfast.**\n   \n   So, she eats 3 eggs daily.\n\n3. **She bakes muffins for her friends every day with 4 eggs.**\n   \n   She uses 4 eggs per day for baking muffins.\n\n4. **She sells the remainder at the farmers' market for $2 per fresh duck egg.**\n\n   So, the eggs not used in breakfast or baking are:  \n   $ 16 \\text{ eggs/day} - 3 \\text{ eggs} - 4 \\text{ eggs} = 9 \\text{ eggs/day} $\n\n   These 9 eggs are sold at $2 per egg, so:\n   $ 9 \\times 2 = 18 \\text{ dollars} $\n\n---\n\n### Final Answer:\n\nThe answer is: **The answer is $18**.",
+       "metrics": {
+        "completion_tokens": 220,
+        "prompt_tokens": 99
+       },
+       "model_name": "baseline",
+       "source": "agent",
+       "step_id": 2
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "expected_answer": "18",
+   "extracted_answer": "**",
+   "latency_ms": 2872.06,
+   "metadata": {
+    "answer": "18",
+    "benchmark": "gsm8k",
+    "eval_seed": 12,
+    "question": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+    "source": "byob"
+   },
+   "model_response": "Let's break down the problem step by step.\n\n**Janet's daily activities:**\n\n- **Eats 3 eggs for breakfast** \u2192 3 eggs per day.\n- **Bakes 4 eggs for her friends** \u2192 4 eggs per day.\n- **Lays 16 eggs per day** \u2192 16 eggs per day.\n\nSo, the **remainder** of the eggs she doesn't eat is:\n\n$$\n16 \\text{ eggs/day} - 3 \\text{ eggs} - 4 \\text{ eggs} = 9 \\text{ eggs/day}\n$$\n\n**Earnings from selling the remaining eggs:**\n\n$$\n9 \\text{ eggs/day} \\times \\$2 \\text{ per egg} = \\$18 \\text{ per day}\n$$\n\n---\n\n**Final Answer:**\n\n$$\n\\boxed{\\$18}\n$$",
+   "problem_idx": 0,
+   "prompt": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+   "repeat": 1,
+   "reward": 0.0,
+   "scorer_rewards": {
+    "scorer:numeric_match": 1.0
+   },
+   "scoring_details": {
+    "correct": false,
+    "extracted": "**",
+    "method": "byob_gsm8k",
+    "scorer:numeric_match": {
+     "correct": true,
+     "extracted": "18",
+     "reward": 1.0
+    }
+   },
+   "tokens": 281,
+   "trajectory": [
+    {
+     "agent": {
+      "model_name": "baseline",
+      "name": "nemo-evaluator",
+      "version": "0.1.0"
+     },
+     "final_metrics": {
+      "total_completion_tokens": 182,
+      "total_prompt_tokens": 99,
+      "total_steps": 2
+     },
+     "schema_version": "ATIF-v1.6",
+     "session_id": "7495ea9c61b341b2",
+     "steps": [
+      {
+       "message": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+       "source": "user",
+       "step_id": 1
+      },
+      {
+       "message": "Let's break down the problem step by step.\n\n**Janet's daily activities:**\n\n- **Eats 3 eggs for breakfast** \u2192 3 eggs per day.\n- **Bakes 4 eggs for her friends** \u2192 4 eggs per day.\n- **Lays 16 eggs per day** \u2192 16 eggs per day.\n\nSo, the **remainder** of the eggs she doesn't eat is:\n\n$$\n16 \\text{ eggs/day} - 3 \\text{ eggs} - 4 \\text{ eggs} = 9 \\text{ eggs/day}\n$$\n\n**Earnings from selling the remaining eggs:**\n\n$$\n9 \\text{ eggs/day} \\times \\$2 \\text{ per egg} = \\$18 \\text{ per day}\n$$\n\n---\n\n**Final Answer:**\n\n$$\n\\boxed{\\$18}\n$$",
+       "metrics": {
+        "completion_tokens": 182,
+        "prompt_tokens": 99
+       },
+       "model_name": "baseline",
+       "source": "agent",
+       "step_id": 2
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "candidate": [
+  {
+   "expected_answer": "18",
+   "extracted_answer": "$$",
+   "latency_ms": 3241.74,
+   "metadata": {
+    "answer": "18",
+    "benchmark": "gsm8k",
+    "eval_seed": 11,
+    "question": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+    "source": "byob"
+   },
+   "model_response": "Let's break this problem step by step:\n\n1. **Total eggs per day**:  \n   Janet\u2019s ducks lay **16 eggs per day**.\n\n2. **She eats eggs**:  \n   - **3 eggs per morning** (for breakfast).  \n   - She eats this **3 eggs every morning**.\n\n3. **She uses eggs for baking**:  \n   - She bakes **4 eggs per day** (for her friends).  \n   - This means she uses **4 eggs every day**.\n\n4. **She sells the remainder**:  \n   - The eggs she uses and eats go to her kitchen (eats 3 eggs and uses 4 eggs) and she sells the **remaining eggs** at **$2 per fresh egg**.\n\nSo, let's calculate:\n\n- **Daily eggs**: 16 eggs/day  \n- **Eggs used**:  \n  - 3 eggs (breakfast) + 4 eggs (baking) = 7 eggs/day  \n- **Remainder**: 16 - 7 = **9 eggs per day**\n\nShe sells the remainder at **$2 per egg**:\n\n$$\n9 \\times 2 = \\boxed{18} \\text{ dollars}\n$$\n\n### \u2705 Final Answer:\n$$\n\\boxed{18} \\text{ dollars}\n$$",
+   "problem_idx": 0,
+   "prompt": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+   "repeat": 0,
+   "reward": 0.0,
+   "scorer_rewards": {
+    "scorer:numeric_match": 1.0
+   },
+   "scoring_details": {
+    "correct": false,
+    "extracted": "$$",
+    "method": "byob_gsm8k",
+    "scorer:numeric_match": {
+     "correct": true,
+     "extracted": "18",
+     "reward": 1.0
+    }
+   },
+   "tokens": 374,
+   "trajectory": [
+    {
+     "agent": {
+      "model_name": "candidate",
+      "name": "nemo-evaluator",
+      "version": "0.1.0"
+     },
+     "final_metrics": {
+      "total_completion_tokens": 275,
+      "total_prompt_tokens": 99,
+      "total_steps": 2
+     },
+     "schema_version": "ATIF-v1.6",
+     "session_id": "06494971454047c0",
+     "steps": [
+      {
+       "message": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+       "source": "user",
+       "step_id": 1
+      },
+      {
+       "message": "Let's break this problem step by step:\n\n1. **Total eggs per day**:  \n   Janet\u2019s ducks lay **16 eggs per day**.\n\n2. **She eats eggs**:  \n   - **3 eggs per morning** (for breakfast).  \n   - She eats this **3 eggs every morning**.\n\n3. **She uses eggs for baking**:  \n   - She bakes **4 eggs per day** (for her friends).  \n   - This means she uses **4 eggs every day**.\n\n4. **She sells the remainder**:  \n   - The eggs she uses and eats go to her kitchen (eats 3 eggs and uses 4 eggs) and she sells the **remaining eggs** at **$2 per fresh egg**.\n\nSo, let's calculate:\n\n- **Daily eggs**: 16 eggs/day  \n- **Eggs used**:  \n  - 3 eggs (breakfast) + 4 eggs (baking) = 7 eggs/day  \n- **Remainder**: 16 - 7 = **9 eggs per day**\n\nShe sells the remainder at **$2 per egg**:\n\n$$\n9 \\times 2 = \\boxed{18} \\text{ dollars}\n$$\n\n### \u2705 Final Answer:\n$$\n\\boxed{18} \\text{ dollars}\n$$",
+       "metrics": {
+        "completion_tokens": 275,
+        "prompt_tokens": 99
+       },
+       "model_name": "candidate",
+       "source": "agent",
+       "step_id": 2
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "expected_answer": "18",
+   "extracted_answer": "$$",
+   "latency_ms": 2380.3,
+   "metadata": {
+    "answer": "18",
+    "benchmark": "gsm8k",
+    "eval_seed": 12,
+    "question": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+    "source": "byob"
+   },
+   "model_response": "Let\u2019s break this problem step by step:\n\n- **Number of eggs per day**: Janet\u2019s ducks lay **16 eggs per day**.\n- **Breakfast eggs eaten**: She eats **3 eggs** each morning.\n- **Muffin eggs baked**: She bakes **4 eggs** per day.\n- **Eggs sold at farmers' market**: The remainder is sold for **$2 per egg**.\n\n### Step 1: Calculate total eggs per day\n$$\n16 \\text{ eggs/day} - 3 \\text{ eggs (breakfast)} - 4 \\text{ eggs (baking)} = 16 - 3 - 4 = 9 \\text{ eggs/day}\n$$\n\n### Step 2: Calculate the amount made from eggs sold at farmers' market\nShe sells the **9 eggs/day** at **$2 per egg**, so the amount she makes daily is:\n$$\n9 \\times 2 = \\boxed{18} \\text{ dollars}\n$$\n\n### \u2705 Final Answer:\n$$\n\\boxed{18}\n$$",
+   "problem_idx": 0,
+   "prompt": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+   "repeat": 1,
+   "reward": 0.0,
+   "scorer_rewards": {
+    "scorer:numeric_match": 1.0
+   },
+   "scoring_details": {
+    "correct": false,
+    "extracted": "$$",
+    "method": "byob_gsm8k",
+    "scorer:numeric_match": {
+     "correct": true,
+     "extracted": "18",
+     "reward": 1.0
+    }
+   },
+   "tokens": 326,
+   "trajectory": [
+    {
+     "agent": {
+      "model_name": "candidate",
+      "name": "nemo-evaluator",
+      "version": "0.1.0"
+     },
+     "final_metrics": {
+      "total_completion_tokens": 227,
+      "total_prompt_tokens": 99,
+      "total_steps": 2
+     },
+     "schema_version": "ATIF-v1.6",
+     "session_id": "948eced224f14539",
+     "steps": [
+      {
+       "message": "Solve the following math problem step by step. Put your final numerical answer after 'The answer is'.\n\nProblem: Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?",
+       "source": "user",
+       "step_id": 1
+      },
+      {
+       "message": "Let\u2019s break this problem step by step:\n\n- **Number of eggs per day**: Janet\u2019s ducks lay **16 eggs per day**.\n- **Breakfast eggs eaten**: She eats **3 eggs** each morning.\n- **Muffin eggs baked**: She bakes **4 eggs** per day.\n- **Eggs sold at farmers' market**: The remainder is sold for **$2 per egg**.\n\n### Step 1: Calculate total eggs per day\n$$\n16 \\text{ eggs/day} - 3 \\text{ eggs (breakfast)} - 4 \\text{ eggs (baking)} = 16 - 3 - 4 = 9 \\text{ eggs/day}\n$$\n\n### Step 2: Calculate the amount made from eggs sold at farmers' market\nShe sells the **9 eggs/day** at **$2 per egg**, so the amount she makes daily is:\n$$\n9 \\times 2 = \\boxed{18} \\text{ dollars}\n$$\n\n### \u2705 Final Answer:\n$$\n\\boxed{18}\n$$",
+       "metrics": {
+        "completion_tokens": 227,
+        "prompt_tokens": 99
+       },
+       "model_name": "candidate",
+       "source": "agent",
+       "step_id": 2
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

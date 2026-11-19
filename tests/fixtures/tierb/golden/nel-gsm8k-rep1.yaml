@@ -1,0 +1,35 @@
+# Golden NeMo Evaluator config (ea35ba3) for repeat 1 of the fixture
+# registration (tests/fixtures/tierb/registration.template.yaml), rendered by
+#   gatedtrain nel-config --registration <reg> --model-url http://localhost:8000/v1
+#     --model-id baseline --eval-root /work/out/eval/baseline --out <dir>
+# Compared as parsed YAML. Schema: config/eval_config.py:59-66,
+# config/services.py:28-44 (GenerationConfig), :82-105 (ProxyConfig),
+# :240-259 (ExternalApiService), config/benchmarks.py:34-60, config/solvers.py
+# (simple solver), config/output.py:41-49. One seed per run (G-16);
+# enable_thinking false (G-15); no dataset revision key exists at ea35ba3
+# (environments/custom.py:126-148), so the revision is recorded by the export
+# and the report instead (G-17).
+services:
+  model:
+    type: api
+    url: http://localhost:8000/v1/chat/completions
+    protocol: chat_completions
+    model: baseline
+    generation:
+      temperature: 0.7
+      top_p: 1.0
+      max_tokens: 1024
+      seed: 12
+    proxy:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+benchmarks:
+  - name: gsm8k
+    repeats: 1
+    solver:
+      type: simple
+      service: model
+output:
+  dir: /work/out/eval/baseline/rep1
+  timestamped: false

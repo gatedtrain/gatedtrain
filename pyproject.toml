@@ -1,0 +1,63 @@
+[project]
+name = "gatedtrain"
+version = "0.3.0"
+description = "Composable post-training framework: launch, consumption ledger, paired gates and impact for external training runs (prototype)."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [{name = "The gatedtrain Authors"}]
+requires-python = ">=3.12,<3.14"
+keywords = [
+    "post-training",
+    "reinforcement-learning",
+    "fine-tuning",
+    "evaluation",
+    "statistical-testing",
+    "reproducibility",
+    "provenance",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Lower bounds are the versions the test suite was run with (uv.lock, requirements-tierb-host.txt).
+dependencies = [
+    "numpy>=2.5.4",
+    "scipy>=1.18.1",
+    "pyarrow>=26.0.1",
+    "duckdb>=2.0.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+# Tier A (`gatedtrain run`, `warmup` and their tests) trains a small model in process.
+tier-a = ["torch>=2.15.0"]
+
+[project.urls]
+Homepage = "https://github.com/gatedtrain/gatedtrain"
+Source = "https://github.com/gatedtrain/gatedtrain"
+Issues = "https://github.com/gatedtrain/gatedtrain/issues"
+
+[project.scripts]
+gatedtrain = "gatedtrain.cli:main"
+
+# Adapters are plugins of the entry point group `gatedtrain.adapters`, registered by the recipe distributions;
+# gatedtrain itself registers none (its tests use `gatedtrain.testing.synthetic`).
+
+[build-system]
+requires = ["setuptools>=78"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# uv.lock covers macOS only; a Linux host installs requirements-tierb-host.txt instead.
+[tool.uv]
+environments = ["sys_platform == 'darwin'"]

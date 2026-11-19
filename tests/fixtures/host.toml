@@ -1,0 +1,5 @@
+# The default host layout of the test suite (a neutral layout; nothing is created there). _support.py names it as
+# the default GATEDTRAIN_HOST_CONFIG; a test of the layout itself, or one that reads a real host's records
+# (GATEDTRAIN_TEST_TIERB_ROOT), passes its own environment.
+host_work = "/srv/gatedtrain/tierb"
+output_root = "/srv/gatedtrain/mm/out"

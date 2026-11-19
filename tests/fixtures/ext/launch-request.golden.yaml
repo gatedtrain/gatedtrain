@@ -1,0 +1,53 @@
+# ext-launch request for the golden command (tests/README.md section 11.18, EXT-24, EXT-27), adapter `synthetic`.
+# Paths are fixed strings; ext-launch checks the rules on the request, never the host. The shape is a
+# venv_in_container runtime: a CUDA base image by digest plus a host venv and its Python mounted read-only at their
+# own paths; the base model and the export at /inputs; one writable /out; no HF cache mount. `venv_lock` is resolved
+# against the working directory; tests copy fixtures/ext/venv.lock.fixture there as uv.lock. ext-launch resolves
+# every mount source on the launch host (EXT-51), so tests move the `/data/...` paths under a test directory and
+# create them (`test_ext_launch.rooted`); the golden command is compared with that root removed and the hashed label
+# written `<label>`. The EXT-26 credential rule matches whole name components (EXT-55), so TOKENIZERS is not TOKEN.
+# Review round 3 (EXT-63): the output lies under the output root (`/data/gatedtrain-mm/out`), outside host_work; the base
+# model and the export lie under host_work; `test_ext_launch.host_layout` gives ext-launch host_work `/data/gatedtrain-work`,
+# that output root and the input root `/data`.
+area: 1
+label: ext-synthetic-smoke
+host_work: /data/gatedtrain-work
+runtime:
+  kind: venv_in_container
+  image: "docker.io/nvidia/cuda:13.0.3-devel-ubuntu24.04@sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266"
+  venv_lock: uv.lock
+framework: {name: synthetic-trainer, version: "1.0.0", commit: null}
+training_seed: 42
+gpus: true
+network: none
+network_reason: null
+user: "1000:1000"
+env:
+  DO_NOT_TRACK: "1"
+  FLASHINFER_WORKSPACE_BASE: /tmp/cache
+  HF_HOME: /tmp/hf
+  HF_HUB_OFFLINE: "1"
+  HOME: /tmp/home
+  MASTER_ADDR: 127.0.0.1
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  TORCHINDUCTOR_CACHE_DIR: /tmp/cache/inductor
+  TORCH_CUDA_ARCH_LIST: "8.9"
+  TRANSFORMERS_OFFLINE: "1"
+  TRITON_CACHE_DIR: /tmp/cache/triton
+  VLLM_CACHE_ROOT: /tmp/cache/vllm
+  VLLM_CONFIG_ROOT: /tmp/cache/vllm-config
+  VLLM_NO_USAGE_STATS: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  XDG_CACHE_HOME: /tmp/cache
+mounts:
+  - {host: /data/gatedtrain-mm/python, container: /data/gatedtrain-mm/python, mode: ro}
+  - {host: /data/gatedtrain-mm/synthetic-runtime, container: /data/gatedtrain-mm/synthetic-runtime, mode: ro}
+  - {host: /data/gatedtrain-work/ext/a1/base-model, container: /inputs/base-model, mode: ro}
+  - {host: /data/gatedtrain-work/ext/a1/export, container: /inputs/export, mode: ro}
+  - {host: /data/gatedtrain-mm/out/a1/stage-out, container: /out, mode: rw}
+tmpfs: [/tmp]
+output_dir: /data/gatedtrain-mm/out/a1/stage-out
+gpu_est_h: 0.25
+argv: [/data/gatedtrain-mm/synthetic-runtime/.venv/bin/python, /data/gatedtrain-mm/synthetic-runtime/train.py, --profile, smoke, --out, /out]

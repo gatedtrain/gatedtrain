@@ -1,0 +1,8 @@
+# Train the CPU demo baseline with `gatedtrain warmup demo/warmup.yaml --out <dir>`.
+# The short warm-up leaves room to measure the effect of fine-tuning.
+backend: cpu_stub
+data: data/warmup
+seed: 7
+lr: 0.003
+batch_size: 50
+max_steps: 1500

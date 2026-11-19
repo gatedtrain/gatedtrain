@@ -1,0 +1,12 @@
+{"problem_idx": 0, "repeat": 0, "reward": 1.0, "model_response": "5"}
+{"problem_idx": 0, "repeat": 1, "reward": 0.0, "model_response": "6"}
+
+{"problem_idx": "1", "repeat": "0", "reward": 0.0}
+{"problem_idx": 2, "reward": 1.0, "note": "repeat missing -> 0"}
+not json at all
+{"repeat": 3, "reward": 1.0, "note": "no problem_idx -> skipped"}
+{"problem_idx": 3, "repeat": 0, "reward": 0.0}
+{"problem_idx": 3, "repeat": 0, "reward": 1.0, "note": "duplicate key, last wins"}
+{"problem_idx": "x", "repeat": 0, "reward": 1.0, "note": "not an int -> skipped"}
+   {"problem_idx": 4, "repeat": 1, "reward": 0.5}
+{"problem_idx": 5, "repeat": null, "reward": 1.0, "note": "repeat null -> int(None) fails -> skipped"}

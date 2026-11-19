@@ -1,0 +1,9 @@
+# skeleton-stub trainer config for the no-training negative control.
+# Identical to trainer.yaml except lr = 0 (MVP-SPEC section 5). Keep the
+# other values in step with trainer.yaml; lr must stay 0.
+backend: cpu_stub
+seed: 1234
+lr: 0.0
+batch_size: 50
+max_steps: 2000
+save_period: 500

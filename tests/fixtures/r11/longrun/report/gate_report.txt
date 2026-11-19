@@ -1,0 +1,42 @@
+tags: prototype, unpromotable, registration: unsigned; stand-ins: none
+workflow: tierb-4090-gsm8k
+gate_id: quality_gate
+hypothesis_type: superiority
+metric: reward
+metric_source: scorer_rewards[scorer:numeric_match]
+status: PASS
+delta_hat: 0.174943
+interval: [0.158074, 0.192191] level 0.95 cluster_bootstrap
+margin: 0
+alpha_used: 0.025
+power_target: 0.8
+achieved_power: 0.929083
+mde: 0.0245111
+mde_declared: 0.03
+underpowered: false
+sd_diff: 0.317747
+sd_zero: false
+n_prompts: 1319
+unpaired_baseline: 0
+unpaired_candidate: 0
+plan: n_required 546, n_available 1319, mde 0.0192851, sigma_used 0.25 (fixed), underpowered false
+baseline_score: 0.544162
+candidate_score: 0.719105
+registration_hash: sha256:1409e92dc3f1261e7fa6a9a737524c1a40c60302391280a25f20ab2d23fec67e
+registration_signed_by: prototype-unsigned
+prompt_set_hash: sha256:47c1e13489ce8cb9827858e85e5675dd0dc941917d2ee4cee4ef5ff72f31caee
+evaluator_hash: sha256:2c196d9d5c5d5699d78e48edf437e3e8a14fe11afdab3d62a3862050965a78e9
+sampler_hash: sha256:38498fb739ff950185d795b2613edd78893f1bb647452a80a6d7caf4120b1885
+baseline_checkpoint_hash: sha256:76cf82caf4a7f713c3f98937c6878b4ce8284b422cdf38a6dc1c9c15d14bfa2f
+candidate_checkpoint_hash: sha256:512175ef14ccd4e6b3463601d7616a64d6c7d222931fe7a60126e7f37797e13f
+lockfile_hash: sha256:718697df98dc41847a4f7a8f4828826c8d204d7a61ba23f3bccf6985f3fb1f4a
+dataset_revision: 740312add88f781978c0658806c59bc2815b9866
+independence_tier: not-assessed (skeleton)
+transfer_test: not-assessed (skeleton)
+contamination: not-assessed (skeleton)
+family_alpha: not-assessed (skeleton)
+disjoint_from: not-assessed (skeleton)
+stubs: none
+note: NeMo Evaluator sends one seed per run (orchestration/orchestrator.py:881-889 at ea35ba3), so the K registered evaluation seeds come from K single-seed runs merged by ptc-skel merge-eval (G-16); vLLM seeded sampling is reproducible only up to batch-composition numerics.
+note: Training used NeMo Evaluator's GSM8K prompt with Qwen3 thinking off (G-15); part of any gain may be answer-format learning.
+note: The gate reads NeMo Evaluator's numeric_match scorer (G-21): it compares the last number in the response, commas removed, after stripping trailing zeros and then a trailing dot on both sides (scoring/pattern.py:39-43 at ea35ba3), so integers without a trailing dot can match falsely (10 and 1 match; 10. and 1 do not). Observed false-positive rate on the smoke baseline: 25/5,276 = 0.47%.

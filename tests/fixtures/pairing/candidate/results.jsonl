@@ -1,0 +1,7 @@
+{"problem_idx": 0, "repeat": 1, "reward": 1.0}
+{"problem_idx": 0, "repeat": 0, "reward": 1.0}
+{"problem_idx": 1, "repeat": 0, "reward": 1.0}
+{"problem_idx": 2, "repeat": 0, "reward": 1.0}
+{"problem_idx": 3, "repeat": 0, "reward": 0.0}
+{"problem_idx": 4, "repeat": 1, "reward": 1.0}
+{"problem_idx": 7, "repeat": 0, "reward": 1.0, "note": "candidate-only key"}

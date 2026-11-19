@@ -1,0 +1,1 @@
+{"alpha":0.025,"design_effect":1,"hypothesis_type":"superiority","mde":0.019285080151491333,"n_available":1319,"n_required":546,"planning_distance":0.03,"power":0.8,"schema":"ptc_skel.plan","schema_version":"1.0","sigma_plan":"fixed","sigma_used":0.25,"tags":["prototype","unpromotable"],"underpowered":false}

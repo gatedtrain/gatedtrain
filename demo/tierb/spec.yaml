@@ -1,0 +1,33 @@
+# Tier B workflow template for the RTX 4090 run (TIER-B-SPEC H-8; docs/tier-b-runbook.md).
+# prototype, unpromotable. A strict subset of the 04 section 3 grammar: one
+# training stage on unmodified NeMo RL 4f39fd8 and one gate on NeMo Evaluator
+# ea35ba3 results. `gatedtrain run` refuses this spec (it never launches a GPU
+# job); the Tier B path is `gatedtrain tierb-collect` on the recorded outputs.
+# URIs are relative to this file: copy this directory into the host work dir
+# next to export/ (gatedtrain export-gsm8k) and base-model/ (huggingface-cli
+# download --local-dir). Re-pin the registration hash after editing it.
+workflow: tierb-4090-gsm8k
+version: 1
+budget: {gpu_hours: 8}
+artifacts:
+  base:         {type: model_checkpoint, uri: "file:base-model"}
+  train:        {type: training_dataset, uri: "file:export/train"}
+  heldout:      {type: prompt_dataset, uri: "file:export/heldout", disjoint_from: [train]}
+  trainer_cfg:  {type: trainer_config, uri: "file:trainer.yaml"}
+  registration: {type: registration, uri: "file:registration.yaml@sha256:f21a739f02f3827c8ed8ffab478e315832b42ad1565bf096a5937f59021be4c8"}
+stages:
+  - id: rl
+    uses: rl.nemo_rl@0.1
+    algorithm: grpo
+    model_family: llm.qwen3@0.1
+    inputs: {model: base, data: train, config: trainer_cfg}
+    outputs: {model: rl_ckpt}
+  - id: quality_gate
+    uses: gate.superiority@1.0
+    evaluator: gsm8k.nemo_evaluator@0.1
+    sampler: deployment
+    inputs: {model: rl_ckpt, baseline: base, prompts: heldout, registration: registration}
+    test: {metric: reward, alpha: 0.025, power: 0.80, mde: 0.03, cluster_by: prompt, seeds: 4}
+    on_fail: stop
+    owner: skeleton-demo
+    escalation: [skeleton-demo-lead]
