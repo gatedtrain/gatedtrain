@@ -22,6 +22,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .paths import realpath
+
 MAX_SAFE_INT = 2**53 - 1
 MANIFEST_HASH_KIND = "p2_filelist_sha256"
 SCHEMA_VERSION = "1.0"   # format rule 2A, provisional initial value
@@ -221,7 +223,7 @@ def manifest_document(name: str, type_: str, root: Path, tags: tuple[str, ...],
         "schema_version": SCHEMA_VERSION,
         "artifact": name,
         "type": type_,
-        "root": str(Path(root).resolve()),
+        "root": realpath(root),
         "entries": entries,
         "manifest_hash": entries_hash(entries),
         "manifest_hash_kind": MANIFEST_HASH_KIND,

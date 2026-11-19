@@ -30,11 +30,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -e '.[tier-a]'
-      # The launch rules require a run's output directory to be owned by the container's uid 1000 (EXT-63); the
-      # runner's user is another uid, so the tests run as uid 1000.
-      - run: id -u 1000 > /dev/null 2>&1 || sudo useradd --uid 1000 --create-home gatedtrain-test
-      - run: sudo chown -R 1000:1000 "$GITHUB_WORKSPACE"
-      - run: sudo chmod a+x "$HOME" "$(dirname "$GITHUB_WORKSPACE")" "$(dirname "$(dirname "$GITHUB_WORKSPACE")")"
-      - run: sudo -u '#1000' -H env "PATH=$PATH" "GATEDTRAIN_DESIGN_DIR=$GATEDTRAIN_DESIGN_DIR" python -m unittest discover -s tests -t tests
+      # As the runner user: the launch fixtures run the container as the user running the tests (EXT-63).
+      - run: python -m unittest discover -s tests -t tests
         env:
           GATEDTRAIN_DESIGN_DIR: ${{ runner.temp }}/gatedtrain-design
