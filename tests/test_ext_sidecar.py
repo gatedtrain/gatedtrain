@@ -219,20 +219,26 @@ class TestSidecarRefusedIsolation(SidecarCase):
                 self.refused(lambda r: r["sidecar"].update(network=net), "sidecar.network", text="network none")
 
     def test_user(self):
-        """The executor binds its socket with umask 077: only the trainer's uid may connect."""
-        self.refused(lambda r: r["sidecar"].update(user="1001:1001"), "sidecar.user")
+        """The executor binds its socket with umask 077: only the trainer's uid may connect. The whole `uid:gid` must
+        equal the trainer's (1000:1000), so a matching uid with another gid is refused too."""
+        for user in ("1001:1001", "1000:1001", "1001:1000"):
+            with self.subTest(user=user):
+                self.refused(lambda r: r["sidecar"].update(user=user), "sidecar.user",
+                             text=f"user {user!r} is not the trainer's '1000:1000'")
 
     def test_flags(self):
         for key, value in (("read_only", False), ("cap_drop", []), ("cap_drop", ["NET_RAW"]), ("security_opt", []),
                            ("gpus", True), ("gpus", 0), ("read_only", 1)):
             with self.subTest(key=key, value=value):
-                self.refused(lambda r: r["sidecar"].update({key: value}), f"sidecar.{key}", text="B18")
+                self.refused(lambda r: r["sidecar"].update({key: value}), f"sidecar.{key}",
+                             text=f"{key} is {value!r}, not ")
 
     def test_limits(self):
         for key, value in (("memory", "16g"), ("pids", 4096), ("cpus", 8.0), ("core", "0")):
             with self.subTest(key=key, value=value):
-                self.refused(lambda r: r["sidecar"]["limits"].update({key: value}), "sidecar.limits")
-        self.refused(lambda r: r["sidecar"]["limits"].pop("nofile"), "sidecar.limits")
+                self.refused(lambda r: r["sidecar"]["limits"].update({key: value}), "sidecar.limits",
+                             text="are not the executor's")
+        self.refused(lambda r: r["sidecar"]["limits"].pop("nofile"), "sidecar.limits", text="are not the executor's")
 
     def test_tmpfs(self):
         self.refused(lambda r: r["sidecar"].update(tmpfs=["/tmp", "/var/tmp"]), "sidecar.tmpfs")
@@ -298,7 +304,8 @@ class TestSidecarRefusedMounts(SidecarCase):
     def test_spool_not_empty(self):
         """A new launch's spool is empty (fresh, EXT-63)."""
         (self.spool / "stale.sock").write_text("", encoding="utf-8")
-        self.refused(lambda r: None, "sidecar.mounts[1].host", text="the spool")
+        self.refused(lambda r: None, "sidecar.mounts[1].host", text="the spool: spool ")
+        self.refused(lambda r: None, "sidecar.mounts[1].host", text="is not empty; a new run writes into a new, empty")
 
     def test_trainer_does_not_share_the_spool(self):
         self.refused(lambda r: r["mounts"].pop(), "sidecar.mounts", text="0 times")
