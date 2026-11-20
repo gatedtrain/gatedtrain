@@ -69,6 +69,9 @@ SCHEMA = pa.schema([
     ("gen_version", pa.int64()), ("reward_epoch", pa.int64()), ("rewards", pa.list_(pa.float64())),
     ("sampler_config_hash", pa.string()), ("seed_inputs", SEED_INPUTS), ("chunk", CHUNK),
     ("precision", pa.string()), ("derivation", pa.string()), ("writer_id", pa.string()),
+    # Resumed external runs (EXT-RES-1, EXT-RES-5): the attempt number and `kept` | `orphaned`. A ledger written
+    # before them has neither column, and a row without them is a kept row of attempt 0.
+    ("controller_epoch", pa.int64()), ("status", pa.string()),
 ], metadata={
     b"schema": b"gatedtrain.consumption_record",
     b"schema_version": b"1.0",

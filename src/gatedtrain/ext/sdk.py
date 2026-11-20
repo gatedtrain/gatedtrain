@@ -3,6 +3,15 @@ recipe packages import them from here, never from each other).
 
 Standard library only, plus `gatedtrain.canonical` and `gatedtrain.errors` (MM-12: an adapter imports no framework). Every reader
 returns (value, None) or (None, why) instead of raising, so a caller can turn a defect into a `Problem`.
+
+Resumed runs (EXT-RES-1 to EXT-RES-5). A run directory with `attempts.jsonl` is the new layout: ext-collect builds the
+segment chain (`gatedtrain.ext.attempts`) and calls the adapter's
+`consumption(stage_out, data, cuts, *, run_id, chain: list[Segment] | None = None)`, which returns
+`{"rows": [...], "orphaned": [...], "precision": str}`. `rows` are the kept records, `orphaned` the records after a
+non-final attempt's last cut (steps a later attempt ran again); each row carries the segment's `attempt_id`
+(`<run_id>.<A>`), `controller_epoch` A and `status` (`kept` | `orphaned`), and `gatedtrain.ext.attempts.split_steps`
+does the split. An adapter whose `consumption` takes no `chain` keyword is called as before for a run with one
+non-empty attempt, and ext-collect refuses a run with more (EXT-RES-3: "this adapter does not support resumed runs").
 """
 
 from __future__ import annotations

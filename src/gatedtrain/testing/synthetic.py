@@ -14,7 +14,8 @@ The run it reads (`<stage-out>`, the one read-write mount `/out` of the launch):
 - `run_args.json`, the launcher's record of the run's arguments: `model_name_or_path` (the base mount's container
   path), `seed`, `profile`, `dry_run`, `max_steps`, `train_file` (`<export mount>/train.jsonl`), `train_file_sha256`
   (the SHA-256 of the training shards concatenated in file-name order), `rows_per_step` and `shuffle`;
-- `samples.jsonl` (optional): one line `{step, row}` per training row each optimizer step consumed;
+- `samples.jsonl` (optional): one line `{step, row}` per training row each optimizer step consumed; in a resumed
+  run (`attempts.jsonl` present) each line also carries the `attempt` that logged it;
 - `env-freeze.txt` (`name==version` lines, `synthetic-trainer` among them) and `env-runtime.json` (`script_sha256`).
 
 Consumption: with `shuffle` false and a positive integer `rows_per_step` P, optimizer step s read rows P(s-1) .. Ps-1
@@ -37,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from ..canonical import entries_hash, file_sha256, manifest_entries, manifest_hash, text_lines
-from ..errors import Problem
+from ..errors import Problem, Refused
 from ..ext.rowkit import CONTAINER_PATHS, HF_LLM_COMPONENTS
 from ..ext.sdk import (bound_mounts, plain_file, read_run_args, runtime_script_problems, safetensors_problem,
                        shards_concat_sha256)
@@ -161,15 +162,16 @@ def step_rows(per_step: int, total: int, last: int) -> dict[int, range]:
     return out
 
 
-def read_samples(path: Path) -> tuple[dict[int, set[int]] | None, str | None]:
-    """({step: rows logged}, None) from samples.jsonl, or (None, why it cannot be read)."""
+def read_sample_records(path: Path) -> tuple[list[dict] | None, str | None]:
+    """(the lines of samples.jsonl as objects with integer `step` and `row`, None), or (None, why it cannot be read).
+    A resumed run's lines also carry the integer `attempt` that logged them."""
     if not plain_file(path):
         return None, f"{path.name} is not a plain file"
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return None, f"{path.name} cannot be read ({exc.__class__.__name__})"
-    logged: dict[int, set[int]] = {}
+    out: list[dict] = []
     for n, line in enumerate(text_lines(text), start=1):
         if not line.strip():
             continue
@@ -180,8 +182,22 @@ def read_samples(path: Path) -> tuple[dict[int, set[int]] | None, str | None]:
         step, row = (doc.get("step"), doc.get("row")) if isinstance(doc, dict) else (None, None)
         if not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (step, row)):
             return None, f"{path.name} line {n} has no integer `step` and `row`"
-        logged.setdefault(step, set()).add(row)
-    return logged, None
+        out.append(doc)
+    return out, None
+
+
+def logged_rows(records: list[dict]) -> dict[int, set[int]]:
+    """{step: rows logged} of records from `read_sample_records`."""
+    logged: dict[int, set[int]] = {}
+    for doc in records:
+        logged.setdefault(doc["step"], set()).add(doc["row"])
+    return logged
+
+
+def read_samples(path: Path) -> tuple[dict[int, set[int]] | None, str | None]:
+    """({step: rows logged}, None) from samples.jsonl, or (None, why it cannot be read)."""
+    records, why = read_sample_records(path)
+    return (None, why) if records is None else (logged_rows(records), None)
 
 
 class SyntheticAdapter:
@@ -265,11 +281,15 @@ class SyntheticAdapter:
     # --- consumption (MM-22, MM-23) ---
 
     def consumption(self, stage_out: Path, data: Path, cuts: list, *, run_id: str = "",
-                    attempt_id: str = "0") -> dict[str, Any]:
+                    attempt_id: str = "0", chain: list | None = None) -> dict[str, Any]:
+        """The ledger rows of the run. With `chain` (the segments of a resumed run, `gatedtrain.ext.attempts`) the
+        samples.jsonl lines, each tagged with its attempt, are split into kept and orphaned records (EXT-RES-4);
+        the result then also lists `orphaned` rows (one per orphaned (attempt, step, shard)); `rows` are the kept
+        ones, each with its segment's `attempt_id` and `controller_epoch` (EXT-RES-1, EXT-RES-5)."""
         from ..ledger import LEDGER_DERIVATION, WRITER_ID, check_precision, shard_table, step_shards
 
         def stage(why: str) -> dict[str, Any]:
-            return {"precision": "stage", "rows": [], "derivation": None,
+            return {"precision": "stage", "rows": [], "orphaned": [], "derivation": None,
                     "reason": f"{why}; the row order is not shown, so every cut possibly consumed every shard (MM-23)"}
 
         args, why = read_run_args(stage_out)
@@ -293,7 +313,36 @@ class SyntheticAdapter:
         except ValueError as exc:
             return stage(f"the rows per step do not fit the training data ({exc})")
         samples = Path(stage_out) / SAMPLES
-        if samples.exists() or samples.is_symlink():
+        kept_steps: dict[int, Any] = {}               # step -> the segment that keeps it
+        orphan_steps: set[tuple[int, int]] = set()     # (attempt, step)
+        if chain is not None:
+            from ..ext.attempts import split_steps
+
+            by_attempt = {sg.attempt: sg for sg in chain}
+            records = None
+            if samples.exists() or samples.is_symlink():
+                records, why = read_sample_records(samples)
+                if records is None:
+                    return stage(f"{why}, so the reconstructed rows cannot be cross-checked")
+            elif len(chain) > 1:
+                raise Refused([Problem("EXT-RES-4", SAMPLES, f"{SAMPLES} is missing, so the records of the attempts "
+                                       "cannot be split into kept and orphaned",
+                                       "collect a resumed run with the records of every attempt")])
+            if records is not None:
+                kept, orphaned, problems = split_steps(chain, records)
+                if problems:
+                    raise Refused(problems)
+                for doc in kept:
+                    kept_steps[doc["step"]] = by_attempt[doc["attempt"]]
+                orphan_steps = {(doc["attempt"], doc["step"]) for doc in orphaned}
+                for step, want in step_rows(per_step, sum(n for _, n in table), last).items():
+                    got = {doc["row"] for doc in kept if doc["step"] == step}
+                    if got != set(want):
+                        return stage(f"{SAMPLES} logs rows {sorted(got)[:8]} for step {step}, not the reconstructed "
+                                     f"rows {want.start} .. {want.stop - 1}")
+            else:
+                kept_steps = {s: chain[0] for s in range(1, last + 1)}
+        elif samples.exists() or samples.is_symlink():
             logged, why = read_samples(samples)
             if logged is None:
                 return stage(f"{why}, so the reconstructed rows cannot be cross-checked")
@@ -303,18 +352,29 @@ class SyntheticAdapter:
                                  f"{want.start} .. {want.stop - 1}")
         check_precision("iteration", LEDGER_DERIVATION)
         snapshot = manifest_hash(data)
-        rows = []
+
+        def row(step: int, shard: str, att: str, epoch: int | None, status: str | None) -> dict[str, Any]:
+            sample_id = hashlib.sha256(f"{run_id}\x00{att}\x00{step}\x00{shard}".encode()).hexdigest()
+            return {
+                "run_id": run_id, "attempt_id": att, "step": step, "sample_id": "sha256:" + sample_id,
+                "data_ref": {"snapshot": snapshot, "shard": shard, "row": None, "mixture": None, "component": None},
+                "parent_ref": None, "outcome": "consumed", "reason": None, "rule_version": None,
+                "gen_version": None, "reward_epoch": None, "rewards": None, "sampler_config_hash": None,
+                "seed_inputs": None, "chunk": None, "precision": "iteration", "derivation": LEDGER_DERIVATION,
+                "writer_id": WRITER_ID, "controller_epoch": epoch, "status": status}
+
+        rows, orphaned_rows = [], []
         for step in range(1, last + 1):
             for shard in mapping[step]:
-                sample_id = hashlib.sha256(f"{run_id}\x00{attempt_id}\x00{step}\x00{shard}".encode()).hexdigest()
-                rows.append({
-                    "run_id": run_id, "attempt_id": attempt_id, "step": step, "sample_id": "sha256:" + sample_id,
-                    "data_ref": {"snapshot": snapshot, "shard": shard, "row": None, "mixture": None, "component": None},
-                    "parent_ref": None, "outcome": "consumed", "reason": None, "rule_version": None,
-                    "gen_version": None, "reward_epoch": None, "rewards": None, "sampler_config_hash": None,
-                    "seed_inputs": None, "chunk": None, "precision": "iteration", "derivation": LEDGER_DERIVATION,
-                    "writer_id": WRITER_ID})
-        return {"precision": "iteration", "rows": rows, "derivation": LEDGER_DERIVATION,
+                if chain is None:
+                    rows.append(row(step, shard, attempt_id, None, None))
+                else:
+                    sg = kept_steps[step]
+                    rows.append(row(step, shard, sg.attempt_id, sg.attempt, "kept"))
+        for a, step in sorted(orphan_steps):
+            sg = {x.attempt: x for x in chain}[a]
+            orphaned_rows += [row(step, shard, sg.attempt_id, sg.attempt, "orphaned") for shard in mapping[step]]
+        return {"precision": "iteration", "rows": rows, "orphaned": orphaned_rows, "derivation": LEDGER_DERIVATION,
                 "reason": (f"{RUN_ARGS} shows shuffle false and {per_step} rows per optimizer step, so step s read rows "
                            "P(s-1) .. Ps-1 of the training file in file order; shards mapped as MM-22, derivation "
                            "reconstructed" + (f"; {SAMPLES} logs the same rows per step" if samples.exists() else ""))}

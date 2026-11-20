@@ -23,6 +23,9 @@ Counts (05 section 12.4, 05:424; the impact join reports them, 05:463; R10A-9):
 `orphaned` counts the queried shard's ConsumptionRecords (precision
 `iteration`, one per (step, shard)) after the last committed cut; they enter
 no rollup. `superseded` is 0: a skeleton run is one attempt and one segment.
+A resumed external run (EXT-RES-5) also keeps its orphaned rows in the ledger with `status` `orphaned`; the
+first-use query reads only rows whose status is `kept` (or absent), and the run's lineage/orphaned.parquet
+carries the same rows for the counts and ranges.
 
 Design revision 11 (tests/README.md section 11.16):
 - R11-18 (R11A-18): each result carries `derivation`, `reconstructed` if any contributing ledger record is,
@@ -64,7 +67,7 @@ first_use AS (
       ON l.run_id = t.run_id
      AND l.data_ref.snapshot = t.snapshot
      AND l.data_ref.shard = t.shard
-    WHERE l.outcome = 'consumed'
+    WHERE l.outcome = 'consumed'{kept}
     GROUP BY t.run_id, t.stage_id
 )
 SELECT c.checkpoint_hash, c.run_id, c.stage_id, c.last_step_included, f.first_step, f.precision, f.derivation,
@@ -115,6 +118,15 @@ DERIVATION_EXPR = ("CASE WHEN bool_or(l.derivation = 'reconstructed') THEN 'reco
 def _has_derivation(ledgers: list[str]) -> bool:
     """Whether any ledger file has the revision 11 `derivation` column."""
     return any("derivation" in pq.read_schema(p).names for p in ledgers)
+
+
+def _has_status(ledgers: list[str]) -> bool:
+    """Whether any ledger file has the `status` column (EXT-RES-5); a file without it holds only kept rows."""
+    return any("status" in pq.read_schema(p).names for p in ledgers)
+
+
+# EXT-RES-5: an orphaned row enters no rollup; a NULL or absent status is `kept`.
+KEPT_FILTER = "\n      AND COALESCE(l.status, 'kept') = 'kept'"
 
 
 RANGE_QUERY = """
@@ -188,7 +200,9 @@ def impact_query(shard: str, *, run_dir: Path | None = None, runs_root: Path | N
     derivation = DERIVATION_EXPR if _has_derivation(params["ledger"]) else "CAST(NULL AS VARCHAR)"
     con = duckdb.connect(":memory:")
     try:
-        cur = con.execute(QUERY.replace("{derivation}", derivation), params)
+        query = QUERY.replace("{derivation}", derivation).replace(
+            "{kept}", KEPT_FILTER if _has_status(params["ledger"]) else "")
+        cur = con.execute(query, params)
         cols = [c[0] for c in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     finally:

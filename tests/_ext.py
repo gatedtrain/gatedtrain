@@ -341,7 +341,7 @@ def build_stage_out(root: Path, *, steps: tuple[int, ...] = (5, 10), max_steps: 
                     train: Path | None = None, args_mutate: Callable[[dict], None] | None = None,
                     script_sha256: str | None = None) -> Path:
     """A synthetic run's output directory: checkpoint-<N>/ cuts, a model card README.md,
-    and the launcher's env-freeze.txt (MM-33), env-runtime.json, memory.jsonl, attempts.jsonl; with `train`,
+    and the launcher's env-freeze.txt (MM-33), env-runtime.json, memory.jsonl (no attempts.jsonl: that is the old layout, section 11.35); with `train`,
     also run_args.json (`args_mutate` may change it) and samples.jsonl. `final_save` adds top-level
     model files (EXT-13 shows they are not a cut). `script_sha256` goes into env-runtime.json as the launcher writes
     it (EXT-83)."""
@@ -359,8 +359,6 @@ def build_stage_out(root: Path, *, steps: tuple[int, ...] = (5, 10), max_steps: 
     (root / "env-runtime.json").write_text(json.dumps(runtime, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (root / "memory.jsonl").write_text("".join(json.dumps({"step": s, "seconds": 9.5}) + "\n"
                                                for s in range(1, max_steps + 1)), encoding="utf-8")
-    (root / "attempts.jsonl").write_text(json.dumps({"attempt": 1, "started_at": "2026-11-11T09:30:00Z"}) + "\n",
-                                         encoding="utf-8")
     if train is not None:
         args = run_args(train, max_steps=max_steps, save_steps=save_steps)
         if args_mutate is not None:

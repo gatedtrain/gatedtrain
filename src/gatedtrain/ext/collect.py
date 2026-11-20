@@ -20,9 +20,12 @@ See `MULTIMODAL-SPEC.md` and `tests/README.md` for the collection contract.
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,7 @@ from .. import ANALYSIS_CODE_VERSION, TAGS
 from ..canonical import (canonical_json, entries_hash, file_sha256, manifest_entries, manifest_hash, sha256_bytes,
                          text_lines, write_canonical)
 from ..errors import Problem, Refused
+from . import attempts as attempts_mod
 from . import registry
 from .armfs import ArmSnapshot
 from ..gates import _cluster_value_ok as cluster_value_ok
@@ -169,7 +173,8 @@ def exact_overlap(item_rows: list[dict], data: Path, field: str) -> int:
 
 
 def write_lineage(wf, run_dir: Path, *, base_hash: str, base_model_hash: str, data: Path, cfg_path: Path,
-                  cuts: list[dict], item_set_hash: str, precision: str, snapshot: str | None = None) -> None:
+                  cuts: list[dict], item_set_hash: str, precision: str, snapshot: str | None = None,
+                  orphaned: list[dict] = ()) -> None:
     """Lineage for the impact query (MM-17, MM-30; EXT-15): checkpoint rows carry both hashes; the training
     stage `used` the base (manifest and model hash) and the data snapshot at the observed precision; the gate
     `used` model hashes (05 section 3.3, R11-14)."""
@@ -184,7 +189,10 @@ def write_lineage(wf, run_dir: Path, *, base_hash: str, base_model_hash: str, da
     (run_dir / "lineage").mkdir()
     pq.write_table(pa.Table.from_pylist(ckpt_rows), run_dir / "lineage" / "checkpoints.parquet")
     pq.write_table(pa.Table.from_pylist(shard_rows), run_dir / "lineage" / "shards.parquet")
-    pq.write_table(pa.Table.from_pylist([], schema=ORPHAN_SCHEMA), run_dir / "lineage" / "orphaned.parquet")
+    orphan_rows = [{"run_id": run_id, "stage_id": stage_id, "attempt_id": r["attempt_id"], "step": r["step"],
+                    "snapshot": r["data_ref"]["snapshot"], "shard": r["data_ref"]["shard"],
+                    "precision": r["precision"]} for r in orphaned]          # EXT-RES-5
+    pq.write_table(pa.Table.from_pylist(orphan_rows, schema=ORPHAN_SCHEMA), run_dir / "lineage" / "orphaned.parquet")
     last = cuts[-1]
     # MM-18 (EXT-120): a LoRA cut's model hash composes the base and the adapter; one `lora_compose` activity per cut
     # used both and generated the model hash, without merged weights. The id names the cut directory: two cuts may share
@@ -214,6 +222,74 @@ def write_lineage(wf, run_dir: Path, *, base_hash: str, base_model_hash: str, da
             *compose,
         ],
     })
+
+
+def _supports_chain(ad) -> bool:
+    """Whether the adapter's `consumption` takes the segment chain (a `chain` keyword)."""
+    try:
+        return "chain" in inspect.signature(ad.consumption).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def resume_chain(ad, stage_out: Path, launch: dict, cuts: list[dict]) -> tuple[list | None, list[Problem]]:
+    """The segment chain of a new-layout run (attempts.jsonl present; EXT-RES-1 to EXT-RES-4) and its problems.
+    Segment attempt ids carry no run id yet: `_consumption` fills them once the run directory is named."""
+    hw, label = launch.get("host_work"), launch.get("label")
+    if not (isinstance(hw, str) and isinstance(label, str)) or not cuts:
+        return None, []                                   # refused with the launch record or the cuts
+    try:
+        records = attempts_mod.read_attempts(stage_out)
+    except Refused as exc:
+        return None, list(exc.problems)
+    try:
+        guard = attempts_mod.guard_attempts(Path(hw) / "gpu-guard.log", label)
+    except OSError:
+        return None, []                                   # EXT-GPU refuses the unreadable log
+    except ValueError as exc:
+        return None, [Problem("EXT-RES-3", "gpu-guard.log", f"the guard events of {label!r} cannot be aligned with "
+                              f"attempts.jsonl: {exc}", "collect a run whose gpu-guard.log gpu-step.sh wrote")]
+    pairs, problems = attempts_mod.align(records, guard)
+    if problems:
+        return None, problems
+    segs, problems = attempts_mod.segment_chain(pairs, [(c["step"], c["path"]) for c in cuts], run_id="",
+                                                max_steps=max(c["step"] for c in cuts))
+    if problems:
+        return None, problems
+    if len(segs) > 1 and not _supports_chain(ad):
+        return None, [Problem("EXT-RES-3", "--adapter", "this adapter does not support resumed runs "
+                              f"({len(segs)} non-empty attempts)",
+                              "collect with an adapter whose `consumption` takes `chain`, or a run of one attempt")]
+    return segs, []
+
+
+def _consumption(ad, stage_out: Path, data: Path, cuts: list[dict], run_id: str, chain: list | None):
+    """(the adapter's consumption result, the chain with its attempt ids). Without a chain (the old layout) the
+    adapter is called as before. With one, a chain-aware adapter gets it; for any other adapter the chain has one
+    segment (`resume_chain` refuses more), and its kept rows take that segment's attempt id and epoch."""
+    cut_args = [(c["step"], c["path"]) for c in cuts]
+    if chain is None:
+        return ad.consumption(stage_out, data, cut_args, run_id=run_id), None
+    segs = [replace(sg, attempt_id=f"{run_id}.{sg.attempt}") for sg in chain]
+    if _supports_chain(ad):
+        cons = dict(ad.consumption(stage_out, data, cut_args, run_id=run_id, chain=segs))
+    else:
+        cons = dict(ad.consumption(stage_out, data, cut_args, run_id=run_id))
+        cons["rows"] = [{**r, "attempt_id": segs[0].attempt_id, "controller_epoch": segs[0].attempt, "status": "kept"}
+                        for r in cons["rows"]]
+    cons["orphaned"] = list(cons.get("orphaned") or [])
+    return cons, segs
+
+
+def resume_report(chain: list | None, cons: dict) -> dict[str, Any]:
+    """The report keys of a new-layout run (design 5.5): attempt count, restore points, steps run again, and the
+    chain's parents (the ledger has no column for a parent step)."""
+    if chain is None:
+        return {}
+    redone = {(r["attempt_id"], r["step"]) for r in cons["orphaned"]}
+    return {"attempts": len(chain), "restored_at": [sg.branch_step for sg in chain[1:]], "steps_redone": len(redone),
+            "resume_chain": [{"attempt": sg.attempt, "parent": sg.parent, "branch_step": sg.branch_step}
+                             for sg in chain[1:]]}
 
 
 def _paths(x) -> list[Path]:
@@ -447,6 +523,13 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
                                                        data_field=f"artifacts.{names['data']}.uri", **env_kw),
                                      "EXT-STAGE", "--stage-out")                       # EXT-65, EXT-68
 
+    # Resumed runs (EXT-RES-1 to EXT-RES-4): `attempts.jsonl` in the output directory is the new layout; without it
+    # the run is read as before (one attempt, attempt id "0").
+    chain = None
+    if listed and isinstance(launch, dict) and os.path.lexists(stage_out / attempts_mod.ATTEMPTS_FILE):
+        chain, chain_problems = resume_chain(ad, stage_out, launch, cuts)
+        problems += chain_problems
+
     # Observed consumption log (EXT-102): checked before anything is written.
     if cuts and hasattr(ad, "consumption_problems") and data_ok:
         fix = getattr(ad, "consumption_fix", "collect the run's own rollouts.jsonl as the run wrote it (MM-25, MM-27)")
@@ -610,7 +693,7 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
                           base_entries=base_entries, base_model=base_model, cfg_path=cfg_path, cuts=cuts,
                           actual_items_hash=actual_items_hash, launch=launch, framework=framework, gpu_s=gpu_s,
                           wall_s=wall_s,
-                          overlap=overlap, allowed=allowed, incomplete=incomplete,
+                          overlap=overlap, allowed=allowed, incomplete=incomplete, chain=chain,
                           known={data: data_entries, items_dir: items_entries})
     except OSError as exc:                  # EXT-59, EXT-75: a failed write is a refusal; other errors are bugs
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -625,7 +708,7 @@ def _write_run(run_dir: Path, *, wf, ad, adapter: str, row: dict, evaluator: str
                base: Path, base_entries: list, base_model: str, cfg_path: Path, cuts: list[dict],
                actual_items_hash: str, launch: dict, framework: dict, gpu_s: int, overlap: int, allowed: bool,
                incomplete: list, known: dict, wall_s: int | None = None, clusters: dict | None = None,
-               rows: dict | None = None) -> tuple[Path, dict[str, Any], str]:
+               rows: dict | None = None, chain: list | None = None) -> tuple[Path, dict[str, Any], str]:
     """The writes of `collect`, after every check passed. With several clauses (R18-1) `arms` lists one
     {baseline, candidate} pair per clause."""
     if isinstance(arms, list):
@@ -635,7 +718,7 @@ def _write_run(run_dir: Path, *, wf, ad, adapter: str, row: dict, evaluator: str
                                 base_model=base_model, cfg_path=cfg_path, cuts=cuts,
                                 actual_items_hash=actual_items_hash, launch=launch, framework=framework, gpu_s=gpu_s,
                                 overlap=overlap, allowed=allowed, incomplete=incomplete, known=known, wall_s=wall_s,
-                                clusters=clusters or {}, rows=rows or {})
+                                clusters=clusters or {}, rows=rows or {}, chain=chain)
     from ..ledger import SCHEMA as LEDGER_SCHEMA
     from ..registration import deciding_evaluator
     from ..runner import _log, copy_registration, gate_and_report, write_manifests, write_plan
@@ -660,14 +743,14 @@ def _write_run(run_dir: Path, *, wf, ad, adapter: str, row: dict, evaluator: str
     (run_dir / "records").mkdir()
     shutil.copyfile(launch_record, run_dir / "records" / "launch.json")
     shutil.copyfile(smoke_record, run_dir / "records" / "smoke.json")
-    cons = ad.consumption(stage_out, data, [(c["step"], c["path"]) for c in cuts], run_id=run_id)
+    cons, chain = _consumption(ad, stage_out, data, cuts, run_id, chain)
     (run_dir / "ledger").mkdir()
-    pq.write_table(pa.Table.from_pylist(list(cons["rows"]), schema=LEDGER_SCHEMA),
-                   run_dir / "ledger" / "consumption.parquet")
+    pq.write_table(pa.Table.from_pylist(list(cons["rows"]) + (cons["orphaned"] if chain is not None else []),
+                                        schema=LEDGER_SCHEMA), run_dir / "ledger" / "consumption.parquet")
     base_hash = entries_hash(base_entries)
     write_lineage(wf, run_dir, base_hash=base_hash, base_model_hash=base_model, data=data, cfg_path=cfg_path,
                   cuts=cuts, item_set_hash=actual_items_hash, precision=cons["precision"],
-                  snapshot=entries_hash(known[data]))
+                  snapshot=entries_hash(known[data]), orphaned=cons["orphaned"] if chain is not None else ())
     last = cuts[-1]
     hashes = write_manifests(run_dir, base=base, final_ckpt=last["path"], data=data, prompts=items_dir,
                              known_entries={base: base_entries, last["path"]: last["entries"], **known})
@@ -718,7 +801,7 @@ def _write_run(run_dir: Path, *, wf, ad, adapter: str, row: dict, evaluator: str
         extra={"metric_source": f"items.jsonl score ({row['scorer']['name']})", "adapter": adapter,
                "independence_tier": row["tier"], "gpu_seconds": gpu_s, "wall_seconds": wall_s,
                "contamination": {"exact_overlap": overlap, "allowed": allowed},
-               "consumption_precision": cons["precision"],
+               "consumption_precision": cons["precision"], **resume_report(chain, cons),
                "incomplete_cuts": [p.name for p in incomplete],
                "baseline_model_hash": base_model, "candidate_model_hash": last["model_hash"], "notes": notes,
                **disclosures})
@@ -730,7 +813,7 @@ def _write_run_multi(run_dir: Path, *, wf, ad, adapter: str, reg: dict, items_di
                      base: Path, base_entries: list, base_model: str, cfg_path: Path, cuts: list[dict],
                      actual_items_hash: str, launch: dict, framework: dict, gpu_s: int, overlap: int, allowed: bool,
                      incomplete: list, known: dict, wall_s: int | None, clusters: dict,
-                     rows: dict) -> tuple[Path, dict[str, Any], str]:
+                     rows: dict, chain: list | None = None) -> tuple[Path, dict[str, Any], str]:
     """The writes of `collect` for several clauses (R18-1, R18-6): as `_write_run`, with each clause's arms under
     `eval/<arm>/<clause name>/`, one plan per clause, per-clause evaluator fields in the lockfile, and the combined
     gate (`runner.gate_and_report_multi`)."""
@@ -758,14 +841,14 @@ def _write_run_multi(run_dir: Path, *, wf, ad, adapter: str, reg: dict, items_di
     (run_dir / "records").mkdir()
     shutil.copyfile(launch_record, run_dir / "records" / "launch.json")
     shutil.copyfile(smoke_record, run_dir / "records" / "smoke.json")
-    cons = ad.consumption(stage_out, data, [(c["step"], c["path"]) for c in cuts], run_id=run_id)
+    cons, chain = _consumption(ad, stage_out, data, cuts, run_id, chain)
     (run_dir / "ledger").mkdir()
-    pq.write_table(pa.Table.from_pylist(list(cons["rows"]), schema=LEDGER_SCHEMA),
-                   run_dir / "ledger" / "consumption.parquet")
+    pq.write_table(pa.Table.from_pylist(list(cons["rows"]) + (cons["orphaned"] if chain is not None else []),
+                                        schema=LEDGER_SCHEMA), run_dir / "ledger" / "consumption.parquet")
     base_hash = entries_hash(base_entries)
     write_lineage(wf, run_dir, base_hash=base_hash, base_model_hash=base_model, data=data, cfg_path=cfg_path,
                   cuts=cuts, item_set_hash=actual_items_hash, precision=cons["precision"],
-                  snapshot=entries_hash(known[data]))
+                  snapshot=entries_hash(known[data]), orphaned=cons["orphaned"] if chain is not None else ())
     last = cuts[-1]
     hashes = write_manifests(run_dir, base=base, final_ckpt=last["path"], data=data, prompts=items_dir,
                              known_entries={base: base_entries, last["path"]: last["entries"], **known})
@@ -825,7 +908,7 @@ def _write_run_multi(run_dir: Path, *, wf, ad, adapter: str, reg: dict, items_di
         extra={"adapter": adapter, "independence_tier": [rows[ev]["tier"] for ev in evaluators],
                "gpu_seconds": gpu_s, "wall_seconds": wall_s,
                "contamination": {"exact_overlap": overlap, "allowed": allowed},
-               "consumption_precision": cons["precision"],
+               "consumption_precision": cons["precision"], **resume_report(chain, cons),
                "incomplete_cuts": [p.name for p in incomplete],
                "baseline_model_hash": base_model, "candidate_model_hash": last["model_hash"], "notes": notes,
                **disclosures})

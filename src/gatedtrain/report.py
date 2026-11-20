@@ -277,6 +277,19 @@ def _registration_lines(rep: dict[str, Any]) -> list[str]:
     ]
 
 
+RESUMED_SENTENCE = "resumed run: not bit-identical to an uninterrupted run"
+
+
+def _resume_lines(rep: dict[str, Any]) -> list[str]:
+    """A new-layout external run (EXT-RES-5): the attempt count, the steps the later attempts restored at and the
+    steps run again; the disclosure sentence only when the run had more than one attempt (design 5.5)."""
+    if "attempts" not in rep:
+        return []
+    lines = [f"attempts: {rep['attempts']}", f"restored_at: {rep['restored_at']}",
+             f"steps_redone: {rep['steps_redone']}"]
+    return lines + ([RESUMED_SENTENCE] if rep["attempts"] > 1 else [])
+
+
 def _tail_lines(rep: dict[str, Any], unpaired: bool) -> list[str]:
     lines = []
     if "dataset_revision" in rep:
@@ -291,6 +304,7 @@ def _tail_lines(rep: dict[str, Any], unpaired: bool) -> list[str]:
                   f"contamination: exact_overlap={cont['exact_overlap']}",
                   f"contamination_allowed: {_fmt(cont['allowed'])}",
                   f"consumption_precision: {rep['consumption_precision']}",
+                  *_resume_lines(rep),
                   f"incomplete_cuts: {', '.join(rep['incomplete_cuts']) or 'none'}",
                   f"baseline_model_hash: {rep['baseline_model_hash']}",
                   f"candidate_model_hash: {rep['candidate_model_hash']}"]
