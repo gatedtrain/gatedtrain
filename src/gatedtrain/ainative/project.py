@@ -74,6 +74,16 @@ def _write_atomic(path: Path, data: bytes) -> None:
         raise
 
 
+def _refuse_links(root: Path, rel: str) -> None:
+    """Refuse when `stages` or `stages/<stage>` (or the file itself) under the root is a symlink."""
+    cur = root
+    for part in rel.split("/"):
+        cur = cur / part
+        if cur.is_symlink():
+            raise _refuse(rel, f"{part!r} is a symbolic link; records must stay inside the project",
+                          "remove the link; the project store does not follow links")
+
+
 class Project:
     def __init__(self, root: Path, doc: dict[str, Any]) -> None:
         self.root = Path(root)
@@ -114,6 +124,7 @@ class Project:
             raise _refuse(f"{stage}/{name}", f"the record is not canonical JSON: {exc}",
                           "use plain JSON values") from None
         rel = f"stages/{stage}/{name}.json"
+        _refuse_links(self.root, rel)
         _write_atomic(self.root / rel, data)
         return ArtifactRef(stage, name, schema, sha256_bytes(data), rel)
 
@@ -123,6 +134,7 @@ class Project:
         if ref.path != f"stages/{ref.stage}/{ref.name}.json":
             raise _refuse(ref.path, "the reference path does not match its stage and name",
                           "use the reference returned by write_artifact")
+        _refuse_links(self.root, ref.path)
         try:
             data = (self.root / ref.path).read_bytes()
         except OSError as exc:

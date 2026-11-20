@@ -136,6 +136,28 @@ class ProjectStoreTest(unittest.TestCase):
         ref = ArtifactRef("gate", "v", "s", sha256_bytes(canonical_json({"a": 1})), "../evil.json")
         self.refusal(lambda: p.read_artifact(ref))
 
+    def test_symlinked_stage_dirs_refused(self) -> None:
+        p = self.make()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "v.json").write_bytes(canonical_json({"a": 1}))
+        ref = ArtifactRef("gate", "v", "s", sha256_bytes(canonical_json({"a": 1})), "stages/gate/v.json")
+        # stages/<stage> is a link
+        (self.root / "stages").mkdir()
+        (self.root / "stages" / "gate").symlink_to(outside, target_is_directory=True)
+        self.refusal(lambda: p.write_artifact("gate", "new", {"a": 1}, "s"))
+        self.refusal(lambda: p.read_artifact(ref))
+        self.assertEqual(sorted(os.listdir(outside)), ["v.json"])
+        # stages itself is a link
+        (self.root / "stages" / "gate").unlink()
+        (self.root / "stages").rmdir()
+        (self.root / "stages").symlink_to(outside, target_is_directory=True)
+        (outside / "gate").mkdir()
+        (outside / "gate" / "v.json").write_bytes(canonical_json({"a": 1}))
+        self.refusal(lambda: p.write_artifact("gate", "new", {"a": 1}, "s"))
+        self.refusal(lambda: p.read_artifact(ref))
+        self.assertEqual(os.listdir(outside / "gate"), ["v.json"])
+
     def test_append_attempt_is_jsonl(self) -> None:
         p = self.make()
         p.append_attempt({"stage": "gate", "n": 1})
