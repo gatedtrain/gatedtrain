@@ -194,5 +194,87 @@ class AlignTests(Base):
         self.assertIn("EXT-RES-1", self.rules(probs))
 
 
+class FixRoundTests(Base):
+    G1 = ["2026-11-20T10:00:00Z START run-a attempt=1", "2026-11-20T10:30:00Z PREEMPTED run-a attempt=1 rc=143"]
+
+    def test_trailing_empty_preempted_refuses(self):
+        _, probs = self.check([start(1, "2026-11-20T10:00:05Z")], self.G1 + [
+            "2026-11-20T11:00:00Z START run-a attempt=2", "2026-11-20T11:10:00Z PREEMPTED run-a attempt=2 rc=143"])
+        self.assertIn("EXT-RES-3", self.rules(probs))
+        self.assertTrue(any("final attempt" in p.message for p in probs))
+
+    def test_end_ok_then_later_empty_preempted_refuses_about_final(self):
+        _, probs = self.check([start(1, "2026-11-20T10:00:05Z"), end(1, "2026-11-20T10:20:00Z")], [
+            "2026-11-20T10:00:00Z START run-a attempt=1", "2026-11-20T10:25:00Z END run-a attempt=1 rc=0",
+            "2026-11-20T11:00:00Z START run-a attempt=2", "2026-11-20T11:10:00Z PREEMPTED run-a attempt=2 rc=143"])
+        self.assertTrue(any("final attempt" in p.message for p in probs))
+        self.assertFalse(any("non-final attempt has an end line" in p.message for p in probs))
+
+    def test_fractional_and_offset_utc(self):
+        pairs, probs = self.check(
+            [start(1, "2026-11-20T10:00:05.123Z"), end(1, "2026-11-20T12:00:00+00:00")],
+            ["2026-11-20T10:00:00Z START run-a attempt=1", "2026-11-20T12:00:01Z END run-a attempt=1 rc=0"])
+        self.assertEqual(probs, [])
+        self.assertEqual(len(pairs), 1)
+
+    def test_bad_utc_refuses(self):
+        self.write_attempts([start(1, "2026-11-20 10:00:05")])
+        with self.assertRaises(Refused):
+            read_attempts(self.dir)
+
+    def test_same_second_boundary_pairs_with_later_attempt(self):
+        # The run's start is in the same second as PREEMPTED of attempt 1 and START of attempt 2.
+        pairs, probs = self.check(
+            [start(1, "2026-11-20T11:00:00Z"), end(1, "2026-11-20T12:00:00Z")],
+            self.G1[:1] + ["2026-11-20T11:00:00Z PREEMPTED run-a attempt=1 rc=143",
+                           "2026-11-20T11:00:00Z START run-a attempt=2", "2026-11-20T12:00:01Z END run-a attempt=2 rc=0"])
+        self.assertEqual(probs, [])
+        self.assertIsNone(pairs[0][1])
+        self.assertIsNotNone(pairs[1][1])
+
+    def test_start_after_terminator_refuses(self):
+        _, probs = self.check(
+            [start(1, "2026-11-20T10:45:00Z"), end(1, "2026-11-20T12:00:00Z")],
+            self.G1 + ["2026-11-20T11:00:00Z START run-a attempt=2", "2026-11-20T12:00:01Z END run-a attempt=2 rc=0"])
+        self.assertIn("EXT-RES-1", self.rules(probs))
+
+    def test_repaired_must_be_bool(self):
+        self.write_attempts([start(1, "2026-11-20T10:00:05Z"),
+                             start(2, "2026-11-20T11:00:05Z", dict(restore(), repaired="false"))])
+        with self.assertRaises(Refused):
+            read_attempts(self.dir)
+
+    def test_multiple_invocations_attempt_counter_resets(self):
+        pairs, probs = self.check(
+            [start(1, "2026-11-20T10:00:05Z"), start(2, "2026-11-20T11:00:05Z", restore()),
+             end(2, "2026-11-20T12:00:00Z")],
+            self.G1 + ["2026-11-20T11:00:00Z START run-a attempt=1", "2026-11-20T12:00:01Z END run-a attempt=1 rc=0"])
+        self.assertEqual(probs, [])
+        self.assertEqual([g.index for g, _ in pairs], [1, 2])
+
+    def test_running_attempt_in_the_middle_refuses(self):
+        _, probs = self.check(
+            [start(1, "2026-11-20T10:00:05Z"), start(2, "2026-11-20T11:00:05Z", restore()),
+             end(2, "2026-11-20T12:00:00Z")],
+            ["2026-11-20T10:00:00Z START run-a attempt=1", "2026-11-20T11:00:00Z START run-a attempt=2",
+             "2026-11-20T12:00:01Z END run-a attempt=2 rc=0"])
+        self.assertIn("EXT-RES-1", self.rules(probs))
+
+    def test_end_before_start_and_duplicate_start_refuse(self):
+        self.write_attempts([end(1, "2026-11-20T10:00:05Z"), start(1, "2026-11-20T10:00:05Z")])
+        with self.assertRaises(Refused):
+            read_attempts(self.dir)
+        self.write_attempts([start(1, "2026-11-20T10:00:05Z"), start(1, "2026-11-20T10:00:06Z")])
+        with self.assertRaises(Refused):
+            read_attempts(self.dir)
+
+    def test_two_run_starts_in_one_guard_attempt_refuse(self):
+        _, probs = self.check(
+            [start(1, "2026-11-20T10:00:05Z"), start(2, "2026-11-20T10:10:05Z", restore()),
+             end(2, "2026-11-20T12:00:00Z")],
+            ["2026-11-20T10:00:00Z START run-a attempt=1", "2026-11-20T12:00:01Z END run-a attempt=1 rc=0"])
+        self.assertIn("EXT-RES-1", self.rules(probs))
+
+
 if __name__ == "__main__":
     unittest.main()

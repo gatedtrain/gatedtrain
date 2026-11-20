@@ -1901,6 +1901,8 @@ assert their reason. Suite: 1,369 tests, 40 skipped in CI (among them the root-o
 
 An external NeMo RL run preempted by the scheduler resumes from its last committed cut, and `ext-collect` counts consumption per segment (05 §12.4, linear chains only; 02 §2.1). Old layouts are not re-collected: new adapters accept only the new layout.
 
+Run-side `utc` values in `attempts.jsonl` are written as `%Y-%m-%dT%H:%M:%SZ`; readers also accept ISO 8601 UTC with fractional seconds and `+00:00`, and compare at whole seconds against the guard log (second resolution).
+
 | ID | Subject | Rule | Test file |
 |---|---|---|---|
 | EXT-RES-1 | Attempt records and guard alignment | Ledger `attempt_id` is `<run_id>.<A>` and `controller_epoch` is A, with parent `(A-1, branch_step)`. The guard events of the run's launch label and the run `start` lines of `attempts.jsonl` align one to one in order; a guard `START` without a `start` line is an empty attempt, allowed only if it ended `PREEMPTED`. Any guard `END rc!=0` refuses. | `tests/test_ext_attempts.py` |

@@ -8,14 +8,16 @@ A run's `attempts.jsonl` holds, per attempt A (1, 2, ... in launch order), a `st
 
 Alignment rule. A "non-empty attempt" is one with a `start` line. Guard attempts are the label's `START`
 events in log order (the `attempt=` token restarts at 1 on each gpu-step.sh invocation, so it is not used).
-Each guard attempt has a window from its `START` to its terminator (open-ended while unterminated). Run
-`start` lines are paired one to one, in order, with the guard attempt whose window contains the line's `utc`
-(the run's start may be later than the guard's `START`); a guard attempt that no run `start` line falls into
-is an empty attempt (paired with None), allowed only if it ended `PREEMPTED`.
+A run `start` line pairs with the LAST guard attempt whose `START` is <= the line's `utc` (the run's start may
+be later than the guard's `START`), and its `utc` must be <= that attempt's terminator (or the next `START`
+when unterminated); two run lines in one guard attempt refuse. Run `utc` values are ISO 8601 UTC (`Z` or
+`+00:00`, optional fraction) compared at whole seconds. A guard attempt with no run `start` line is an empty
+attempt (paired with None), allowed only if it ended `PREEMPTED` and is not the last guard attempt.
 
-Chain rule (design 5.3, 5.3a). Any guard `END rc!=0` for the label refuses. Every non-final non-empty
-attempt has no `end` line and its guard attempt ended `PREEMPTED` (EXT-RES-3). The final attempt has an `end`
-line with status "ok" and its guard attempt is `END rc=0`, the label's last terminal event (EXT-53)."""
+Chain rule (design 5.3, 5.3a). Any guard `END rc!=0` for the label refuses. The final attempt is the LAST
+guard attempt: it is `END rc=0` (the label's last terminal event, EXT-53), paired with a run `start` line
+whose `end` line has status "ok". Every other non-empty attempt has no `end` line and its guard attempt ended
+`PREEMPTED` (EXT-RES-3)."""
 
 from __future__ import annotations
 
@@ -50,6 +52,18 @@ class GuardAttempt:
     outcome: str        # "preempted", "end" or "running"
     rc: int | None
     end_utc: str | None = field(default=None, compare=False)   # window end: terminator, or the next START
+
+
+_UTC_RE = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.[0-9]+)?(?:Z|\+00:00)")
+
+
+def _run_ts(value: str) -> _dt.datetime:
+    """A run-side `utc`: ISO 8601 UTC, optional fractional seconds, `Z` or `+00:00`; truncated to whole seconds
+    (the guard log has second resolution). Writers write %Y-%m-%dT%H:%M:%SZ. Raises ValueError."""
+    m = _UTC_RE.fullmatch(value)
+    if m is None:
+        raise ValueError(value)
+    return _dt.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
 
 
 def _refuse(field: str, message: str, fix: str) -> Refused:
@@ -87,10 +101,16 @@ def read_attempts(stage_out: Path) -> list[AttemptRecord]:
                 or not isinstance(row.get("utc"), str):
             raise _refuse(f"{field}:{n}", "line is not an object with integer `attempt` and string `utc`", _FIX)
         ev = row.get("event")
+        try:
+            _run_ts(row["utc"])
+        except ValueError:
+            raise _refuse(f"{field}:{n}", f"utc {row['utc']!r} is not ISO 8601 UTC (Z or +00:00)", _FIX) from None
         if ev == "start":
             rs = row.get("restore")
             if rs is not None and not isinstance(rs, dict):
                 raise _refuse(f"{field}:{n}", "`restore` is neither null nor an object", _FIX)
+            if rs is not None and not isinstance(rs.get("repaired", False), bool):
+                raise _refuse(f"{field}:{n}", "`restore.repaired` is not a boolean", _FIX)
             if row["attempt"] != len(starts) + 1:
                 raise _refuse(f"{field}:{n}", f"start line has attempt {row['attempt']}, expected {len(starts) + 1}",
                               _FIX)
@@ -151,12 +171,6 @@ def guard_attempts(log_path: Path, label: str) -> list[GuardAttempt]:
     return out
 
 
-def _in_window(g: GuardAttempt, utc: _dt.datetime) -> bool:
-    if utc < _ts(g.start_utc):
-        return False
-    return g.end_utc is None or utc <= _ts(g.end_utc)
-
-
 def align(records: list[AttemptRecord], guard: list[GuardAttempt]
           ) -> tuple[list[tuple[GuardAttempt, AttemptRecord | None]], list[Problem]]:
     """Pair each guard attempt with its run attempt (None: empty) by the window rule in the module docstring and
@@ -178,50 +192,58 @@ def align(records: list[AttemptRecord], guard: list[GuardAttempt]
             p1("gpu-guard.log", f"guard attempt {g.index} ended with rc={g.rc}; any END rc!=0 makes the run "
                                 "uncollectable (A1)", restart)
 
-    pairs: list[tuple[GuardAttempt, AttemptRecord | None]] = []
-    gi = 0
+    starts = [_ts(g.start_utc) for g in guard]
+    assigned: dict[int, AttemptRecord] = {}
     for r in records:
-        try:
-            t = _ts(r.start_utc)
-        except ValueError:
-            p1(f"attempts.jsonl attempt {r.attempt}", f"start utc {r.start_utc!r} is not %Y-%m-%dT%H:%M:%SZ", _FIX)
-            return pairs, problems
-        while gi < len(guard) and not _in_window(guard[gi], t):
-            pairs.append((guard[gi], None))
-            gi += 1
-        if gi == len(guard):
-            p1(f"attempts.jsonl attempt {r.attempt}", "the start line lies in no unpaired guard attempt window "
-               "(more run start lines than guard STARTs, or a start outside the guard's window)", restart)
-            return pairs, problems
-        pairs.append((guard[gi], r))
-        gi += 1
-    while gi < len(guard):
-        pairs.append((guard[gi], None))
-        gi += 1
+        t = _run_ts(r.start_utc)
+        cand = [i for i, st in enumerate(starts) if st <= t]
+        gi = cand[-1] if cand else None
+        g = guard[gi] if gi is not None else None
+        if g is None or (g.end_utc is not None and t > _ts(g.end_utc)):
+            p1(f"attempts.jsonl attempt {r.attempt}", "the start line lies in no guard attempt window (a start "
+               "before the first guard START, or after the attempt's terminator)", restart)
+            return [(g, assigned.get(i)) for i, g in enumerate(guard)], problems
+        if gi in assigned:
+            p1(f"attempts.jsonl attempt {r.attempt}", f"guard attempt {g.index} already holds a run start line "
+               "(more run start lines than guard STARTs)", restart)
+            return [(g, assigned.get(i)) for i, g in enumerate(guard)], problems
+        assigned[gi] = r
+    pairs = [(g, assigned.get(i)) for i, g in enumerate(guard)]
 
     last = len(pairs) - 1
+    gl = pairs[last][0]
+    if gl.outcome != "running" and (gl.outcome != "end" or gl.rc != 0):
+        # The run is unfinished: say so, rather than blaming earlier attempts for not being final.
+        p3(f"guard attempt {gl.index}", "the final attempt (the label's last guard attempt) is not END rc=0 "
+           "(EXT-53); an empty PREEMPTED attempt after the last run start line does not make an earlier attempt "
+           "final", restart)
+        return pairs, problems
     for i, (g, r) in enumerate(pairs):
         where = f"guard attempt {g.index}"
         if g.outcome == "running":
             p1(where, "the guard attempt has no END or PREEMPTED", restart)
+            continue
+        if i == last:
+            if g.outcome != "end" or g.rc != 0:
+                p3(where, "the final attempt (the label's last guard attempt) is not END rc=0 (EXT-53); an empty "
+                          "PREEMPTED attempt after the last run start line does not make an earlier attempt final",
+                   restart)
+            if r is None:
+                p3(where, "the final attempt has no run start line", restart)
+            elif r.end_status != "ok":
+                p3(f"attempts.jsonl attempt {r.attempt}",
+                   "the final attempt has no end line with status \"ok\"" if r.end_status is None
+                   else f"the final attempt's end status is {r.end_status!r}, not \"ok\"", restart)
             continue
         if r is None:
             if g.outcome != "preempted":
                 p1(where, "the guard attempt has no run start line and did not end PREEMPTED (an empty attempt is "
                           "allowed only after PREEMPTED)", restart)
             continue
-        if i < last:
-            if r.end_status is not None:
-                p3(f"attempts.jsonl attempt {r.attempt}", "a non-final attempt has an end line", restart)
-            if g.outcome != "preempted":
-                p3(where, "a non-final attempt's guard attempt did not end PREEMPTED", restart)
-        else:
-            if g.outcome != "end" or g.rc != 0:
-                p3(where, "the final attempt's guard attempt is not END rc=0 (EXT-53)", restart)
-            if r.end_status != "ok":
-                p3(f"attempts.jsonl attempt {r.attempt}",
-                   "the final attempt has no end line with status \"ok\"" if r.end_status is None
-                   else f"the final attempt's end status is {r.end_status!r}, not \"ok\"", restart)
+        if r.end_status is not None:
+            p3(f"attempts.jsonl attempt {r.attempt}", "a non-final attempt has an end line", restart)
+        if g.outcome != "preempted":
+            p3(where, "a non-final attempt's guard attempt did not end PREEMPTED", restart)
     if not any(r is not None for _, r in pairs):
         p1("attempts.jsonl", "no run start line", _FIX)
     return pairs, problems
