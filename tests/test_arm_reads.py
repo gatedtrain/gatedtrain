@@ -418,6 +418,29 @@ class TestFromNelReadsOnce(ScenarioCase):
             self.convert(runs)
         self.assertIn("full_config.yaml contains a symbolic link", str(cm.exception))
 
+    def test_null_config_refused_without_a_second_read(self):
+        """Round 3: an empty or `null` full_config.yaml parses to None, which the tierb helpers take as "no config
+        given" and would read again by path (following a link the container swapped in); it is refused instead."""
+        from gatedtrain import tierb
+
+        def given(real):
+            def call(run, cfg=None):
+                if cfg is None:
+                    raise AssertionError("the tierb helper would read full_config.yaml again by path")
+                return real(run, cfg)
+            return call
+
+        for body in (b"", b"null\n", b"~\n"):
+            with self.subTest(body=body):
+                runs = self.runs("null")
+                (runs[0] / "full_config.yaml").write_bytes(body)
+                with mock.patch.object(tierb, "_run_seed_and_repeats", given(tierb._run_seed_and_repeats)), \
+                        mock.patch.object(tierb, "_run_sampler", given(tierb._run_sampler)):
+                    with self.assertRaises(Refused) as cm:
+                        self.convert(runs)
+                self.assertIn("cannot read", str(cm.exception))
+                self.assertIn("full_config.yaml: ValueError", str(cm.exception))
+
     def test_config_swapped_after_the_checks_is_not_recorded(self):
         from gatedtrain.ext import from_nel
 

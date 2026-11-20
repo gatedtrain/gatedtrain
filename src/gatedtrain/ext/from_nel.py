@@ -168,6 +168,8 @@ def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, c
                 raise FileNotFoundError("full_config.yaml")
             config_text = data["config"].decode("utf-8")
             cfg = yaml.safe_load(config_text)
+            if not isinstance(cfg, dict):              # an empty or `null` config would make the tierb helpers
+                raise ValueError("not a mapping")    # read the file again by path (cfg None means "not given")
             seed, repeats = _run_seed_and_repeats(run, cfg)
             used = _run_sampler(run, cfg)
             declared = _declared_scorers(cfg)
