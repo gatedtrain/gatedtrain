@@ -13,6 +13,7 @@ plain files the operator can read; the keeper replaces it in step 2.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -154,6 +155,7 @@ class FixedAlphaLedger:
     `trust/ledger.jsonl`: one line per spend and per record."""
 
     REL = "trust/ledger.jsonl"
+    CLAIM = "trust/spent"
 
     def __init__(self, project: Project, alpha: float = 0.05) -> None:
         self.project = project
@@ -175,16 +177,40 @@ class FixedAlphaLedger:
         return rows
 
     def _append(self, row: dict) -> None:
-        raw = _read_trust_file(self.project, self.REL) or b""
-        _write_trust_file(self.project, self.REL, raw + canonical_json(row) + b"\n")
+        """One `O_APPEND` write per line, never through a link."""
+        _refuse_links(self.project.root, self.REL)
+        path = self.project.root / self.REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, canonical_json(row) + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _claim(self) -> bool:
+        """Claim the single spend atomically (`O_EXCL`); False when another spend already holds it."""
+        _refuse_links(self.project.root, self.CLAIM)
+        path = self.project.root / self.CLAIM
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644))
+        except FileExistsError:
+            return False
+        return True
+
+    def _claimed(self) -> bool:
+        _refuse_links(self.project.root, self.CLAIM)
+        return (self.project.root / self.CLAIM).exists()
 
     def available(self) -> float:
-        return 0.0 if any(r.get("event") == "spend" for r in self._lines()) else self.alpha
+        return 0.0 if self._claimed() or any(r.get("event") == "spend" for r in self._lines()) else self.alpha
 
     def spend(self, attempt_id: str) -> float:
-        if any(r.get("event") == "spend" for r in self._lines()):
-            raise Refused([Problem("AN-9", "gate", "the alpha budget is spent: step 1 allows one gate test per project",
-                                   "start a new project for another test")])
+        spent = Refused([Problem("AN-9", "gate", "the alpha budget is spent: step 1 allows one gate test per project",
+                                 "start a new project for another test")])
+        if any(r.get("event") == "spend" for r in self._lines()) or not self._claim():
+            raise spent
         self._append({"event": "spend", "attempt_id": attempt_id, "alpha": self.alpha})
         return self.alpha
 

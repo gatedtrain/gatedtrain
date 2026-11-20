@@ -4,7 +4,11 @@ Runs a project through its validated pipeline. State lives only in the project's
 (`status` is derived from them), so a new process after a crash sees the same status.
 
 Attempt lines: `{stage, attempt, key, event, utc}` with `event` one of `start`, `done` (also lists the outputs),
-`failed` (also names the error) and `stale` (a rerun of an earlier stage invalidated this one).
+`failed` (also names the error) and `stale` (an audit note that a rerun of an earlier stage invalidated this one).
+A `done` line records the key parts (`stage_type`, `version`, `params_sha256`, `input_sha256s`, `decision_sha256`).
+Staleness is derived from those parts, never from `stale` lines: a done stage is `stale` when its recorded type,
+version, params or any input hash differs from the current spec, registry or the producer's current output (in
+pipeline order, so it propagates), or when a producer is no longer done.
 
 The idempotence key is the sha256 of (stage name, version, params, input artifact hashes, decision without its
 `rerun` flag). A done stage with the same key returns its recorded outputs without calling `run`; a different
@@ -58,9 +62,9 @@ def _validated(project: Project, spec: PipelineSpec | None, registry: dict | Non
     return spec, registry
 
 
-def _states(project: Project, spec: PipelineSpec) -> dict[str, dict]:
+def _states(project: Project, spec: PipelineSpec, registry: dict) -> dict[str, dict]:
     """Per stage: status, last attempt line, attempt count, and the recorded outputs and key of a done stage."""
-    st: dict[str, dict] = {s.name: {"status": "pending", "last": None, "attempts": 0, "key": None, "outputs": None}
+    st: dict[str, dict] = {s.name: {"status": "pending", "last": None, "attempts": 0, "key": None, "outputs": None, "done_row": None}
                            for s in spec.stages}
     for row in project.read_attempts():
         cur = st.get(row.get("stage"))
@@ -73,16 +77,48 @@ def _states(project: Project, spec: PipelineSpec) -> dict[str, dict]:
             cur["status"] = "failed"          # a start without done or failed is an interrupted run
         elif ev == "done":
             cur["status"], cur["key"], cur["outputs"] = "done", row.get("key"), row.get("outputs")
+            cur["done_row"] = row
         elif ev == "failed":
             cur["status"] = "failed"
-        elif ev == "stale":
+        # `stale` lines are an audit trail only; staleness is derived below
+    for sref in spec.stages:
+        cur = st[sref.name]
+        if cur["status"] == "done" and _is_stale(sref, cur, st, registry):
             cur["status"] = "stale"
     return st
 
 
-def status(project: Project, *, spec: PipelineSpec | None = None) -> dict:
+def _params_sha(params: dict) -> str:
+    return sha256_bytes(canonical_json(params))
+
+
+def _is_stale(sref: StageRef, cur: dict, st: dict[str, dict], registry: dict) -> bool:
+    cls = registry.get(sref.stage)
+    row = cur["done_row"]
+    if cls is None or row is None:
+        return True
+    if row.get("stage_type") != sref.stage or row.get("version") != getattr(cls, "version", None) \
+            or row.get("params_sha256") != _params_sha(sref.params):
+        return True
+    recorded = row.get("input_sha256s")
+    if not isinstance(recorded, dict) or set(recorded) != set(sref.inputs):
+        return True
+    for key, src in sref.inputs.items():
+        producer, _, name = src.partition(".")
+        pst = st.get(producer)
+        if pst is None or pst["status"] != "done":
+            return True
+        out = (pst["outputs"] or {}).get(name)
+        if not isinstance(out, dict) or out.get("sha256") != recorded[key]:
+            return True
+    return False
+
+
+def status(project: Project, *, spec: PipelineSpec | None = None, registry: dict | None = None) -> dict:
     spec = spec if spec is not None else _load_spec(project)
-    return {name: {"status": s["status"], "last_attempt": s["last"]} for name, s in _states(project, spec).items()}
+    registry = registry if registry is not None else stage_registry()
+    return {name: {"status": s["status"], "last_attempt": s["last"]}
+            for name, s in _states(project, spec, registry).items()}
 
 
 def _ref_from_row(row: dict) -> ArtifactRef:
@@ -130,7 +166,7 @@ def _inputs(project: Project, spec: PipelineSpec, states: dict[str, dict], sref:
 
 def _key(sref: StageRef, version: str, inputs: dict[str, ArtifactRef], decision: dict) -> str:
     body = {k: v for k, v in decision.items() if k != "rerun"}
-    doc = {"stage": sref.name, "version": version, "params": sref.params,
+    doc = {"stage": sref.name, "type": sref.stage, "version": version, "params": sref.params,
            "inputs": {k: r.sha256 for k, r in sorted(inputs.items())}, "decision": body}
     try:
         return sha256_bytes(canonical_json(doc))
@@ -149,7 +185,7 @@ def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, 
                trust: TrustBackend | None = None, ledger: AlphaLedger | None = None) -> Proposal:
     spec, registry = _validated(project, spec, registry)
     i = _locate(spec, ref)
-    states = _states(project, spec)
+    states = _states(project, spec, registry)
     _check_ready(spec, states, i)
     sref = spec.stages[i]
     ctx = _context(project, sref, _inputs(project, spec, states, sref), trust, ledger)
@@ -166,7 +202,7 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
               ledger: AlphaLedger | None = None) -> StageResult:
     spec, registry = _validated(project, spec, registry)
     i = _locate(spec, ref)
-    states = _states(project, spec)
+    states = _states(project, spec, registry)
     _check_ready(spec, states, i)
     sref = spec.stages[i]
     cls = registry[sref.stage]
@@ -182,7 +218,7 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
             raise _refuse(f"stages[{i}]", f"stage {sref.name!r} is done with a different key (inputs, params or "
                           "decision changed)", 'pass decision["rerun"] = true to rerun it; later stages become stale')
     if decision.get("rerun") and cur["status"] == "done":
-        for later in spec.stages[i + 1:]:
+        for later in spec.stages[i + 1:]:        # audit trail only; status is derived from the key parts
             ls = states[later.name]
             if ls["status"] != "pending":
                 _event(project, later.name, ls["attempts"], ls["key"], "stale", cause=sref.name)
@@ -196,7 +232,10 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
     except Exception as exc:
         _event(project, sref.name, attempt, key, "failed", error=type(exc).__name__)
         raise
-    _event(project, sref.name, attempt, key, "done", outputs={n: _ref_row(r) for n, r in sorted(outputs.items())})
+    _event(project, sref.name, attempt, key, "done", outputs={n: _ref_row(r) for n, r in sorted(outputs.items())},
+           stage_type=sref.stage, version=cls.version, params_sha256=_params_sha(sref.params),
+           input_sha256s={k: r.sha256 for k, r in sorted(inputs.items())},
+           decision_sha256=sha256_bytes(canonical_json({k: v for k, v in decision.items() if k != "rerun"})))
     return StageResult(sref.name, key, attempt, outputs, False)
 
 

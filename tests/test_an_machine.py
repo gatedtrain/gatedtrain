@@ -76,7 +76,7 @@ class MachineTest(unittest.TestCase):
         return run_stage(project or self.project, ref, decision or {}, registry=REGISTRY)
 
     def states(self) -> dict[str, str]:
-        return {k: v["status"] for k, v in status(self.project).items()}
+        return {k: v["status"] for k, v in status(self.project, registry=REGISTRY).items()}
 
     def lines(self) -> list[dict]:
         return [json.loads(x) for x in (self.root / "attempts.jsonl").read_text().splitlines()]
@@ -140,14 +140,79 @@ class MachineTest(unittest.TestCase):
 
     def test_changed_params_change_the_key(self) -> None:
         r1 = self.run_("intake_seal")
+        self.edit_params("intake_seal", {"p": 1})
+        self.assertEqual(self.states()["intake_seal"], "stale")
+        r2 = self.run_("intake_seal")
+        self.assertNotEqual(r1.key, r2.key)
+        self.assertFalse(r2.reused)
+        self.assertEqual(self.states()["intake_seal"], "done")
+
+    def edit_params(self, stage: str, params: dict) -> None:
         spec_path = Path(self.project.pipeline)
         raw = yaml.safe_load(spec_path.read_text())
-        raw["stages"][0]["params"] = {"p": 1}
+        for st in raw["stages"]:
+            if st["name"] == stage:
+                st["params"] = params
         spec_path.write_text(yaml.safe_dump(raw))
+
+    def drop_events(self, event: str) -> None:
+        path = self.root / "attempts.jsonl"
+        keep = [x for x in path.read_text().splitlines() if json.loads(x)["event"] != event]
+        path.write_text("".join(x + "\n" for x in keep))
+
+    def test_edited_downstream_params_mark_it_and_consumers_stale(self) -> None:
+        for n in TRUST_STAGES[:4]:
+            self.run_(n)
+        self.edit_params("preregister", {"p": 1})
+        self.assertEqual(self.states(), {"intake_seal": "done", "preregister": "stale", "evaluate_sealed": "stale",
+                                         "gate": "stale", "report": "pending"})
+        self.assertNotIn("stale", {x["event"] for x in self.lines()})   # derived, not from events
         with self.assertRaises(Refused):
-            self.run_("intake_seal")
-        r2 = self.run_("intake_seal", {"rerun": True})
-        self.assertNotEqual(r1.key, r2.key)
+            self.run_("evaluate_sealed")
+        self.run_("preregister")
+        self.assertEqual(self.states()["preregister"], "done")
+        self.assertEqual(self.states()["evaluate_sealed"], "done")      # identical output: consumers stay valid
+
+    def test_upstream_rerun_makes_downstream_stale_without_stale_lines(self) -> None:
+        for n in TRUST_STAGES[:3]:
+            self.run_(n)
+        self.run_("intake_seal", {"a": 2, "rerun": True})
+        self.drop_events("stale")
+        self.assertEqual(self.states(), {"intake_seal": "done", "preregister": "stale", "evaluate_sealed": "stale",
+                                         "gate": "pending", "report": "pending"})
+        with self.assertRaises(Refused):
+            self.run_("evaluate_sealed")
+
+    def test_stale_lines_are_audit_only(self) -> None:
+        self.run_("intake_seal")
+        self.run_("preregister")
+        self.project.append_attempt({"stage": "preregister", "attempt": 1, "key": "k", "event": "stale",
+                                     "utc": "2026-01-01T00:00:00Z"})
+        self.assertEqual(self.states()["preregister"], "done")
+
+    def test_crash_between_stale_appends_still_stale(self) -> None:
+        for n in TRUST_STAGES[:3]:
+            self.run_(n)
+        self.run_("intake_seal", {"a": 2, "rerun": True})
+        self.drop_events("stale")                  # as if the process died before writing any stale line
+        self.assertEqual(self.states()["evaluate_sealed"], "stale")
+
+    def test_version_or_type_change_marks_stale(self) -> None:
+        self.run_("intake_seal")
+        self.run_("preregister")
+        class V2(REGISTRY["intake_seal"]):
+            version = "2"
+        st = status(self.project, registry={**REGISTRY, "intake_seal": V2})
+        self.assertEqual([st[n]["status"] for n in TRUST_STAGES[:3]], ["stale", "stale", "pending"])
+        self.assertEqual(self.lines()[1]["stage_type"], "intake_seal")
+
+    def test_done_line_records_key_parts(self) -> None:
+        self.run_("intake_seal")
+        self.run_("preregister", {"d": 1})
+        done = [x for x in self.lines() if x["event"] == "done" and x["stage"] == "preregister"][0]
+        self.assertEqual(set(done["input_sha256s"]), {"in"})
+        for k in ("params_sha256", "decision_sha256", "version", "stage_type"):
+            self.assertIn(k, done)
 
     def test_exception_leaves_failed_with_attempt_line_and_retry_succeeds(self) -> None:
         FAIL_ONCE.add("intake_seal")
@@ -167,7 +232,7 @@ class MachineTest(unittest.TestCase):
         self.project.append_attempt({"stage": "intake_seal", "attempt": 1, "key": "k", "event": "start",
                                      "utc": "2026-01-01T00:00:00Z"})
         fresh = Project.load(self.root)
-        self.assertEqual(status(fresh)["intake_seal"]["status"], "failed")
+        self.assertEqual(status(fresh, registry=REGISTRY)["intake_seal"]["status"], "failed")
         self.assertEqual(self.run_("intake_seal", project=fresh).attempt, 2)
 
     def test_attempt_lines(self) -> None:
@@ -185,7 +250,7 @@ class MachineTest(unittest.TestCase):
         self.run_("intake_seal")
         self.run_("preregister")
         fresh = Project.load(self.root)
-        st = status(fresh)
+        st = status(fresh, registry=REGISTRY)
         self.assertEqual([st[n]["status"] for n in TRUST_STAGES], ["done", "done", "pending", "pending", "pending"])
         self.assertEqual(st["preregister"]["last_attempt"]["event"], "done")
         self.assertIsNone(st["gate"]["last_attempt"])
@@ -284,6 +349,28 @@ class TrustStubTest(unittest.TestCase):
                 fn()
             self.assertEqual(cm.exception.problems[0].rule, "AN-2")
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_spend_line_alone_keeps_budget_empty(self) -> None:
+        FixedAlphaLedger(self.project).spend("a1")
+        (self.project.root / "trust" / "spent").unlink()
+        led = FixedAlphaLedger(self.project)
+        self.assertEqual(led.available(), 0.0)
+        with self.assertRaises(Refused):
+            led.spend("a2")
+
+    def test_concurrent_spends_exactly_one_succeeds(self) -> None:
+        a = FixedAlphaLedger(self.project)
+        b = FixedAlphaLedger(self.project)
+        from unittest import mock
+        results = []
+        with mock.patch.object(FixedAlphaLedger, "_lines", lambda self: []):   # both read "no spend yet"
+            for led, name in ((a, "a1"), (b, "a2")):
+                try:
+                    results.append(led.spend(name))
+                except Refused as exc:
+                    results.append(exc.problems[0].rule)
+        self.assertEqual(results, [0.05, "AN-9"])
+        self.assertEqual(len(FixedAlphaLedger(self.project).entries()), 1)
 
     def test_in_process_trust(self) -> None:
         t = InProcessTrust(self.project)
