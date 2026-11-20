@@ -9,6 +9,7 @@ the arm, and without registered item rows the `ext_from_nel` arm is not re-deriv
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import tempfile
@@ -49,9 +50,12 @@ class RederiveCase(unittest.TestCase):
 
     def problems(self, d: Path, *, item_rows=..., row=...) -> list[str]:
         meta = json.loads((d / "eval_meta.json").read_text(encoding="utf-8"))
+        # A version that reads sources only under a configured root (`sources_root`) gets the test directory.
+        root = ({"sources_root": self.tmp} if "sources_root" in inspect.signature(arm.provenance_problems).parameters
+                else {})
         return arm.provenance_problems(d, meta, nel_benchmark=self.row.get("nel_benchmark"),
                                        row=self.row if row is ... else row,
-                                       item_rows=self.item_rows if item_rows is ... else item_rows)
+                                       item_rows=self.item_rows if item_rows is ... else item_rows, **root)
 
 
 class TestMergedArm(RederiveCase):
