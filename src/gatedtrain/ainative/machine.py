@@ -11,8 +11,13 @@ version, params or any input hash differs from the current spec, registry or the
 pipeline order, so it propagates), or when a producer is no longer done.
 
 The idempotence key is the sha256 of (stage name, version, params, input artifact hashes, decision without its
-`rerun` flag). A done stage with the same key returns its recorded outputs without calling `run`; a different
-key on a done stage refuses unless `decision["rerun"]` is true, which marks every later stage `stale`.
+`rerun` flag). A done stage with the same key returns its recorded outputs without calling `run`. A stage that is
+done under a different key, or whose own recorded params, version or type differ from the current spec or
+registry, refuses unless `decision["rerun"]` is true (a rerun appends `stale` audit lines for later stages); a
+stage that is stale only because of upstream changes reruns without the flag.
+
+The alpha ledger claims its single spend before it writes the ledger line; a crash in between leaves the budget
+spent (`available()` stays 0.0) instead of risking a second spend.
 """
 
 from __future__ import annotations
@@ -92,14 +97,20 @@ def _params_sha(params: dict) -> str:
     return sha256_bytes(canonical_json(params))
 
 
-def _is_stale(sref: StageRef, cur: dict, st: dict[str, dict], registry: dict) -> bool:
+def _own_changed(sref: StageRef, cur: dict, registry: dict) -> bool:
+    """True when the stage's own recorded type, version or params differ from the current spec and registry."""
     cls = registry.get(sref.stage)
     row = cur["done_row"]
     if cls is None or row is None:
         return True
-    if row.get("stage_type") != sref.stage or row.get("version") != getattr(cls, "version", None) \
-            or row.get("params_sha256") != _params_sha(sref.params):
+    return (row.get("stage_type") != sref.stage or row.get("version") != getattr(cls, "version", None)
+            or row.get("params_sha256") != _params_sha(sref.params))
+
+
+def _is_stale(sref: StageRef, cur: dict, st: dict[str, dict], registry: dict) -> bool:
+    if _own_changed(sref, cur, registry):
         return True
+    row = cur["done_row"]
     recorded = row.get("input_sha256s")
     if not isinstance(recorded, dict) or set(recorded) != set(sref.inputs):
         return True
@@ -211,13 +222,17 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
     key = _key(sref, cls.version, inputs, decision)
     cur = states[sref.name]
 
+    own_changed = cur["status"] in ("done", "stale") and _own_changed(sref, cur, registry)
+    if own_changed and not decision.get("rerun"):
+        raise _refuse(f"stages[{i}]", f"stage {sref.name!r} was done with a different type, version or params",
+                      'pass decision["rerun"] = true to rerun it; later stages become stale')
     if cur["status"] == "done":
         if cur["key"] == key:
             return StageResult(sref.name, key, cur["attempts"], _recorded_outputs(project, cur), True)
         if not decision.get("rerun"):
             raise _refuse(f"stages[{i}]", f"stage {sref.name!r} is done with a different key (inputs, params or "
                           "decision changed)", 'pass decision["rerun"] = true to rerun it; later stages become stale')
-    if decision.get("rerun") and cur["status"] == "done":
+    if decision.get("rerun") and (cur["status"] == "done" or own_changed):
         for later in spec.stages[i + 1:]:        # audit trail only; status is derived from the key parts
             ls = states[later.name]
             if ls["status"] != "pending":

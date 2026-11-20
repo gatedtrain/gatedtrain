@@ -142,7 +142,12 @@ class MachineTest(unittest.TestCase):
         r1 = self.run_("intake_seal")
         self.edit_params("intake_seal", {"p": 1})
         self.assertEqual(self.states()["intake_seal"], "stale")
-        r2 = self.run_("intake_seal")
+        with self.assertRaises(Refused) as cm:
+            self.run_("intake_seal")
+        self.assertEqual(cm.exception.problems[0].rule, "AN-5")
+        self.assertIn("rerun", cm.exception.problems[0].fix)
+        self.assertEqual(CALLS, ["intake_seal"])
+        r2 = self.run_("intake_seal", {"rerun": True})
         self.assertNotEqual(r1.key, r2.key)
         self.assertFalse(r2.reused)
         self.assertEqual(self.states()["intake_seal"], "done")
@@ -169,7 +174,9 @@ class MachineTest(unittest.TestCase):
         self.assertNotIn("stale", {x["event"] for x in self.lines()})   # derived, not from events
         with self.assertRaises(Refused):
             self.run_("evaluate_sealed")
-        self.run_("preregister")
+        with self.assertRaises(Refused):
+            self.run_("preregister")               # its own params changed: needs the rerun flag
+        self.run_("preregister", {"rerun": True})
         self.assertEqual(self.states()["preregister"], "done")
         self.assertEqual(self.states()["evaluate_sealed"], "done")      # identical output: consumers stay valid
 
@@ -182,6 +189,24 @@ class MachineTest(unittest.TestCase):
                                          "gate": "pending", "report": "pending"})
         with self.assertRaises(Refused):
             self.run_("evaluate_sealed")
+
+    def test_upstream_only_stale_stage_reruns_without_the_flag(self) -> None:
+        for n in TRUST_STAGES[:2]:
+            self.run_(n)
+        self.run_("intake_seal", {"a": 2, "rerun": True})
+        self.assertEqual(self.states()["preregister"], "stale")
+        r = self.run_("preregister")                # own params, version and type unchanged
+        self.assertFalse(r.reused)
+        self.assertEqual(self.states()["preregister"], "done")
+
+    def test_version_change_of_own_stage_needs_rerun(self) -> None:
+        self.run_("intake_seal")
+        class V2(REGISTRY["intake_seal"]):
+            version = "2"
+        reg = {**REGISTRY, "intake_seal": V2}
+        with self.assertRaises(Refused):
+            run_stage(self.project, "intake_seal", {}, registry=reg)
+        self.assertFalse(run_stage(self.project, "intake_seal", {"rerun": True}, registry=reg).reused)
 
     def test_stale_lines_are_audit_only(self) -> None:
         self.run_("intake_seal")
@@ -357,6 +382,15 @@ class TrustStubTest(unittest.TestCase):
         self.assertEqual(led.available(), 0.0)
         with self.assertRaises(Refused):
             led.spend("a2")
+
+    def test_claim_without_spend_line_keeps_budget_spent(self) -> None:
+        (self.project.root / "trust").mkdir()
+        (self.project.root / "trust" / "spent").touch()      # crash between the claim and the ledger line
+        led = FixedAlphaLedger(self.project)
+        self.assertEqual(led.available(), 0.0)
+        with self.assertRaises(Refused):
+            led.spend("a1")
+        self.assertEqual(led.entries(), [])
 
     def test_concurrent_spends_exactly_one_succeeds(self) -> None:
         a = FixedAlphaLedger(self.project)
