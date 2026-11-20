@@ -383,11 +383,16 @@ def cmd_project_status(args) -> int:
         return _prefuse(args, exc.problems)
     gate_status = gate.get("status") if isinstance(gate, dict) else None
     data = {"goal": project.goal, "stages": {n: {"status": s["status"],
-                                                 "last_event": (s["last_attempt"] or {}).get("event")}
+                                                 "last_event": (s["last_attempt"] or {}).get("event"),
+                                                 "last_refusal": s["last_refusal"]}
                                              for n, s in stages.items()},
             "gate": gate_status, "passed": gate_status == "PASS", "gate_recorded": recorded,
             "alpha_ledger": ledger}
-    lines = [f"{n}: {s['status']}\n" for n, s in data["stages"].items()]
+    lines = []
+    for n, s in data["stages"].items():
+        ref = s["last_refusal"]
+        note = f" (last attempt refused: {', '.join(ref['rules'] or [])} {ref['reason']})" if ref else ""
+        lines.append(f"{n}: {s['status']}{note}\n")
     if gate_status:
         lines.append(f"gate: {gate_status}\n")
     elif recorded:

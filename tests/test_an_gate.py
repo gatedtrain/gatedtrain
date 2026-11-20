@@ -236,6 +236,49 @@ class RefusalKeepsStateTest(GateBase):
         self.assertEqual(proj.read_attempts()[-1]["event"], "failed")
 
 
+    def test_a_refusal_after_overwriting_a_record_fails_the_stage_and_a_plain_rerun_recovers(self) -> None:
+        from gatedtrain.ainative.machine import status
+        from gatedtrain.errors import Problem
+
+        class WriteThenRefuse(model_stage("train_x", 1.0, True)):
+            def run(self, ctx, decision):
+                if decision.get("boom"):
+                    ctx.project.write_artifact(self.name, "model", {"junk": 1}, SCHEMA_MODEL_REF)
+                    raise Refused([Problem("X-1", "model", "refused after writing", "fix")])
+                return super().run(ctx, decision)
+
+        proj = self.make()
+        reg = {**self.registry(), "train_x": WriteThenRefuse}
+        for stage in ("intake_seal", "choose_x", "preregister", "train_x"):
+            run_stage(proj, stage, {"metric_confirmed": True} if stage == "preregister" else {}, registry=reg)
+        with self.assertRaises(Refused):
+            run_stage(proj, "train_x", {"boom": True, "rerun": True}, registry=reg)
+        self.assertEqual(status(proj, registry=reg)["train_x"]["status"], "failed")
+        last = proj.read_attempts()[-1]
+        self.assertEqual((last["event"], last["rules"]), ("failed", ["X-1"]))
+        run_stage(proj, "train_x", {}, registry=reg)                       # a plain rerun recovers
+        self.assertEqual(status(proj, registry=reg)["train_x"]["status"], "done")
+
+    def test_a_refusal_after_spending_alpha_fails_the_stage(self) -> None:
+        from gatedtrain.ainative.machine import status
+
+        proj = self.make()
+        self.through(proj, "evaluate_sealed")
+        real = FixedAlphaLedger.record
+
+        def boom(self_, attempt_id, passed):
+            raise Refused([trust_stages.Problem("X-2", "gate", "refused after the spend", "fix")])
+
+        FixedAlphaLedger.record = boom
+        try:
+            with self.assertRaises(Refused):
+                self.run_(proj, "gate")
+        finally:
+            FixedAlphaLedger.record = real
+        self.assertEqual(len(FixedAlphaLedger(proj).entries()), 1)
+        self.assertEqual(status(proj, registry=self.registry())["gate"]["status"], "failed")
+
+
 class EvaluateSealedTest(GateBase):
     def test_records_hold_item_id_seed_and_score_only_and_no_sealed_text(self) -> None:
         proj = self.make()

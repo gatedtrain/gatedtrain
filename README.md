@@ -92,8 +92,8 @@ rewrite, as can the attempt log; the report's `sealed_guarantee` says so ("unsea
 can read the sealed items"). Enforcement arrives with the step-2 keeper.
 
 `project create` copies the pipeline into `<root>/pipeline.yaml` and records its sha256; the project refuses a copy
-that was changed. To use another pipeline, create a new project. A stage that refuses (for example a second gate,
-because the alpha is spent) is logged as `refused` in `attempts.jsonl` and changes no stage state.
+that was changed. To use another pipeline, create a new project. A stage that refuses in `run` before writing outputs is logged as `refused` and changes no stage state; a refusal
+after it wrote outputs, or from the output checks, is `failed`.
 
 ## Adapter plugins
 

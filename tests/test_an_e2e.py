@@ -208,6 +208,14 @@ class DegenerateRecipeTest(E2EBase):
         status = self.cli("project", "status", str(root))
         self.assertEqual(status["data"]["stages"]["smoke"]["status"], "pending")     # a refusal changes no state
         self.assertIn(b'"event":"refused"', self.attempts(root))
+        refusal = status["data"]["stages"]["smoke"]["last_refusal"]
+        self.assertEqual(refusal["rules"], ["MM-38"])
+        self.assertIn("degenerate", refusal["reason"])
+        self.assertEqual(refusal["attempt"], 1)
+        self.assertIsNone(status["data"]["stages"]["train"]["last_refusal"])
+        text = subprocess.run([sys.executable, str(WRAPPER), "project", "status", str(root)], capture_output=True,
+                              text=True, env=cli_env(), cwd=self.tmp).stdout
+        self.assertIn("smoke: pending (last attempt refused: MM-38", text)
         self.assertEqual(status["data"]["stages"]["gate"]["status"], "pending")
         self.assertIsNone(status["data"]["gate"])
         self.assertFalse(status["data"]["passed"])

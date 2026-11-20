@@ -5,11 +5,11 @@ Runs a project through its validated pipeline. State lives only in the project's
 
 Attempt lines: `{stage, attempt, key, event, utc}` with `event` one of `start` (also `trains`: whether the stage trains, resolved at run time),
 `done` (also lists the outputs),
-`failed` (also names the error), `refused` (a stage refused in `run`, before it returned any outputs: also the rules and
+`failed` (also names the error), `refused` (a stage refused in `run` before it wrote any record or spent alpha: also the rules and
 the first reason; it is audit only and `_states` ignores it, so a refused attempt, such as a second gate or an
 amendment after the alpha is spent, never changes the derived state) and `stale` (an audit note that a rerun of an
-earlier stage invalidated this one). A refusal raised by the output checks, after the stage wrote its outputs, is
-`failed` as before.
+earlier stage invalidated this one). A refusal after the stage wrote records or spent alpha, or raised by the output checks, is
+`failed` (with its rules and reason).
 A `done` line records the key parts (`stage_type`, `version`, `params_sha256`, `input_sha256s`, `decision_sha256`).
 Staleness is derived from those parts, never from `stale` lines: a done stage is `stale` when its recorded type,
 version, params or any input hash differs from the current spec, registry or the producer's current output (in
@@ -82,8 +82,8 @@ def _validated(project: Project, spec: PipelineSpec | None, registry: dict | Non
 
 def _states(project: Project, spec: PipelineSpec, registry: dict) -> dict[str, dict]:
     """Per stage: status, last attempt line, attempt count, and the recorded outputs and key of a done stage."""
-    st: dict[str, dict] = {s.name: {"status": "pending", "last": None, "attempts": 0, "key": None, "outputs": None, "done_row": None}
-                           for s in spec.stages}
+    st: dict[str, dict] = {s.name: {"status": "pending", "last": None, "attempts": 0, "key": None, "outputs": None, "done_row": None,
+                           "refusal": None} for s in spec.stages}
     before_start: dict[str, tuple] = {}
     for row in project.read_attempts():
         cur = st.get(row.get("stage"))
@@ -94,7 +94,10 @@ def _states(project: Project, spec: PipelineSpec, registry: dict) -> dict[str, d
             snap = before_start.pop(row["stage"], None)
             if snap is not None:
                 cur["status"], cur["last"] = snap
+            cur["refusal"] = {"attempt": row.get("attempt"), "rules": row.get("rules"), "reason": row.get("reason"),
+                              "utc": row.get("utc")}
             continue
+        cur["refusal"] = None                 # a later start, done or failed line supersedes the refusal
         before_start.pop(row.get("stage"), None)
         if ev == "start":
             before_start[row["stage"]] = (cur["status"], cur["last"])
@@ -150,7 +153,7 @@ def _is_stale(sref: StageRef, cur: dict, st: dict[str, dict], registry: dict) ->
 def status(project: Project, *, spec: PipelineSpec | None = None, registry: dict | None = None) -> dict:
     spec = spec if spec is not None else _load_spec(project)
     registry = registry if registry is not None else stage_registry()
-    return {name: {"status": s["status"], "last_attempt": s["last"]}
+    return {name: {"status": s["status"], "last_attempt": s["last"], "last_refusal": s["refusal"]}
             for name, s in _states(project, spec, registry).items()}
 
 
@@ -225,6 +228,22 @@ def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, 
     return registry[sref.stage]().plan(ctx)
 
 
+def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int]:
+    """What a stage's `run` may have changed: the hash of every file under `stages/<stage>/` and the number of lines
+    in the alpha ledger (a spend is a side effect)."""
+    files: dict[str, str] = {}
+    base = project.root / "stages" / stage
+    if base.is_dir():
+        for path in sorted(base.rglob("*")):
+            if path.is_file() and not path.name.endswith(".tmp"):
+                files[path.relative_to(base).as_posix()] = sha256_bytes(path.read_bytes())
+    try:
+        lines = (project.root / "trust" / "ledger.jsonl").read_bytes().count(b"\n")
+    except OSError:
+        lines = 0
+    return files, lines
+
+
 def done_output(project: Project, stage: str, name: str, *, spec: PipelineSpec | None = None,
                 registry: dict | None = None) -> dict | list | None:
     """The record of output `name` of `stage` when the stage is `done` (not stale, not failed), else None."""
@@ -287,11 +306,16 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
     # trust the log, not the pipeline file, which can be edited afterwards.
     _event(project, sref.name, attempt, key, "start", trains=_is_training(spec, sref, cls))
     ctx = _context(project, sref, inputs, trust, ledger)
+    before = _side_effects(project, sref.name)
     try:
         outputs = stage.run(ctx, decision)
-    except Refused as exc:                       # refused before any outputs: audit it, keep the state as it was
-        _event(project, sref.name, attempt, key, "refused", rules=sorted({p.rule for p in exc.problems}),
-               reason=(exc.problems[0].message[:300] if exc.problems else ""))
+    except Refused as exc:
+        rules = sorted({p.rule for p in exc.problems})
+        reason = exc.problems[0].message[:300] if exc.problems else ""
+        if _side_effects(project, sref.name) == before:      # refused before any write: audit only, state unchanged
+            _event(project, sref.name, attempt, key, "refused", rules=rules, reason=reason)
+        else:                                                # it wrote records or spent alpha first: a failed attempt
+            _event(project, sref.name, attempt, key, "failed", error=type(exc).__name__, rules=rules, reason=reason)
         raise
     except Exception as exc:
         _event(project, sref.name, attempt, key, "failed", error=type(exc).__name__)
