@@ -20,6 +20,7 @@ from typing import Any
 import yaml
 
 from ..errors import Problem, Refused
+from .project import _check_name
 from .stage import TRUST_STAGES
 
 
@@ -105,6 +106,14 @@ def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
     stages = spec.stages
     names = [s.name for s in stages]
     for i, ref in enumerate(stages):
+        try:
+            _check_name("stage", ref.name)
+            safe = "." not in ref.name
+        except Refused:
+            safe = False
+        if not safe:      # a directory name in the project and the `<stage>` of `<stage>.<output>` wiring
+            add(f"stages[{i}].name", f"stage name {ref.name!r} is not a safe name (empty, '.', '..', or holding '/', "
+                "'\\', NUL or '.')", "use a plain name of letters, digits, '_' and '-'")
         if names.index(ref.name) != i:
             add(f"stages[{i}].name", f"stage name {ref.name!r} is used twice", "give every stage a unique name")
 

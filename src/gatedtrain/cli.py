@@ -457,7 +457,7 @@ def _add_project(sub) -> None:
     c.add_argument("--pipeline", required=True, metavar="FILE",
                    help="the pipeline spec: the path of a pipeline YAML (the loader resolves a path, not a registry "
                         "name). The project keeps a copy and its sha256; a changed copy is refused, and another "
-                        "pipeline means a new project")
+                        "pipeline needs a new project with new sealed data")
     c.add_argument("--gpu-hours", type=_gpu_hours, default=0.0, metavar="H",
                    help="the GPU-hour budget; step 1 only records it in project.yaml and does not enforce it")
     c.set_defaults(func=cmd_project_create)

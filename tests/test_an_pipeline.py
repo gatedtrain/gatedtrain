@@ -186,6 +186,13 @@ class PipelineValidatorTest(PipelineBase):
         p = self.problems([INTAKE, PREREG, TRAIN, dict(TRAIN), EVAL, GATE, REPORT])
         self.assertRefused(p, "stages[3].name", "used twice")
 
+    def test_unsafe_or_dotted_ref_names_refused_before_any_run(self):
+        """A ref name is a directory name in the project and the producer part of `<stage>.<output>` wiring."""
+        for bad in ("a/b", "..", "x.y", "a\\b"):
+            note = {"name": bad, "stage": "note"}
+            p = self.problems([INTAKE, note, PREREG, TRAIN, EVAL, GATE, REPORT])
+            self.assertRefused(p, "stages[1].name")
+
     def test_malformed_spec_refused(self):
         path = self.tmp / "bad.yaml"
         path.write_text("name: x\nstages: nope\n")

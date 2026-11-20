@@ -68,7 +68,8 @@ def _load_spec(project: Project) -> PipelineSpec:
         if got != project.pipeline_sha256:
             raise _refuse("pipeline", f"the pipeline copy {project.pipeline!r} was changed after the project was "
                           f"created (recorded sha256 {project.pipeline_sha256}, file has {got})",
-                          "restore the copy; to use another pipeline, create a new project")
+                          "restore the copy; another pipeline needs a new project with new sealed data (a new "
+                          "project on the same data would reuse the same sealed split)")
     return load_pipeline(path)
 
 
