@@ -185,6 +185,49 @@ def impact_counts(shard: str, *, run_dir: Path | None = None, runs_root: Path | 
     return {"orphaned": orphaned, "superseded": 0}
 
 
+STEPS_QUERY = """
+SELECT DISTINCT o.attempt_id, o.step
+FROM read_parquet($orphaned, union_by_name = true) AS o
+JOIN (SELECT DISTINCT run_id, stage_id, snapshot, shard FROM read_parquet($shards) WHERE shard_sha256 = $target) AS t
+  ON o.run_id = t.run_id AND o.stage_id = t.stage_id AND o.snapshot = t.snapshot AND o.shard = t.shard
+ORDER BY o.attempt_id, o.step
+"""
+
+
+def impact_orphaned(shard: str, *, run_dir: Path | None = None, runs_root: Path | None = None) -> dict[str, Any]:
+    """The `orphaned` section of an impact answer for a resumed run (EXT-RES-5; 05 section 12.4: orphaned records
+    enter no rollup). Empty (`{}`) when the queried shard has no orphaned record, so the JSON answer of a
+    single-attempt or old-layout run keeps its keys.
+
+    Otherwise `{"count": N, "attempts": {attempt_id: [[first, last], ...]}}`: `count` is the number of orphaned
+    ConsumptionRecords of the shard (the same figure as impact_counts), and each attempt lists the contiguous
+    runs of orphaned steps of the shard as inclusive `[first, last]` pairs in ascending order. Attribution to
+    checkpoints is separate and reads kept rows only (impact_query), so a shard consumed only in orphaned steps
+    has no checkpoint in the answer and an `orphaned` section here."""
+    target = resolve_target(shard)
+    dirs = [d for d in run_dirs(run_dir=run_dir, runs_root=runs_root) if (d / "lineage" / "orphaned.parquet").is_file()]
+    if not dirs:
+        return {}
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(STEPS_QUERY, {
+            "target": target,
+            "orphaned": [str(d / "lineage" / "orphaned.parquet") for d in dirs],
+            "shards": [str(d / "lineage" / "shards.parquet") for d in dirs],
+        }).fetchall()
+    finally:
+        con.close()
+    attempts: dict[str, list[list[int]]] = {}
+    for attempt_id, step in rows:
+        runs = attempts.setdefault(str(attempt_id), [])
+        if runs and int(step) == runs[-1][1] + 1:
+            runs[-1][1] = int(step)
+        else:
+            runs.append([int(step), int(step)])
+    count = impact_counts(target, run_dir=run_dir, runs_root=runs_root)["orphaned"]
+    return {"count": count, "attempts": attempts} if count else {}
+
+
 def impact_query(shard: str, *, run_dir: Path | None = None, runs_root: Path | None = None) -> list[dict[str, Any]]:
     """Every checkpoint that possibly consumed the shard (tests/README.md section 6.4)."""
     target = resolve_target(shard)

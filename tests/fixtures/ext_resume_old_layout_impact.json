@@ -1,0 +1,75 @@
+{
+ "counts": {
+  "orphaned": 0,
+  "superseded": 0
+ },
+ "query": null,
+ "ranges": {
+  "orphaned": [],
+  "superseded": []
+ },
+ "results": [
+  {
+   "answer": "possibly consumed",
+   "checkpoint_hash": "sha256:323215c53d96120fcac52b693f6bd51c3dfe55219b7d43431d1641c815d77db9",
+   "derivation": "reconstructed",
+   "first_step": 3,
+   "last_step_included": 5,
+   "model_hash": "sha256:0c2db217bcbbdb8aeca93ce4f59f059ed532269a8c1ce3e426beace2f573cb37",
+   "paths": [
+    {
+     "chain": [
+      {
+       "derivation": "reconstructed",
+       "edge": "data",
+       "first_step": 3,
+       "precision": "iteration",
+       "run_id": "<run>",
+       "stage_id": "rl"
+      }
+     ],
+     "derivation": "reconstructed",
+     "first_step": 3,
+     "precision": "iteration",
+     "via_model_hash": null
+    }
+   ],
+   "precision": "iteration",
+   "run_id": "<run>",
+   "shard_sha256": "sha256:f1af3f4195f87b45b6c2b254920c5ac72e943ad81fefc96689605eb4624c8950",
+   "stage_id": "rl",
+   "via_model_hash": null
+  },
+  {
+   "answer": "possibly consumed",
+   "checkpoint_hash": "sha256:d9067a7fc5187c76f12896a2d65f3f4f06cb037d13fce9e76db32fa4c7b7da6d",
+   "derivation": "reconstructed",
+   "first_step": 3,
+   "last_step_included": 10,
+   "model_hash": "sha256:4968ec6739223cb364594e4ed685ac11583cf0cdf631389cb306972c9079c190",
+   "paths": [
+    {
+     "chain": [
+      {
+       "derivation": "reconstructed",
+       "edge": "data",
+       "first_step": 3,
+       "precision": "iteration",
+       "run_id": "<run>",
+       "stage_id": "rl"
+      }
+     ],
+     "derivation": "reconstructed",
+     "first_step": 3,
+     "precision": "iteration",
+     "via_model_hash": null
+    }
+   ],
+   "precision": "iteration",
+   "run_id": "<run>",
+   "shard_sha256": "sha256:f1af3f4195f87b45b6c2b254920c5ac72e943ad81fefc96689605eb4624c8950",
+   "stage_id": "rl",
+   "via_model_hash": null
+  }
+ ]
+}

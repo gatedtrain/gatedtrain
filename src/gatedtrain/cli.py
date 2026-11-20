@@ -81,7 +81,7 @@ def cmd_warmup(args) -> int:
 
 
 def cmd_impact(args) -> int:
-    from .impact import UnknownTarget, impact_counts, impact_query, impact_ranges, resolve_target
+    from .impact import UnknownTarget, impact_counts, impact_orphaned, impact_query, impact_ranges, resolve_target
 
     try:
         target = resolve_target(args.shard)
@@ -90,12 +90,15 @@ def cmd_impact(args) -> int:
         results = impact_query(target, **where)
         counts = impact_counts(target, **where)
         ranges = impact_ranges(target, **where)
+        orphaned = impact_orphaned(target, **where)
     except (UnknownTarget, FileNotFoundError) as exc:
         return _refuse(args, [Problem("IMPACT-TARGET", "shard", str(exc),
                                       "pass sha256:<64 hex> or the path of an existing shard file, and a run directory")])
     query = {"shard": args.shard, "shard_sha256": target, "run_dir": args.run_dir, "runs_root": args.runs_root,
              "outcome": "consumed", "include_exposed": False}
     obj = {"query": query, "results": results, "counts": counts, "ranges": ranges}
+    if orphaned:                                             # EXT-RES-5: only a resumed run has the section
+        obj["orphaned"] = orphaned
     if _as_json(args):                                       # the AN-1 envelope; `data` is the impact object
         return _finish(args, obj)
     lines: list[str] = []

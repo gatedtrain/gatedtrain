@@ -222,6 +222,90 @@ class TestThreeAttempts(Case):
         self.assertEqual({r["first_step"] for r in after}, first)
 
 
+    # ---- EXT-RES-5: impact attribution over segments -------------------------------------------------------
+
+    def impact(self, run_dir: Path, shard: str) -> dict:
+        proc = run_cli(["impact", str(self.sc.train / shard), "--run-dir", str(run_dir), "--json"], cwd=self.sc.root)
+        self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
+        return json.loads(proc.stdout)
+
+    def edited_copy(self, name: str, drop) -> Path:
+        """A copy of the run whose ledger lacks the rows `drop` selects."""
+        copy = self.tmp / name
+        shutil.copytree(self.run_dir(), copy)
+        path = copy / "ledger" / "consumption.parquet"
+        table = pq.read_table(path)
+        keep = [r for r in table.to_pylist() if not drop(r)]
+        pq.write_table(pa.Table.from_pylist(keep, schema=table.schema), path)
+        return copy
+
+    def test_kept_rows_attribute_to_covering_cuts(self):
+        d = self.run_dir()
+        want = {  # shard -> (first kept step; cuts with last_step_included >= it)
+            "shard-00000.jsonl": [4, 8, 12], "shard-00001.jsonl": [4, 8, 12],
+            "shard-00002.jsonl": [8, 12], "shard-00003.jsonl": [8, 12]}
+        for shard, cuts in want.items():
+            doc = self.impact(d, shard)
+            self.assertEqual([r["last_step_included"] for r in doc["results"]], cuts, shard)
+
+    def test_orphaned_section_per_attempt_ranges(self):
+        d = self.run_dir()
+        doc = self.impact(d, "shard-00001.jsonl")
+        self.assertEqual(doc["orphaned"], {"count": 1, "attempts": {f"{d.name}.1": [[5, 5]]}})
+        doc = self.impact(d, "shard-00003.jsonl")
+        self.assertEqual(doc["orphaned"], {"count": 1, "attempts": {f"{d.name}.2": [[9, 9]]}})
+        self.assertNotIn("orphaned", self.impact(d, "shard-00000.jsonl"), "no orphaned record, no section")
+
+    def test_shard_consumed_only_in_orphaned_steps_has_no_checkpoint(self):
+        d = self.run_dir()
+        copy = self.edited_copy("only-orphaned", lambda r: r["data_ref"]["shard"] == "shard-00002.jsonl"
+                                and r["status"] == "kept")
+        doc = self.impact(copy, "shard-00002.jsonl")
+        self.assertEqual(doc["results"], [])
+        self.assertEqual(doc["orphaned"], {"count": 1, "attempts": {f"{d.name}.1": [[6, 6]]}})
+        self.assertEqual(doc["counts"]["orphaned"], 1)
+
+    def test_orphaned_ranges_are_contiguous_runs_per_attempt(self):
+        d = self.run_dir()
+        copy = self.tmp / "ranges-copy"
+        shutil.copytree(d, copy)
+        path = copy / "lineage" / "orphaned.parquet"
+        table = pq.read_table(path)
+        rows = [r for r in table.to_pylist() if r["shard"] == "shard-00001.jsonl"]
+        extra = [dict(rows[0], step=s) for s in (6, 7, 9)]
+        pq.write_table(pa.Table.from_pylist(rows + extra, schema=table.schema), path)
+        got = self.impact(copy, "shard-00001.jsonl")["orphaned"]
+        self.assertEqual(got, {"count": 4, "attempts": {f"{d.name}.1": [[5, 7], [9, 9]]}})
+
+    def test_final_attempt_tail_after_last_cut_is_attributed_to_no_checkpoint(self):
+        d = self.run_dir()
+        copy = self.edited_copy("tail", lambda r: r["data_ref"]["shard"] == "shard-00000.jsonl" and r["step"] <= 3)
+        ckpt = copy / "lineage" / "checkpoints.parquet"
+        table = pq.read_table(ckpt)
+        pq.write_table(pa.Table.from_pylist([r for r in table.to_pylist() if r["last_step_included"] != 12],
+                                            schema=table.schema), ckpt)
+        doc = self.impact(copy, "shard-00000.jsonl")  # kept only at steps 11 and 12, last cut is 8
+        self.assertEqual(doc["results"], [])
+        self.assertNotIn("orphaned", doc)
+
+
+class TestOldLayoutImpactUnchanged(Case):
+    def test_old_layout_json_answer_is_byte_for_byte_the_pre_resume_answer(self):
+        """The fixture was captured from the implementation at a3afd25 (before EXT-RES-5) for this scenario."""
+        sc = self.scenario()
+        (sc.stage_out / "attempts.jsonl").unlink()
+        proc = sc.collect(self.runs())
+        d = parse_run_dir(proc.stdout)
+        out = run_cli(["impact", str(sc.train / "shard-00001.jsonl"), "--run-dir", str(d), "--json"], cwd=sc.root)
+        self.assertEqual(out.returncode, EXIT_OK, describe(out))
+        doc = json.loads(out.stdout)
+        doc["query"] = None
+        text = json.dumps(doc, indent=1, sort_keys=True).replace(d.name, "<run>")
+        want = (Path(__file__).parent / "fixtures" / "ext_resume_old_layout_impact.json").read_text(encoding="utf-8")
+        self.assertEqual(text, want)
+        self.assertEqual(set(doc), {"query", "results", "counts", "ranges"})
+
+
 class TestOneAttempt(Case):
     def test_single_attempt_new_layout(self):
         sc = self.scenario()
