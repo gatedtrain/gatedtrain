@@ -51,12 +51,28 @@ gatedtrain = "gatedtrain.cli:main"
 # Adapters are plugins of the entry point group `gatedtrain.adapters`, registered by the recipe distributions;
 # gatedtrain itself registers none (its tests use `gatedtrain.testing.synthetic`).
 
+# The synthetic scenario pack (`gatedtrain.testing.synthetic_pack`) exercises the AI-native stage machine on the CPU: its
+# six pluggable stages and its generation function are plugins of `gatedtrain.stages` and `gatedtrain.scenarios`.
+[project.entry-points."gatedtrain.stages"]
+profile_data = "gatedtrain.testing.synthetic_pack:ProfileData"
+choose_task_and_base = "gatedtrain.testing.synthetic_pack:ChooseTaskAndBase"
+build_train_set = "gatedtrain.testing.synthetic_pack:BuildTrainSet"
+write_recipe = "gatedtrain.testing.synthetic_pack:WriteRecipe"
+smoke = "gatedtrain.testing.synthetic_pack:Smoke"
+train = "gatedtrain.testing.synthetic_pack:Train"
+
+[project.entry-points."gatedtrain.scenarios"]
+synthetic = "gatedtrain.testing.synthetic_pack:SCENARIO"
+
 [build-system]
 requires = ["setuptools>=78"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"gatedtrain.testing" = ["*.yaml"]
 
 # uv.lock covers macOS only; a Linux host installs requirements-tierb-host.txt instead.
 [tool.uv]

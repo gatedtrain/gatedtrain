@@ -17,11 +17,24 @@ from gatedtrain.ainative.machine import run_stage
 from gatedtrain.ainative.project import Project, create_project
 from gatedtrain.ainative.stage import Proposal, stage_registry
 from gatedtrain.ainative.trust import UNSEALED_GUARANTEE, FixedAlphaLedger, InProcessTrust
-from gatedtrain.ainative.trust_stages import (EvaluateSealed, Gate, Report, SCHEMA_MODEL_REF, register_generator,
-                                               render_markdown)
+from gatedtrain.ainative.trust_stages import (EvaluateSealed, Gate, Report, SCHEMA_MODEL_REF, render_markdown)
 from gatedtrain.errors import Refused
 
 GENERATOR = "t7-generator"
+TEST_GENERATORS: dict = {}          # what the test-only scenario entry point exposes
+
+
+class _TestScenario:
+    """A test-only `gatedtrain.scenarios` entry point: the loader is patched in setUp, so no stage can reach it."""
+    name = "t7"
+    value = "test:scenario"
+
+    def load(self):
+        return self
+
+    @property
+    def generators(self):
+        return TEST_GENERATORS
 
 
 def unique_rows(n: int) -> list[dict]:
@@ -85,8 +98,12 @@ class GateBase(ti.Base):
 
     def setUp(self) -> None:
         super().setUp()
-        register_generator(GENERATOR, generate)
-        self.addCleanup(trust_stages.GENERATORS.pop, GENERATOR, None)
+        TEST_GENERATORS.clear()
+        TEST_GENERATORS[GENERATOR] = generate
+        self.addCleanup(TEST_GENERATORS.clear)
+        real = trust_stages._scenario_entry_points
+        trust_stages._scenario_entry_points = lambda: [_TestScenario()]
+        self.addCleanup(setattr, trust_stages, "_scenario_entry_points", real)
         GENERATE_CALLS.clear()
         LABELS.clear()
 
@@ -231,7 +248,7 @@ class EvaluateSealedTest(GateBase):
     def test_unknown_generator_is_refused(self) -> None:
         proj = self.make()
         self.upto_registration(proj)
-        trust_stages.GENERATORS.pop(GENERATOR)
+        TEST_GENERATORS.pop(GENERATOR)
         p = self.refused(proj, "evaluate_sealed", rule="AN-8")
         self.assertIn("generator", p.message)
 
@@ -242,7 +259,7 @@ class EvaluateSealedTest(GateBase):
         def boom(model_ref, item, *, sampler, seed):
             raise RuntimeError("secret " + item["input"])
 
-        register_generator(GENERATOR, boom)
+        TEST_GENERATORS[GENERATOR] = boom
         p = self.refused(proj, "evaluate_sealed", rule="AN-8")
         self.assertNotIn("marker", p.message)
         self.assertNotIn("secret", p.message)

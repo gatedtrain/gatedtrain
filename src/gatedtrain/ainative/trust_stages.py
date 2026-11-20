@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -473,14 +474,37 @@ class Preregister:
 # evaluate_sealed, gate, report (AN-8, AN-9, AN-10)
 # ---------------------------------------------------------------------------
 
-# The generation functions of the scenario packs, by the name a model reference gives in `generator`. A pack
-# registers `generate(model_ref, item, *, sampler, seed) -> prediction`; `item` is `{"input": ...}` only, the label
-# stays with the scorer. Task 8's synthetic pack registers itself here.
-GENERATORS: dict[str, Callable[..., Any]] = {}
+# The generation functions of the scenario packs, by the name a model reference gives in `generator`. A scenario pack
+# is a plugin of the entry point group `gatedtrain.scenarios`: the loaded object carries `generators`, a mapping of
+# name -> `generate(model_ref, item, *, sampler, seed) -> prediction`; `item` is `{"input": ...}` only, the label
+# stays with the scorer. There is no run-time registration: a stage cannot add or replace a generator, only the
+# installed distributions can.
+SCENARIO_ENTRY_POINT_GROUP = "gatedtrain.scenarios"
 
 
-def register_generator(name: str, fn: Callable[..., Any]) -> None:
-    GENERATORS[name] = fn
+def _scenario_entry_points() -> list[Any]:
+    return list(metadata.entry_points(group=SCENARIO_ENTRY_POINT_GROUP))
+
+
+def scenario_generators() -> dict[str, Callable[..., Any]]:
+    """The generators of every installed scenario pack; a pack that fails to load, exposes no mapping of callables
+    or reuses a generator name is refused (`AN-8`) without echoing its message."""
+    found: dict[str, Callable[..., Any]] = {}
+    for ep in _scenario_entry_points():
+        try:
+            gens = ep.load().generators
+        except Exception as exc:
+            raise _refuse("AN-8", f"entry point {ep.name}", f"the scenario pack failed to load ({type(exc).__name__})",
+                          "fix or uninstall the scenario pack") from None
+        if not (isinstance(gens, dict) and all(isinstance(k, str) and callable(v) for k, v in gens.items())):
+            raise _refuse("AN-8", f"entry point {ep.name}", "the scenario pack's `generators` is not a mapping of "
+                          "name to function", "expose `generators = {name: generate}`")
+        for name, fn in gens.items():
+            if name in found:
+                raise _refuse("AN-8", f"entry point {ep.name}", f"generator {name!r} is provided by two scenario packs",
+                              "give each generator a unique name")
+            found[name] = fn
+    return found
 
 
 _REG_KEYS = ("hash", "scorer", "direction", "margin", "alpha", "item_set_hash", "post_hoc", "amends")
@@ -548,10 +572,10 @@ def _eval_seeds(full: dict) -> list:
 
 
 def _score_arm(ctx: StageContext, sealed: SealedRef, model: dict, full: dict) -> list[dict]:
-    fn = GENERATORS.get(model.get("generator"))
+    fn = scenario_generators().get(model.get("generator"))
     if fn is None:
         raise _refuse("AN-8", "model_ref.generator", f"no generation function is registered for {model.get('generator')!r}",
-                      "register the scenario pack that serves this model reference")
+                      "install the scenario pack that serves this model reference")
     sampler = full["sampler"]
     records: list[dict] = []
     for seed in _eval_seeds(full):

@@ -86,10 +86,14 @@ TRUST_INPUT_SOURCES = {"registration": "preregister", "sealed_summary": "intake_
 
 
 def _trust_schemas() -> set[str]:
+    """The schemas only a trust stage may write: the trust records. `train_part` and `report` stay open to pluggable
+    stages (a pack builds its own training set; a report is a document, not a record the gate relies on)."""
     from .stage import builtin_stages
+    from .trust_stages import SCHEMA_REPORT, SCHEMA_TRAIN_PART
 
     built = builtin_stages()
-    return {schema for t in TRUST_STAGES for schema in dict(built[t].outputs).values()}
+    open_ = {SCHEMA_TRAIN_PART, SCHEMA_REPORT}
+    return {schema for t in TRUST_STAGES for schema in dict(built[t].outputs).values()} - open_
 
 
 def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
