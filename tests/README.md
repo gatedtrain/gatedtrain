@@ -1897,6 +1897,20 @@ tests inherited), `TestSnapshotIsWhatIsChecked` (files changed after the snapsho
 the size cap, no descriptor leaked); the provenance refusal tests of `test_ext_hardening` and `test_ext_review2`
 assert their reason. Suite: 1,369 tests, 40 skipped in CI (among them the root-only device-node test).
 
+### 11.35 Resumable external runs (EXT-RES-1 to EXT-RES-7; design revision 22, 2026-11-20)
+
+An external NeMo RL run preempted by the scheduler resumes from its last committed cut, and `ext-collect` counts consumption per segment (05 §12.4, linear chains only; 02 §2.1). Old layouts are not re-collected: new adapters accept only the new layout.
+
+| ID | Subject | Rule | Test file |
+|---|---|---|---|
+| EXT-RES-1 | Attempt records and guard alignment | Ledger `attempt_id` is `<run_id>.<A>` and `controller_epoch` is A, with parent `(A-1, branch_step)`. The guard events of the run's launch label and the run `start` lines of `attempts.jsonl` align one to one in order; a guard `START` without a `start` line is an empty attempt, allowed only if it ended `PREEMPTED`. Any guard `END rc!=0` refuses. | `tests/test_ext_attempts.py` |
+| EXT-RES-2 | Restore is the newest committed cut | Attempt A+1 restores the newest committed cut of attempts 1..A; any other restore (a rollback) is refused. | `tests/test_ext_attempts.py` |
+| EXT-RES-3 | Non-final attempts preempted, final ok | Every non-final attempt has no `end` line and a guard `PREEMPTED`; the final attempt has `end` with `status: "ok"` and guard `END rc=0` (EXT-53). | `tests/test_ext_attempts.py` |
+| EXT-RES-4 | Kept steps exactly once | After records past a non-final attempt's last committed cut are set aside, the kept records cover steps 1..`max_steps` exactly once. | `tests/test_ext_attempts.py` |
+| EXT-RES-5 | Orphaned records in the ledger and impact answers | Records after a non-final attempt's last committed cut stay in the ledger with `status: "orphaned"`; every rollup and impact answer excludes them except the orphaned counts and step ranges. | `tests/test_ext_resume_collect.py` |
+| EXT-RES-6 | Optimizer state saved for a resumed run | A recipe's full profiles set `save_optimizer=true` and `save_period` 10 with a cut at every save (smoke: `save_period` 5), so a resumed run restores optimizer state. | recipe tests (`gatedtrain-recipe-nemo-rl-img2cad` `tests/test_adapter.py`, `tests/test_runtime.py`) |
+| EXT-RES-7 | Cut repair recorded and valid | A repaired cut is recorded and the repaired cut is valid. | recipe tests (`gatedtrain-recipe-nemo-rl-img2cad` `tests/test_adapter.py`, `tests/test_runtime.py`) |
+
 ## 12. AI-native step 1 (AN-1 to AN-10)
 
 Design revision 21, `05-evaluation-and-lineage.md` §18. Step 1 runs on a CPU only synthetic pack. The trust backend is
