@@ -540,7 +540,10 @@ Source: the area runtime `<mm-root>/area10-agentic` (README section 0, in partic
 - **The demo's gate depended on the runner's CPU.** The stand-ins train on one thread with deterministic algorithms,
   so a run repeats exactly on one machine, but PyTorch chooses CPU kernels by instruction set and MKL its BLAS code
   path. On GitHub runners the same commit and the same wheels gave PASS in one job and FAIL in another
-  (`test_e2e_slow`: the warm-up baseline scored 0.833 there against 0.522 on the development host). The stand-ins now
-  pin `ATEN_CPU_CAPABILITY=default` and `MKL_CBWR=COMPATIBLE` before torch is imported (`gatedtrain/stubs/__init__.py`;
-  an operator's own setting wins), and `runner.run` imports the stand-ins before torch. The CI workflow prints the
+  (`test_e2e_slow`: the warm-up baseline scored 0.833 there against 0.522 on the development host). Three code paths
+  depend on the CPU: ATen's kernels, MKL's BLAS and oneDNN, which JIT-compiles kernels for the instruction set (the
+  stand-ins' GELU ran as `eltwise jit:avx2` on the development host and on AVX-512 on a Xeon runner; a first fix that
+  pinned only ATen and MKL still gave 0.745 there). The stand-ins now pin `ATEN_CPU_CAPABILITY=default` and
+  `MKL_CBWR=COMPATIBLE` before torch is imported (`gatedtrain/stubs/__init__.py`; an operator's own setting wins) and
+  turn oneDNN off (`model.configure_torch`); `runner.run` imports the stand-ins before torch. The CI workflow prints the
   runner's CPU model and instruction sets.

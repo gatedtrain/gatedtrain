@@ -9,7 +9,7 @@ artifacts:
   train:        {type: training_dataset, uri: "file:data/train-shuffled"}
   heldout:      {type: prompt_dataset, uri: "file:data/heldout", disjoint_from: [train]}
   trainer_cfg:  {type: trainer_config, uri: "file:trainer.yaml"}
-  registration: {type: registration, uri: "file:registration-ni.yaml@sha256:1cf448541420ab3d22f0fdaabfcd329bd2fefb4061ee480913bee868c5b82e7f"}
+  registration: {type: registration, uri: "file:registration-ni.yaml@sha256:1ec0c86980526ebcc2c4338b99be3ebac3b3bbf7f22d18ab4679c8d545ddb290"}
 stages:
   - id: sft
     uses: sft.cpu_stub@0.1

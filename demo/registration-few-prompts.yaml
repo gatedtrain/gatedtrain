@@ -37,7 +37,7 @@ evaluators:
   # R10-5 (decision R10A-2): manifest_hash is the resolved stand-in evaluator identity hash, which the
   # report records as evaluator_hash (gatedtrain.runner.stub_evaluator_hash).
   - id: addition_em.cpu_stub@0.1
-    manifest_hash: "sha256:e7d57d2f8255899295fa6c8149225f6a949fef00a2b59017c9d080a549aff54f"
+    manifest_hash: "sha256:b09acedcd376f8d2fd3532a45ebb2c57f29ea9523b732ecce692c0de4d06ebef"
 multiplicity:
   plan: single_gate
   family: null

@@ -36,9 +36,12 @@ DEFAULT_CONFIG = {
 
 
 def configure_torch() -> None:
-    """Single-threaded deterministic CPU kernels: same seed, same bytes."""
+    """Single-threaded deterministic CPU kernels: same seed, same bytes, on any CPU. oneDNN is off: it JIT-compiles
+    kernels for the CPU's instruction set (GELU ran as `eltwise jit:avx2` on one host and avx512 on another), which
+    ATEN_CPU_CAPABILITY does not reach (gatedtrain/stubs/__init__.py pins ATen and MKL)."""
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
+    torch.backends.mkldnn.enabled = False
 
 
 class Block(nn.Module):

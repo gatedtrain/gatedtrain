@@ -11,7 +11,7 @@ artifacts:
   train:        {type: training_dataset, uri: "file:data/train"}
   heldout:      {type: prompt_dataset, uri: "file:data/heldout-small", disjoint_from: [train]}
   trainer_cfg:  {type: trainer_config, uri: "file:trainer-lr0.yaml"}
-  registration: {type: registration, uri: "file:registration-few-prompts.yaml@sha256:0a321acf8517cfc28ece0d82e850f48624f99b3661a13c7b7cf0de35809dabe3"}
+  registration: {type: registration, uri: "file:registration-few-prompts.yaml@sha256:ad4f83cea66455652a47156fba9f978a7969f49a84073325f760b54539040e4d"}
 stages:
   - id: sft
     uses: sft.cpu_stub@0.1
