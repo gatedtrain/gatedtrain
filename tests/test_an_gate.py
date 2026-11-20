@@ -67,6 +67,18 @@ def model_stage(stage_name: str, rate: float, trains: bool) -> type:
     return _Model
 
 
+def choose_stage(base_rate: float) -> type:
+    class _Choose(ti.ChooseDeployment):
+        def run(self, ctx, decision):
+            out = super().run(ctx, decision)
+            base = {"schema": SCHEMA_MODEL_REF, "schema_version": 1, "generator": GENERATOR, "rate": base_rate,
+                    "label": "base"}
+            out["base"] = ctx.project.write_artifact(self.name, "base", base, SCHEMA_MODEL_REF)
+            return out
+
+    return _Choose
+
+
 class GateBase(ti.Base):
     base_rate = 0.5
     cand_rate = 1.0
@@ -78,6 +90,10 @@ class GateBase(ti.Base):
         GENERATE_CALLS.clear()
         LABELS.clear()
 
+    baseline_src = "choose_x.base"
+    candidate_src = "train_x.model"
+    extra_stage = False
+
     def make(self, data: bytes | None = None, *, name: str = "proj", n: int = 400) -> Project:
         rows = unique_rows(n)
         LABELS.update({r["input"]: r["label"] for r in rows})
@@ -87,12 +103,13 @@ class GateBase(ti.Base):
             {"name": "intake_seal", "stage": "intake_seal"},
             {"name": "choose_x", "stage": "choose_x"},
             {"name": "preregister", "stage": "preregister",
-             "inputs": {"sealed_summary": "intake_seal.sealed_summary", "deployment": "choose_x.deployment"}},
-            {"name": "base_x", "stage": "base_x"},
+             "inputs": {"sealed_summary": "intake_seal.sealed_summary", "deployment": "choose_x.deployment",
+                        "base_model": "choose_x.base"}},
             {"name": "train_x", "stage": "train_x"},
+            *([{"name": "other_x", "stage": "other_x"}] if self.extra_stage else []),
             {"name": "evaluate_sealed", "stage": "evaluate_sealed",
-             "inputs": {"registration": "preregister.registration", "baseline_model": "base_x.model",
-                        "candidate_model": "train_x.model"}},
+             "inputs": {"registration": "preregister.registration", "baseline_model": self.baseline_src,
+                        "candidate_model": self.candidate_src}},
             {"name": "gate", "stage": "gate",
              "inputs": {"registration": "preregister.registration",
                         "baseline_records": "evaluate_sealed.baseline_records",
@@ -106,14 +123,15 @@ class GateBase(ti.Base):
 
     def registry(self) -> dict:
         return {**stage_registry(), "train_x": model_stage("train_x", self.cand_rate, True),
-                "base_x": model_stage("base_x", self.base_rate, False), "choose_x": ti.ChooseDeployment}
+                "other_x": model_stage("other_x", self.cand_rate, False), "choose_x": choose_stage(self.base_rate)}
 
     def upto_registration(self, proj: Project) -> None:
         self.run_(proj, "intake_seal")
         self.run_(proj, "choose_x")
         self.run_(proj, "preregister", {"metric_confirmed": True})
-        self.run_(proj, "base_x")
         self.run_(proj, "train_x")
+        if self.extra_stage:
+            self.run_(proj, "other_x")
 
     def through(self, proj: Project, last: str = "report") -> dict:
         self.upto_registration(proj)
@@ -133,6 +151,16 @@ class GateBase(ti.Base):
             if path.is_file() and "trust" not in path.relative_to(proj.root).parts:
                 blob += path.read_bytes()
         return blob
+
+
+SCHEMA_RECORDS = trust_stages.SCHEMA_SEALED_RECORDS
+
+
+def plugin(name: str, outputs: dict) -> type:
+    return type(name, (), {"name": name, "version": "1", "inputs": {}, "outputs": outputs, "needs": frozenset(),
+                           "params": frozenset(), "trains": False,
+                           "plan": lambda self, ctx: Proposal(name, "x", {}, {}),
+                           "run": lambda self, ctx, decision: {}, "check": lambda self, ctx, outputs: []})
 
 
 class RegistryTest(unittest.TestCase):
@@ -476,5 +504,221 @@ class ReportTest(GateBase):
         self.assertEqual({p.rule for p in problems}, {"AN-10"})
 
 
+class TrustWiringTest(GateBase):
+    """Review round 1, critical 1: a plugin cannot stand in for a trust stage's records."""
+
+    def problems(self, mutate) -> list:
+        from gatedtrain.ainative.pipeline import load_pipeline, pipeline_problems
+        proj = self.make()
+        raw = yaml.safe_load(Path(proj.pipeline).read_text())
+        mutate(raw)
+        path = self.tmp / "mutated.yaml"
+        path.write_text(yaml.safe_dump(raw))
+        reg = {**self.registry(), "forge_x": plugin("forge_x", {"baseline_records": SCHEMA_RECORDS,
+                                                                "registration": trust_stages.SCHEMA_REGISTRATION})}
+        return pipeline_problems(load_pipeline(path), reg)
+
+    @staticmethod
+    def _insert_forger(raw: dict) -> None:
+        names = [x["name"] for x in raw["stages"]]
+        raw["stages"].insert(names.index("evaluate_sealed"), {"name": "forge_x", "stage": "forge_x"})
+
+    def test_a_plugin_that_declares_a_trust_schema_is_refused(self) -> None:
+        got = self.problems(self._insert_forger)
+        refused = {(p.rule, p.field) for p in got}
+        self.assertIn(("AN-3", "stages[4].outputs.baseline_records"), refused)
+        self.assertIn(("AN-3", "stages[4].outputs.registration"), refused)
+
+    def test_gate_inputs_wired_from_a_plugin_are_refused(self) -> None:
+        def mutate(raw):
+            self._insert_forger(raw)
+            gate = next(x for x in raw["stages"] if x["name"] == "gate")
+            gate["inputs"]["baseline_records"] = "forge_x.baseline_records"
+            gate["inputs"]["registration"] = "forge_x.registration"
+
+        refused = {(p.rule, p.field) for p in self.problems(mutate)}
+        self.assertIn(("AN-4", "stages[6].inputs.baseline_records"), refused)
+        self.assertIn(("AN-4", "stages[6].inputs.registration"), refused)
+
+    def test_a_renamed_trust_stage_is_refused(self) -> None:
+        def mutate(raw):
+            gate = next(x for x in raw["stages"] if x["name"] == "gate")
+            gate["name"] = "gate2"
+            rep = next(x for x in raw["stages"] if x["name"] == "report")
+            rep["inputs"]["gate_result"] = "gate2.gate_result"
+
+        got = self.problems(mutate)
+        self.assertTrue(any(p.rule == "AN-4" and "must be named 'gate'" in p.message for p in got), got)
+
+    def test_a_plugin_entry_point_with_a_trust_schema_is_refused(self) -> None:
+        from gatedtrain.ainative import stage as stage_mod
+
+        class EP:
+            name = "forge_x"
+            value = "x:y"
+
+            def load(self):
+                return plugin("forge_x", {"gate_result": trust_stages.SCHEMA_GATE_RESULT})
+
+        real = stage_mod._plugin_entry_points
+        stage_mod._plugin_entry_points = lambda: [EP()]
+        self.addCleanup(setattr, stage_mod, "_plugin_entry_points", real)
+        with self.assertRaises(Refused) as cm:
+            stage_registry()
+        self.assertEqual(cm.exception.problems[0].rule, "AN-3")
+        self.assertIn("reserved trust schema", cm.exception.problems[0].message)
+
+
+class ForgeBase(GateBase):
+    """Direct `Gate.run` on records the test writes itself (what a hostile record writer could produce)."""
+
+    def forged_gate(self, proj: Project, *, mutate_cand=None, mutate_base=None, reg_ref=None,
+                    record_done: bool = True) -> dict:
+        from gatedtrain.ainative.stage import StageContext
+        if not any(r["stage"] == "evaluate_sealed" and r["event"] == "done" for r in proj.read_attempts()):
+            self.run_(proj, "evaluate_sealed")
+        from gatedtrain.ainative.project import ArtifactRef
+        done0 = [r for r in proj.read_attempts() if r["stage"] == "evaluate_sealed" and r["event"] == "done"][-1]
+        outs = {n: ArtifactRef(**o) for n, o in done0["outputs"].items()}
+        refs = {}
+        for arm, mut in (("baseline_records", mutate_base), ("candidate_records", mutate_cand)):
+            rec = proj.read_artifact(outs[arm])
+            if mut:
+                mut(rec)
+            refs[arm] = proj.write_artifact("evaluate_sealed", arm, rec, SCHEMA_RECORDS)
+        if record_done:
+            done = [r for r in proj.read_attempts() if r["stage"] == "evaluate_sealed" and r["event"] == "done"][-1]
+            row = dict(done, outputs={n: {"stage": r.stage, "name": r.name, "schema": r.schema, "sha256": r.sha256,
+                                          "path": r.path} for n, r in refs.items()})
+            proj.append_attempt({k: v for k, v in row.items() if k not in ("schema", "schema_version")})
+        proj.append_attempt({"stage": "gate", "attempt": 1, "key": "k1", "event": "start"})
+        ctx = StageContext(proj, {"registration": reg_ref or self.reg_ref(proj), **refs}, {}, InProcessTrust(proj),
+                           FixedAlphaLedger(proj))
+        out = Gate().run(ctx, {})
+        return proj.read_artifact(out["gate_result"])
+
+    def refused_gate(self, proj: Project, **kw):
+        with self.assertRaises(Refused) as cm:
+            self.forged_gate(proj, **kw)
+        self.assertEqual(cm.exception.problems[0].rule, "AN-9")
+        self.assertEqual(FixedAlphaLedger(proj).entries(), [])           # nothing was spent
+        return cm.exception.problems[0]
+
+    def test_records_that_are_not_the_ones_evaluate_sealed_recorded_are_refused(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+
+        def all_ones(rec):
+            for r in rec["records"]:
+                r["score"] = 1.0
+
+        p = self.refused_gate(proj, mutate_base=all_ones, record_done=False)
+        self.assertIn("recorded", p.message)
+
+    def test_an_edited_registration_record_cannot_clear_post_hoc(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+        first = self.reg_ref(proj)
+        second = self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.05, "rerun": True}).outputs[
+            "registration"]
+        rec = proj.read_artifact(second)
+        self.assertTrue(rec["post_hoc"])
+        self.run_(proj, "evaluate_sealed")
+        forged = proj.write_artifact("preregister", "registration", dict(rec, post_hoc=False), second.schema)
+        p = self.refused_gate(proj, reg_ref=forged)
+        self.assertIn("post_hoc", p.field)
+        # The older registration (hash not the latest) is refused as well.
+        proj2 = self.make(name="p2")
+        self.upto_registration(proj2)
+        old = self.reg_ref(proj2)
+        old_rec = proj2.read_artifact(old)
+        self.run_(proj2, "preregister", {"metric_confirmed": True, "margin": 0.05, "rerun": True})
+        self.run_(proj2, "evaluate_sealed")
+        old = proj2.write_artifact("preregister", "registration", old_rec, old.schema)
+        p = self.refused_gate(proj2, reg_ref=old)
+        self.assertIn("latest", p.message)
+
+    def test_report_takes_post_hoc_from_the_trust_store(self) -> None:
+        from gatedtrain.ainative.stage import StageContext
+        proj = self.make()
+        self.upto_registration(proj)
+        second = self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.05, "rerun": True}).outputs[
+            "registration"]
+        for ref in ("evaluate_sealed", "gate"):
+            out = self.run_(proj, ref).outputs
+        forged = proj.write_artifact("preregister", "registration",
+                                     dict(proj.read_artifact(second), post_hoc=False), second.schema)
+        ctx = StageContext(proj, {"registration": forged, "power": self.run_(proj, "intake_seal").outputs["power"],
+                                  "gate_result": out["gate_result"]}, {}, InProcessTrust(proj),
+                           FixedAlphaLedger(proj))
+        with self.assertRaises(Refused) as cm:
+            Report().run(ctx, {})
+        self.assertEqual(cm.exception.problems[0].rule, "AN-10")
+
+    def test_records_of_the_wrong_model_make_the_gate_missing(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+
+        def other_model(rec):
+            rec["model_ref_sha256"] = "sha256:" + "2" * 64
+
+        res = self.forged_gate(proj, mutate_base=other_model)
+        self.assertEqual(res["status"], "MISSING")
+        self.assertIn("model_hash_mismatch", res["status_reasons"])
+
+    def test_n_items_must_match_the_registered_sealed_size(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+
+        def short(rec):
+            rec["records"] = rec["records"][:20]
+            rec["n_items"] = 10
+
+        p = self.refused_gate(proj, mutate_cand=short)
+        self.assertIn("sealed set size", p.message)
+
+    def test_a_malformed_row_counts_as_missing_instead_of_being_dropped(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+
+        def bad_row(rec):
+            rec["records"][0]["note"] = "x"          # a field outside {item_id, seed, score}
+
+        res = self.forged_gate(proj, mutate_cand=bad_row)
+        self.assertEqual(res["status"], "MISSING")
+        self.assertIn("malformed_record", res["status_reasons"])
+
+
+class ModelBindingTest(GateBase):
+    """Review round 1, important 1: the arms are the registered base and a trained candidate."""
+
+    def refused_eval(self, **attrs) -> str:
+        for k, v in attrs.items():
+            setattr(self, k, v)
+        proj = self.make()
+        self.upto_registration(proj)
+        p = self.refused(proj, "evaluate_sealed", rule="AN-8")
+        self.assertFalse((proj.root / "stages" / "evaluate_sealed").exists())
+        return p.message
+
+    def test_baseline_must_be_the_registered_base_model(self) -> None:
+        self.assertIn("registered", self.refused_eval(baseline_src="train_x.model", candidate_src="choose_x.base"))
+
+    def test_candidate_must_differ_from_the_baseline(self) -> None:
+        self.assertIn("same model", self.refused_eval(candidate_src="choose_x.base"))
+
+    def test_candidate_must_come_from_a_training_stage(self) -> None:
+        self.assertIn("training", self.refused_eval(candidate_src="other_x.model", extra_stage=True))
+
+    def test_registration_binds_the_base_model(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+        out = proj.read_artifact(self.reg_ref(proj))
+        full = InProcessTrust(proj).registration(out["hash"])
+        base = self.run_(proj, "choose_x").outputs["base"]
+        self.assertEqual(trust_stages.registered_base(full), base.sha256)
+
+
 if __name__ == "__main__":
     unittest.main()
+

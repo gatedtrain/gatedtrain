@@ -52,7 +52,7 @@ class ChooseDeployment:
     name = "choose_x"
     version = "1"
     inputs: dict = {}
-    outputs = {"deployment": SCHEMA_DEPLOYMENT}
+    outputs = {"deployment": SCHEMA_DEPLOYMENT, "base": SCHEMA_MODEL}
     needs: frozenset = frozenset()
     params: frozenset = frozenset()
     trains = False
@@ -62,7 +62,9 @@ class ChooseDeployment:
         return Proposal(self.name, "choose", {}, {})
 
     def run(self, ctx, decision):
-        return {"deployment": ctx.project.write_artifact(self.name, "deployment", self.record, SCHEMA_DEPLOYMENT)}
+        base = {"schema": SCHEMA_MODEL, "schema_version": 1, "label": "base"}
+        return {"deployment": ctx.project.write_artifact(self.name, "deployment", self.record, SCHEMA_DEPLOYMENT),
+                "base": ctx.project.write_artifact(self.name, "base", base, SCHEMA_MODEL)}
 
     def check(self, ctx, outputs):
         return []
@@ -95,10 +97,11 @@ class Base(unittest.TestCase):
             {"name": "intake_seal", "stage": "intake_seal"},
             {"name": "choose_x", "stage": "choose_x"},
             {"name": "preregister", "stage": "preregister",
-             "inputs": {"sealed_summary": "intake_seal.sealed_summary", "deployment": "choose_x.deployment"}},
+             "inputs": {"sealed_summary": "intake_seal.sealed_summary", "deployment": "choose_x.deployment",
+                        "base_model": "choose_x.base"}},
             {"name": "train_x", "stage": "train_x"},
             {"name": "evaluate_sealed", "stage": "evaluate_sealed",
-             "inputs": {"registration": "preregister.registration", "baseline_model": "train_x.model",
+             "inputs": {"registration": "preregister.registration", "baseline_model": "choose_x.base",
                         "candidate_model": "train_x.model"}},
             {"name": "gate", "stage": "gate",
              "inputs": {"registration": "preregister.registration",
@@ -437,7 +440,7 @@ class PreregisterTest(Base):
 
     def test_deployment_input_is_required(self) -> None:
         self.assertEqual(Preregister.inputs, {"sealed_summary": "gatedtrain.ainative.sealed_summary",
-                                              "deployment": SCHEMA_DEPLOYMENT})
+                                              "deployment": SCHEMA_DEPLOYMENT, "base_model": SCHEMA_MODEL})
 
     def test_training_start_is_logged_and_read_from_the_log_not_the_spec(self) -> None:
         proj = self.intake()
@@ -475,7 +478,8 @@ class PreregisterTest(Base):
         from gatedtrain.ainative.stage import StageContext
         from gatedtrain.ainative.trust import FixedAlphaLedger
         inputs = {"sealed_summary": self.run_(proj, "intake_seal").outputs["sealed_summary"],
-                  "deployment": self.run_(proj, "choose_x").outputs["deployment"]}
+                  "deployment": self.run_(proj, "choose_x").outputs["deployment"],
+                  "base_model": self.run_(proj, "choose_x").outputs["base"]}
         ctx = StageContext(proj, inputs, {}, InProcessTrust(proj), FixedAlphaLedger(proj))
         self.assertEqual(Preregister().check(ctx, out), [])
         reg = proj.read_artifact(out["registration"])
@@ -495,7 +499,8 @@ class PreregisterTest(Base):
         out_rec = dict(proj.read_artifact(out["registration"]), hash=digest)
         ref = proj.write_artifact("preregister", "registration", out_rec, "gatedtrain.ainative.registration")
         ins = {"sealed_summary": self.run_(proj, "intake_seal").outputs["sealed_summary"],
-               "deployment": self.run_(proj, "choose_x").outputs["deployment"]}
+               "deployment": self.run_(proj, "choose_x").outputs["deployment"],
+                  "base_model": self.run_(proj, "choose_x").outputs["base"]}
         ctx = StageContext(proj, ins, {}, trust, FixedAlphaLedger(proj))
         self.assertTrue(any("evaluator" in p.field for p in Preregister().check(ctx, {"registration": ref})))
 

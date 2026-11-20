@@ -79,6 +79,19 @@ def _is_training(spec: PipelineSpec, ref: StageRef, cls: Any) -> bool:
     return trains or "gpu" in needs or ref.name in spec.training_stages or ref.stage in spec.training_stages
 
 
+# Trust-stage inputs that only the named trust stage may produce (a plugin cannot stand in for it).
+TRUST_INPUT_SOURCES = {"registration": "preregister", "sealed_summary": "intake_seal", "power": "intake_seal",
+                       "baseline_records": "evaluate_sealed", "candidate_records": "evaluate_sealed",
+                       "gate_result": "gate"}
+
+
+def _trust_schemas() -> set[str]:
+    from .stage import builtin_stages
+
+    built = builtin_stages()
+    return {schema for t in TRUST_STAGES for schema in dict(built[t].outputs).values()}
+
+
 def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
     problems: list[Problem] = []
 
@@ -109,6 +122,15 @@ def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
         if ref.name in TRUST_STAGES and ref.stage != ref.name:
             add(f"stages[{i}].name", f"stage name {ref.name!r} is reserved for the trust stage of that name",
                 "rename the stage")
+        if ref.stage in TRUST_STAGES and ref.name != ref.stage:
+            add(f"stages[{i}].name", f"the trust stage {ref.stage!r} must be named {ref.stage!r}, not {ref.name!r}",
+                f"name the stage {ref.stage!r}")
+        if ref.stage not in TRUST_STAGES:
+            for out_name, schema in dict(getattr(cls, "outputs", {})).items():
+                if schema in _trust_schemas():
+                    problems.append(Problem("AN-3", f"stages[{i}].outputs.{out_name}",
+                                            f"output {out_name!r} uses the reserved trust schema {schema!r}",
+                                            "only the built-in trust stages write trust records; use another schema"))
         accepted = frozenset(getattr(cls, "params", frozenset()))
         for key in ref.params:
             if key not in accepted:
@@ -137,6 +159,11 @@ def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
             if j >= i:
                 add(field_, f"input comes from {producer_name!r}, which does not run before this stage",
                     "wire the input from an earlier stage")
+                continue
+            want = TRUST_INPUT_SOURCES.get(key) if ref.stage in TRUST_STAGES else None
+            if want is not None and stages[j].stage != want:
+                add(field_, f"input {key!r} of trust stage {ref.stage!r} must come from the {want!r} stage, not "
+                    f"{producer_name!r}", f"wire it from {want}")
                 continue
             pcls = registry.get(stages[j].stage)
             if pcls is None:

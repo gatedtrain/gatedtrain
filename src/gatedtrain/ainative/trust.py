@@ -43,6 +43,8 @@ class TrustBackend(Protocol):
 
     def registration(self, hash: str) -> dict: ...
 
+    def latest_registration(self) -> str | None: ...              # the hash the last `register` returned
+
 
 class AlphaLedger(Protocol):
     def available(self) -> float: ...
@@ -89,6 +91,7 @@ class InProcessTrust:
     """Step 1 stub: sealed items and registrations are files in the project's `trust/` directory."""
 
     sealed_guarantee = UNSEALED_GUARANTEE
+    LATEST = "trust/registrations/latest"
 
     def __init__(self, project: Project) -> None:
         self.project = project
@@ -138,6 +141,15 @@ class InProcessTrust:
                                 "use plain JSON values") from None
         digest = sha256_bytes(data)
         _write_trust_file(self.project, f"trust/registrations/{_hex(digest)}.json", data)
+        _write_trust_file(self.project, self.LATEST, digest.encode("ascii"))
+        return digest
+
+    def latest_registration(self) -> str | None:
+        data = _read_trust_file(self.project, self.LATEST)
+        if data is None:
+            return None
+        digest = data.decode("ascii", "replace").strip()
+        _hex(digest)
         return digest
 
     def registration(self, hash: str) -> dict:

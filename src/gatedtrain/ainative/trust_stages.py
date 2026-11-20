@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -329,11 +330,21 @@ def _deployment(ctx: StageContext) -> dict:
     return {"sampler": dep["sampler"], "eval_seeds": seeds}
 
 
-def _registration(v: dict, item_set_hash: str, dep: dict) -> dict:
+_BASE_ID = re.compile(r"-base-([0-9a-f]{64})$")
+
+
+def registered_base(full: dict) -> str | None:
+    """The `sha256:<hex>` of the base model reference a registration binds. The registration schema has no field for
+    it, so it rides in `registration_id` (`ainative-<item set>-base-<hex>`), which the registration hash covers."""
+    m = _BASE_ID.search(str(full.get("registration_id", "")))
+    return f"sha256:{m.group(1)}" if m else None
+
+
+def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str) -> dict:
     row = SCORERS[v["scorer"]]
     return {
         "registration_version": 1,
-        "registration_id": f"ainative-{item_set_hash.removeprefix('sha256:')[:16]}",
+        "registration_id": f"ainative-{item_set_hash.removeprefix('sha256:')[:16]}-base-{base_sha.removeprefix('sha256:')}",
         "signed_by": "prototype-unsigned",
         "workflow": "ainative",
         "gate": "quality_gate",
@@ -388,7 +399,8 @@ def _prior(ctx: StageContext) -> tuple[dict, dict] | None:
 class Preregister:
     name = "preregister"
     version = "1"
-    inputs = {"sealed_summary": SCHEMA_SEALED_SUMMARY, "deployment": SCHEMA_DEPLOYMENT}
+    inputs = {"sealed_summary": SCHEMA_SEALED_SUMMARY, "deployment": SCHEMA_DEPLOYMENT,
+              "base_model": SCHEMA_MODEL_REF}
     outputs = {"registration": SCHEMA_REGISTRATION}
     needs = frozenset({"user"})
     params: frozenset[str] = frozenset()
@@ -409,7 +421,8 @@ class Preregister:
                            "they agree (they may change scorer or margin first)")
         v = _values(ctx, decision)
         item_hash = _sealed_summary(ctx)["manifest_sha256"]
-        base = _registration(v, item_hash, _deployment(ctx))
+        ctx.project.read_artifact(ctx.inputs["base_model"])
+        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256)
         problems = check_contents(base)
         if problems:
             raise Refused(problems)
@@ -452,6 +465,8 @@ class Preregister:
         if ev.get("id") != scorers.EVALUATOR_ID or ev.get("manifest_hash") != resolved_evaluator_hash(ev):
             bad("registration.evaluators[0].manifest_hash",
                 "the registered evaluator hash is not the one the library resolves for the scorer")
+        if registered_base(full) != ctx.inputs["base_model"].sha256:
+            bad("registration.registration_id", "the registered base model is not the base model input")
         if bool(full.get("post_hoc", False)) != out.get("post_hoc"):
             bad("registration.post_hoc", "the output record and the registration disagree on post_hoc")
         return problems
@@ -475,11 +490,47 @@ _REG_KEYS = ("hash", "scorer", "direction", "margin", "alpha", "item_set_hash", 
 
 
 def _registered(ctx: StageContext, rule: str) -> tuple[dict, dict]:
-    """(registration output record, full registration) of the `registration` input."""
+    """(registration facts, full registration) of the `registration` input. The facts are read from the trust store,
+    never from the output record: the record must name the latest registration held there and agree with it."""
     out = ctx.project.read_artifact(ctx.inputs["registration"])
     if not isinstance(out, dict) or not isinstance(out.get("hash"), str):
         raise _refuse(rule, "inputs.registration", "the registration record is malformed", "rerun preregister")
-    return out, ctx.trust.registration(out["hash"])
+    if out["hash"] != ctx.trust.latest_registration():
+        raise _refuse(rule, "inputs.registration", "the registration is not the latest one in the trust store",
+                      "rerun preregister")
+    full = ctx.trust.registration(out["hash"])
+    clause = full.get("clause") or {}
+    facts = {"hash": out["hash"], "scorer": clause.get("metric"), "direction": clause.get("direction"),
+             "margin": clause.get("margin"), "alpha": clause.get("alpha"),
+             "item_set_hash": (full.get("eval_distribution") or {}).get("item_set_hash"),
+             "post_hoc": bool(full.get("post_hoc", False)), "amends": full.get("amends")}
+    for key, want in facts.items():
+        if out.get(key) != want:
+            raise _refuse(rule, f"inputs.registration.{key}",
+                          f"the registration record differs from the trust store on {key}", "rerun preregister")
+    return facts, full
+
+
+def _done_row(project: Project, stage: str) -> dict | None:
+    row = None
+    for r in project.read_attempts():
+        if r.get("stage") == stage and r.get("event") == "done":
+            row = r
+    return row
+
+
+def _produced_by_training(project: Project, ref: ArtifactRef) -> bool:
+    """True when the artifact is an output of a done run of its stage whose start line recorded `trains`."""
+    attempt = None
+    for r in project.read_attempts():
+        if r.get("stage") == ref.stage and r.get("event") == "done":
+            outs = r.get("outputs") or {}
+            attempt = r.get("attempt") if any(isinstance(o, dict) and o.get("sha256") == ref.sha256
+                                              and o.get("path") == ref.path for o in outs.values()) else None
+    if attempt is None:
+        return False
+    return any(r.get("stage") == ref.stage and r.get("event") == "start" and r.get("attempt") == attempt
+               and r.get("trains") is True for r in project.read_attempts())
 
 
 def _evaluator_problem(full: dict) -> str | None:
@@ -553,6 +604,16 @@ class EvaluateSealed:
         seeds = _eval_seeds(full)
         item_set = full["eval_distribution"]["item_set_hash"]
         sealed = SealedRef(item_set)
+        base_ref, cand_ref = ctx.inputs["baseline_model"], ctx.inputs["candidate_model"]
+        if base_ref.sha256 != registered_base(full):
+            raise _refuse("AN-8", "inputs.baseline_model", "the baseline is not the base model that was registered",
+                          "wire baseline_model from the stage that produced the registered base model")
+        if cand_ref.sha256 == base_ref.sha256:
+            raise _refuse("AN-8", "inputs.candidate_model", "the candidate and the baseline are the same model",
+                          "wire candidate_model from the training stage")
+        if not _produced_by_training(ctx.project, cand_ref):
+            raise _refuse("AN-8", "inputs.candidate_model", "the candidate was not produced by a training stage",
+                          "wire candidate_model from a stage that trains")
         out: dict[str, ArtifactRef] = {}
         for arm in ("baseline", "candidate"):
             ref = ctx.inputs[f"{arm}_model"]
@@ -602,7 +663,20 @@ def _attempt_key(project: Project, stage: str) -> str:
     return key
 
 
-def _arm(project: Project, ref: ArtifactRef, reg: dict, seeds: list) -> dict:
+def _convert(rec: Any, seeds: list) -> Any:
+    """A sealed record as an `evaluate_items` record. A row that is not a well formed record is passed on as it is
+    (or with the fields it lacks left out), so the gate counts it as missing instead of dropping it."""
+    if not isinstance(rec, dict):
+        return rec
+    out = {k: v for k, v in rec.items() if k != "item_id"}
+    if "item_id" in rec:
+        out["item"] = rec["item_id"]
+    seed = rec.get("seed")
+    out["repeat"] = seeds.index(seed) if isinstance(seed, int) and seed in seeds else -1
+    return out
+
+
+def _arm(project: Project, ref: ArtifactRef, reg: dict, seeds: list, n_sealed: int, ev_row: dict | None) -> dict:
     rec = project.read_artifact(ref)
     if not isinstance(rec, dict) or not isinstance(rec.get("records"), list):
         raise _refuse("AN-9", f"inputs.{ref.name}", "the sealed records are malformed", "rerun evaluate_sealed")
@@ -612,10 +686,14 @@ def _arm(project: Project, ref: ArtifactRef, reg: dict, seeds: list) -> dict:
     if rec.get("eval_seeds") != seeds:
         raise _refuse("AN-9", f"inputs.{ref.name}", "the records use other evaluation seeds than the registration",
                       "rerun evaluate_sealed")
-    rows = [{"item": r["item_id"], "repeat": seeds.index(r["seed"]) if r.get("seed") in seeds else -1,
-             "seed": r.get("seed"), "score": r["score"]} for r in rec["records"] if isinstance(r, dict)
-            and "item_id" in r and "score" in r]
-    return {"records": rows, "model_manifest_hash": rec.get("model_ref_sha256"), "n_items": rec.get("n_items")}
+    recorded = ((ev_row or {}).get("outputs") or {}).get(ref.name)
+    if not isinstance(recorded, dict) or recorded.get("sha256") != ref.sha256:
+        raise _refuse("AN-9", f"inputs.{ref.name}", "the records are not the ones evaluate_sealed recorded",
+                      "wire the records from the evaluate_sealed stage and rerun it")
+    if rec.get("n_items") != n_sealed:
+        raise _refuse("AN-9", f"inputs.{ref.name}", "the records do not cover the registered sealed set size",
+                      "rerun evaluate_sealed")
+    return {"records": [_convert(r, seeds) for r in rec["records"]], "model_manifest_hash": rec.get("model_ref_sha256")}
 
 
 class Gate:
@@ -647,19 +725,23 @@ class Gate:
             raise _refuse("AN-9", "registration.clause", "the registration and its output record disagree on the "
                           "direction or the margin", "rerun preregister")
         seeds = _eval_seeds(full)
-        base = _arm(ctx.project, ctx.inputs["baseline_records"], reg, seeds)
-        cand = _arm(ctx.project, ctx.inputs["candidate_records"], reg, seeds)
-        if base["n_items"] != cand["n_items"] or not isinstance(base["n_items"], int) or base["n_items"] < 1:
-            raise _refuse("AN-9", "inputs", "the two arms do not score the same items", "rerun evaluate_sealed")
+        n_sealed = ctx.trust.sealed_summary(SealedRef(reg["item_set_hash"]))["n"]
+        ev_row = _done_row(ctx.project, "evaluate_sealed")
+        if ev_row is None:
+            raise _refuse("AN-9", "inputs", "evaluate_sealed has no done record", "run evaluate_sealed first")
+        base = _arm(ctx.project, ctx.inputs["baseline_records"], reg, seeds, n_sealed, ev_row)
+        cand = _arm(ctx.project, ctx.inputs["candidate_records"], reg, seeds, n_sealed, ev_row)
+        cand_model = (ev_row.get("input_sha256s") or {}).get("candidate_model")
+        expected = {"baseline": registered_base(full), "candidate": cand_model}
         attempt_id = _attempt_key(ctx.project, self.name)
         alpha = ctx.ledger.spend(attempt_id)                      # the ledger decides alpha, not the registration
         clause["alpha"] = alpha
         boot = full["bootstrap"]
         try:
-            result = gates.evaluate_items(clause, base, cand, items=list(range(base["n_items"])),
+            result = gates.evaluate_items(clause, base, cand, items=list(range(n_sealed)),
                                           seed=int(boot["seed"]), n_boot=int(boot["replicates"]),
                                           min_paired=min_paired(full), max_unpaired=max_unpaired(full),
-                                          score_range=(0.0, 1.0))
+                                          score_range=(0.0, 1.0), expected_models=expected)
         except Exception:
             ctx.ledger.record(attempt_id, False)
             raise
@@ -672,7 +754,7 @@ class Gate:
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         res = ctx.project.read_artifact(outputs["gate_result"])
-        reg = ctx.project.read_artifact(ctx.inputs["registration"])
+        reg, _ = _registered(ctx, "AN-9")
         problems: list[Problem] = []
 
         def bad(field: str, message: str) -> None:
@@ -682,7 +764,9 @@ class Gate:
             bad("gate_result.registration_hash", "the result is for another registration")
         if res.get("status") not in (gates.PASS, gates.FAIL, gates.INCONCLUSIVE, gates.MISSING):
             bad("gate_result.status", "the status is not PASS, FAIL, INCONCLUSIVE or MISSING")
-        if reg.get("post_hoc") is True and res.get("status") == gates.PASS:
+        if res.get("post_hoc") is not reg["post_hoc"]:
+            bad("gate_result.post_hoc", "the result disagrees with the registration on post_hoc")
+        if reg["post_hoc"] is True and res.get("status") == gates.PASS:
             bad("gate_result.status", "a post hoc registration cannot PASS")
         entry = [e for e in ctx.ledger.entries() if e["attempt_id"] == res.get("attempt_id")]
         if len(entry) != 1 or entry[0]["alpha"] != res.get("alpha") or \
@@ -772,9 +856,12 @@ class Report:
 
     @staticmethod
     def _build(ctx: StageContext) -> dict:
-        reg = ctx.project.read_artifact(ctx.inputs["registration"])
+        reg, _ = _registered(ctx, "AN-10")
         power = ctx.project.read_artifact(ctx.inputs["power"])
         gate = ctx.project.read_artifact(ctx.inputs["gate_result"])
+        if gate.get("registration_hash") != reg["hash"] or gate.get("post_hoc") is not reg["post_hoc"]:
+            raise _refuse("AN-10", "inputs.gate_result", "the gate result is not for the latest registration",
+                          "rerun the gate in a new project or rerun report with the matching result")
         keep = {"schema", "schema_version"}
         attempts = [{"attempt": r.get("attempt"), "event": r.get("event"), "utc": r.get("utc"), "key": r.get("key")}
                     for r in ctx.project.read_attempts() if r.get("stage") == "gate"]
@@ -813,8 +900,8 @@ class Report:
             problems.append(Problem("AN-10", rel, "report.md is not the rendering of report.json",
                                     "rerun report; do not edit report.md"))
         gate = ctx.project.read_artifact(ctx.inputs["gate_result"])
-        reg = ctx.project.read_artifact(ctx.inputs["registration"])
-        if report.get("status") != _effective_status(gate.get("status"), bool(reg.get("post_hoc"))):
+        reg, _ = _registered(ctx, "AN-10")
+        if report.get("status") != _effective_status(gate.get("status"), reg["post_hoc"]):
             problems.append(Problem("AN-10", "report.status", "the report status differs from the gate result",
                                     "rerun report"))
         if report.get("sealed_guarantee") != ctx.trust.sealed_guarantee:

@@ -150,6 +150,11 @@ def stage_registry() -> dict[str, type]:
                                     "fix or uninstall the plugin"))
             continue
         bad = _plugin_attr_problems(cls)
+        if not bad:
+            from .pipeline import _trust_schemas
+
+            bad = [f"output {k!r} uses the reserved trust schema {v!r}" for k, v in cls.outputs.items()
+                   if v in _trust_schemas()]
         if bad:
             problems.append(Problem("AN-3", f"entry point {ep.name}",
                                     f"plugin {ep.value!r} is not a valid stage: " + "; ".join(bad),
