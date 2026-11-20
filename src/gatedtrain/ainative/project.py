@@ -96,6 +96,7 @@ class Project:
     @classmethod
     def load(cls, root: Path) -> "Project":
         path = Path(root) / "project.yaml"
+        _refuse_links(Path(root), "project.yaml")
         try:
             doc = yaml.safe_load(path.read_bytes().decode("utf-8"))
         except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
@@ -149,12 +150,37 @@ class Project:
     def append_attempt(self, event: dict) -> None:
         row = {"schema": ATTEMPT_SCHEMA, "schema_version": SCHEMA_VERSION, **event}
         line = canonical_json(row) + b"\n"
-        fd = os.open(self.root / "attempts.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        _refuse_links(self.root, "attempts.jsonl")
+        fd = os.open(self.root / "attempts.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
         try:
             os.write(fd, line)
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def read_attempts(self) -> list[dict]:
+        """The attempt log in order; an absent log is empty; a line that is not a JSON object is refused."""
+        _refuse_links(self.root, "attempts.jsonl")
+        try:
+            raw = (self.root / "attempts.jsonl").read_bytes()
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise _refuse("attempts.jsonl", f"cannot read the attempt log ({type(exc).__name__})",
+                          "check the file permissions") from None
+        rows: list[dict] = []
+        for n, line in enumerate(raw.split(b"\n"), 1):
+            if not line:
+                continue
+            try:
+                row = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                row = None
+            if not isinstance(row, dict):
+                raise _refuse(f"attempts.jsonl line {n}", "the line is not a JSON object",
+                              "the log was damaged; restore it from a copy")
+            rows.append(row)
+        return rows
 
 
 def create_project(root: Path, *, goal: str, data: Path, pipeline: str, budget: dict) -> Project:

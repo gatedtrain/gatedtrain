@@ -158,6 +158,25 @@ class ProjectStoreTest(unittest.TestCase):
         self.refusal(lambda: p.read_artifact(ref))
         self.assertEqual(os.listdir(outside / "gate"), ["v.json"])
 
+    def test_symlinked_attempt_log_refused(self) -> None:
+        p = self.make()
+        outside = self.tmp / "outside.jsonl"
+        outside.write_text("keep\n")
+        (self.root / "attempts.jsonl").symlink_to(outside)
+        self.refusal(lambda: p.append_attempt({"stage": "gate"}))
+        self.refusal(lambda: p.read_attempts())
+        self.assertEqual(outside.read_text(), "keep\n")
+
+    def test_symlinked_project_file_refused(self) -> None:
+        self.make()
+        outside = self.tmp / "outside.yaml"
+        outside.write_bytes((self.root / "project.yaml").read_bytes())
+        before = outside.read_bytes()
+        (self.root / "project.yaml").unlink()
+        (self.root / "project.yaml").symlink_to(outside)
+        self.refusal(lambda: Project.load(self.root))
+        self.assertEqual(outside.read_bytes(), before)
+
     def test_append_attempt_is_jsonl(self) -> None:
         p = self.make()
         p.append_attempt({"stage": "gate", "n": 1})
