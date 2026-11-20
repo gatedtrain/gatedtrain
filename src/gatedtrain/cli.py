@@ -14,15 +14,31 @@ from pathlib import Path
 
 from . import STUB_MARK, __version__
 from .errors import Problem, Refused
+from .output import Result, emit
 from .paths import resolve
 
 EXIT_OK, EXIT_NOT_PASS, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
 
 
-def _refuse(problems: list[Problem]) -> int:
-    for p in problems:
-        print(p.line(), file=sys.stderr)
-    return EXIT_REFUSED
+def _as_json(args) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def _finish(args, data: dict, human: str = "", *, ok: bool = True, exit_code: int = EXIT_OK,
+            warnings: list[str] | None = None) -> int:
+    """Emit a finished command: `human` on stdout in text mode, one JSON object with `--json`."""
+    return emit(Result(args.command, ok, exit_code, data, [], list(warnings or [])), as_json=_as_json(args), human=human)
+
+
+def _refuse(args, problems: list[Problem], warnings: list[str] | None = None) -> int:
+    return emit(Result(args.command, False, EXIT_REFUSED, {}, list(problems), list(warnings or [])),
+                as_json=_as_json(args), human="")
+
+
+def _gate_result(args, run_dir, report, text, warnings: list[str] | None = None) -> int:
+    ok = report["status"] == "PASS"
+    return _finish(args, {"run_dir": str(run_dir), "report": report}, f"run_dir: {run_dir}\n{text}", ok=ok,
+                   exit_code=EXIT_OK if ok else EXIT_NOT_PASS, warnings=warnings)
 
 
 def cmd_validate(args) -> int:
@@ -31,9 +47,8 @@ def cmd_validate(args) -> int:
     try:
         load_spec(Path(args.spec))
     except Refused as exc:
-        return _refuse(exc.problems)
-    print("ok")
-    return EXIT_OK
+        return _refuse(args, exc.problems)
+    return _finish(args, {}, "ok\n")
 
 
 def cmd_run(args) -> int:
@@ -42,10 +57,8 @@ def cmd_run(args) -> int:
     try:
         run_dir, report, text = run(Path(args.spec), Path(args.runs_root))
     except Refused as exc:
-        return _refuse(exc.problems)
-    print(f"run_dir: {run_dir}")
-    print(text, end="")
-    return EXIT_OK if report["status"] == "PASS" else EXIT_NOT_PASS
+        return _refuse(args, exc.problems)
+    return _gate_result(args, run_dir, report, text)
 
 
 def cmd_warmup(args) -> int:
@@ -53,15 +66,14 @@ def cmd_warmup(args) -> int:
 
     out = resolve(args.out)
     if out.exists():
-        return _refuse([Problem("WARMUP-OUT", "--out", f"{out} already exists; a warm-up never overwrites",
-                                "pass a new --out directory")])
+        return _refuse(args, [Problem("WARMUP-OUT", "--out", f"{out} already exists; a warm-up never overwrites",
+                                      "pass a new --out directory")])
     try:
         trainer.load_config(Path(args.config), kind="warmup")
         trainer.warmup(Path(args.config), out)
     except trainer.ConfigError as exc:
-        return _refuse([Problem("TRAINER-CONFIG", exc.field, exc.message, exc.fix)])
-    print(f"baseline: {out} ({STUB_MARK} warm-up checkpoint)")
-    return EXIT_OK
+        return _refuse(args, [Problem("TRAINER-CONFIG", exc.field, exc.message, exc.fix)])
+    return _finish(args, {"baseline": str(out)}, f"baseline: {out} ({STUB_MARK} warm-up checkpoint)\n")
 
 
 def cmd_impact(args) -> int:
@@ -75,36 +87,40 @@ def cmd_impact(args) -> int:
         counts = impact_counts(target, **where)
         ranges = impact_ranges(target, **where)
     except (UnknownTarget, FileNotFoundError) as exc:
-        return _refuse([Problem("IMPACT-TARGET", "shard", str(exc),
-                                "pass sha256:<64 hex> or the path of an existing shard file, and a run directory")])
-    if args.json:
-        query = {"shard": args.shard, "shard_sha256": target, "run_dir": args.run_dir, "runs_root": args.runs_root,
-                 "outcome": "consumed", "include_exposed": False}
-        print(json.dumps({"query": query, "results": results, "counts": counts, "ranges": ranges}, indent=1,
-                         sort_keys=True))
+        return _refuse(args, [Problem("IMPACT-TARGET", "shard", str(exc),
+                                      "pass sha256:<64 hex> or the path of an existing shard file, and a run directory")])
+    query = {"shard": args.shard, "shard_sha256": target, "run_dir": args.run_dir, "runs_root": args.runs_root,
+             "outcome": "consumed", "include_exposed": False}
+    obj = {"query": query, "results": results, "counts": counts, "ranges": ranges}
+    if _as_json(args):                                       # the AN-1 envelope; `data` is the impact object
+        return _finish(args, obj)
+    lines: list[str] = []
+    if args.impact_json:                                     # the legacy `impact ... --json` object (R10A-9, R11A-19)
+        lines.append(json.dumps(obj, indent=1, sort_keys=True))
     else:
         if not results:
-            print("no checkpoint consumed this shard")
+            lines.append("no checkpoint consumed this shard")
         for r in results:
-            print(f"{r['answer']}: {r['checkpoint_hash']} run {r['run_id']} stage {r['stage_id']} "
-                  f"last_step_included {r['last_step_included']} (first step {r['first_step'] if r['first_step'] is not None else 'null'}, "
-                  f"precision {r['precision']}, derivation {r['derivation'] or 'null'})")
-        print(f"orphaned: {counts['orphaned']}, superseded: {counts['superseded']}")
+            lines.append(f"{r['answer']}: {r['checkpoint_hash']} run {r['run_id']} stage {r['stage_id']} "
+                         f"last_step_included {r['last_step_included']} (first step {r['first_step'] if r['first_step'] is not None else 'null'}, "
+                         f"precision {r['precision']}, derivation {r['derivation'] or 'null'})")
+        lines.append(f"orphaned: {counts['orphaned']}, superseded: {counts['superseded']}")
         for kind in ("orphaned", "superseded"):              # R11A-19: ranges for the membership question
             if not ranges[kind]:
-                print(f"{kind}_ranges: none")
+                lines.append(f"{kind}_ranges: none")
             for g in ranges[kind]:
-                print(f"{kind}_range: attempt {g['attempt_id']} shard {g['shard']} steps "
-                      f"{g['first_step']}-{g['last_step']}")
-    return EXIT_OK
+                lines.append(f"{kind}_range: attempt {g['attempt_id']} shard {g['shard']} steps "
+                             f"{g['first_step']}-{g['last_step']}")
+    return _finish(args, obj, "".join(line + "\n" for line in lines))
 
 
-def _tierb_call(fn) -> int:
+def _tierb_call(args, fn, warnings: list[str] | None = None) -> int:
+    """Run `fn() -> (data, human)`; a refusal becomes the refusal result."""
     try:
-        fn()
+        data, human = fn()
     except Refused as exc:
-        return _refuse(exc.problems)
-    return EXIT_OK
+        return _refuse(args, exc.problems, warnings)
+    return _finish(args, data, human, warnings=warnings)
 
 
 def cmd_export(args) -> int:
@@ -113,30 +129,36 @@ def cmd_export(args) -> int:
     def go():
         out = export_gsm8k(Path(args.out), source=Path(args.source) if args.source else None,
                            revision=args.revision, rows_per_shard=args.rows_per_shard)
-        print(f"export: {out}")
-    return _tierb_call(go)
+        return {"export": str(out)}, f"export: {out}\n"
+    return _tierb_call(args, go)
 
 
 def cmd_verify_export(args) -> int:
     from .tierb import verify_export
 
-    return _tierb_call(lambda: (verify_export(Path(args.dir)), print("ok")))
+    def go():
+        verify_export(Path(args.dir))
+        return {}, "ok\n"
+    return _tierb_call(args, go)
 
 
 def cmd_merge_eval(args) -> int:
     from .tierb import merge_eval
 
-    return _tierb_call(lambda: print(f"merged: {merge_eval(Path(args.registration), Path(args.out), [Path(r) for r in args.runs])}"))
+    def go():
+        merged = merge_eval(Path(args.registration), Path(args.out), [Path(r) for r in args.runs])
+        return {"merged": str(merged)}, f"merged: {merged}\n"
+    return _tierb_call(args, go)
 
 
 def cmd_nel_config(args) -> int:
     from .tierb import nel_configs
 
     def go():
-        for p in nel_configs(Path(args.registration), model_url=args.model_url, model_id=args.model_id,
-                             eval_root=args.eval_root, out=Path(args.out)):
-            print(p)
-    return _tierb_call(go)
+        paths = list(nel_configs(Path(args.registration), model_url=args.model_url, model_id=args.model_id,
+                                 eval_root=args.eval_root, out=Path(args.out)))
+        return {"configs": [str(p) for p in paths]}, "".join(f"{p}\n" for p in paths)
+    return _tierb_call(args, go)
 
 
 def cmd_tierb_collect(args) -> int:
@@ -150,24 +172,21 @@ def cmd_tierb_collect(args) -> int:
                                         nemo_rl_modified={"yes": True, "no": False, None: "unknown"}[args.nemo_rl_modified],
                                         image_build_notes=args.image_build_notes)
     except Refused as exc:
-        return _refuse(exc.problems)
-    print(f"run_dir: {run_dir}")
-    print(text, end="")
-    return EXIT_OK if report["status"] == "PASS" else EXIT_NOT_PASS
+        return _refuse(args, exc.problems)
+    return _gate_result(args, run_dir, report, text)
 
 
-def _ext_warnings() -> None:
-    """EXT-85: a stderr line per active `GATEDTRAIN_EXT_*` host-layout override."""
+def _ext_warnings() -> list[str]:
+    """EXT-85: a line per active `GATEDTRAIN_EXT_*` host-layout override (stderr in text mode, `warnings` in JSON)."""
     from .ext.launch import override_warnings
 
-    for line in override_warnings():
-        print(line, file=sys.stderr)
+    return list(override_warnings())
 
 
 def cmd_ext_collect(args) -> int:
     from .ext.collect import collect
 
-    _ext_warnings()
+    warnings = _ext_warnings()
     try:
         run_dir, report, text = collect(Path(args.spec), adapter=args.adapter, stage_out=Path(args.stage_out),
                                         launch_record=Path(args.launch_record), smoke_record=Path(args.smoke_record),
@@ -176,33 +195,40 @@ def cmd_ext_collect(args) -> int:
                                         runs_root=Path(args.runs_root),
                                         sources_root=Path(args.sources_root).absolute() if args.sources_root else None)
     except Refused as exc:
-        return _refuse(exc.problems)
-    print(f"run_dir: {run_dir}")
-    print(text, end="")
-    return EXIT_OK if report["status"] == "PASS" else EXIT_NOT_PASS
+        return _refuse(args, exc.problems, warnings)
+    return _gate_result(args, run_dir, report, text, warnings)
 
 
 def cmd_ext_merge_eval(args) -> int:
     from .ext.merge import merge_eval
 
-    return _tierb_call(lambda: print(f"merged: {merge_eval(Path(args.registration), Path(args.out), [Path(r) for r in args.runs])}"))
+    def go():
+        merged = merge_eval(Path(args.registration), Path(args.out), [Path(r) for r in args.runs])
+        return {"merged": str(merged)}, f"merged: {merged}\n"
+    return _tierb_call(args, go)
 
 
 def cmd_ext_launch(args) -> int:
     from .ext.launch import ext_launch, recheck
 
-    _ext_warnings()
+    warnings = _ext_warnings()
     spec = Path(args.spec) if args.spec else None
     if args.recheck:                                     # EXT-69: re-validate a record right before the command
         try:
-            print(recheck(adapter=args.adapter, record_path=Path(args.recheck), spec=spec))
+            checked = recheck(adapter=args.adapter, record_path=Path(args.recheck), spec=spec)
         except Refused as exc:
-            return _refuse(exc.problems)
-        return EXIT_OK
+            return _refuse(args, exc.problems, warnings)
+        return _finish(args, {"recheck": checked}, f"{checked}\n", warnings=warnings)
     missing = [f"--{n.replace('_', '-')}" for n in ("profile", "request", "gpu_log", "out_record")
                if getattr(args, n) is None]
     if missing:
-        print(f"gatedtrain ext-launch: error: {', '.join(missing)} required (or --recheck RECORD)", file=sys.stderr)
+        message = f"{', '.join(missing)} required (or --recheck RECORD)"
+        if _as_json(args):
+            problem = Problem("USAGE", ", ".join(missing), message, "pass the missing options, or --recheck RECORD")
+            return emit(Result(args.command, False, EXIT_USAGE, {}, [problem], warnings), as_json=True, human="")
+        for line in warnings:
+            print(line, file=sys.stderr)
+        print(f"gatedtrain ext-launch: error: {message}", file=sys.stderr)
         return EXIT_USAGE
     try:
         command = ext_launch(adapter=args.adapter, profile=args.profile, request=Path(args.request),
@@ -210,15 +236,19 @@ def cmd_ext_launch(args) -> int:
                              smoke_record=Path(args.smoke_record) if args.smoke_record else None, spec=spec,
                              allow_network=args.allow_network)
     except Refused as exc:
-        return _refuse(exc.problems)
-    print(command)                                       # stdout is exactly the command (EXT-22, EXT-24)
-    return EXIT_OK
+        return _refuse(args, exc.problems, warnings)
+    return _finish(args, {"command": command}, f"{command}\n", warnings=warnings)   # stdout is exactly the command (EXT-22, EXT-24)
 
 
 def cmd_ext_from_nel(args) -> int:
     from .ext.from_nel import from_nel
 
-    return _tierb_call(lambda: print(f"arm: {from_nel(registration=Path(args.registration), adapter=args.adapter, evaluator=args.evaluator, items=Path(args.items), checkpoint=Path(args.checkpoint), out=Path(args.out), runs=[Path(r) for r in args.runs])}"))
+    def go():
+        arm = from_nel(registration=Path(args.registration), adapter=args.adapter, evaluator=args.evaluator,
+                       items=Path(args.items), checkpoint=Path(args.checkpoint), out=Path(args.out),
+                       runs=[Path(r) for r in args.runs])
+        return {"arm": str(arm)}, f"arm: {arm}\n"
+    return _tierb_call(args, go)
 
 
 def cmd_ext_arm_fill(args) -> int:
@@ -228,17 +258,22 @@ def cmd_ext_arm_fill(args) -> int:
     def go():
         out = arm_fill(adapter=args.adapter, arm=Path(args.arm), checkpoint=Path(args.checkpoint),
                        items=Path(args.items), base=Path(args.base) if args.base else None)
+        lines = []
         for key, value in out["values"].items():
             how = "filled" if key in out["filled"] else "converted" if key in out["converted"] else "verified"
-            print(f"{how} {key}: {value}")
+            lines.append(f"{how} {key}: {value}\n")
+        return {"filled": dict(out["values"])}, "".join(lines)
 
-    return _tierb_call(go)
+    return _tierb_call(args, go)
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="gatedtrain", description=f"walking-skeleton prototype {__version__} "
                                  f"(prototype, unpromotable; Tier A stand-ins are {STUB_MARK})")
     ap.add_argument("--version", action="version", version=f"gatedtrain {__version__}")
+    ap.add_argument("--json", action="store_true",
+                    help="print one JSON object (schema gatedtrain.cli_result) instead of text; goes before the "
+                         "subcommand (AN-1)")
     sub = ap.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("validate", help="check a spec and its registration")
@@ -260,7 +295,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--run-dir")
     g.add_argument("--runs-root")
-    p.add_argument("--json", action="store_true")
+    p.add_argument("--json", action="store_true", dest="impact_json",
+                   help="the legacy impact object (after the subcommand); with the top-level --json, the AN-1 object")
     p.set_defaults(func=cmd_impact)
 
     # Tier B helpers (TIER-B-SPEC H-1 to H-4, H-6). They never launch a GPU job.

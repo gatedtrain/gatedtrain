@@ -1906,7 +1906,7 @@ step 2 and are not tested here.
 
 | Rule | Behaviour pinned | Test file |
 |---|---|---|
-| AN-1 | `--json` prints one object with `schema`, `ok`, and `result` or `problems`; nothing else on stdout; no sealed content | `tests/test_an_json.py` |
+| AN-1 | `--json` (before the subcommand) prints one object with `schema` `gatedtrain.cli_result`, `schema_version`, `command`, `ok`, `exit`, `data`, `problems` (`rule`, `field`, `message`, `fix`) and `warnings`; nothing else on stdout, stderr empty; the exit code is the text mode's; no sealed content | `tests/test_an_json.py` |
 | AN-2 | Project store: created once, `project.yaml` fields, schema id on every record, invalid record refused | `tests/test_an_project.py` |
 | AN-3 | Stage protocol: declared schemas, `plan` without side effects, `check` problems in the AN-1 form | `tests/test_an_pipeline.py` |
 | AN-4 | Pipeline spec refused when a trust stage is missing, duplicated, replaced or out of order | `tests/test_an_pipeline.py` |

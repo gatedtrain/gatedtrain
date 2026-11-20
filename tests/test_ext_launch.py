@@ -126,10 +126,10 @@ def bound_spec(tmp: Path, request: dict, root: Path) -> Path:
 
 def launch(tmp: Path, request: dict | Path, *, profile: str = "smoke", out: Path | None = None,
            smoke: Path | None = None, env: dict | None = None, extra: list[str] = (), root: Path | None = None,
-           gpu_log: Path | None = None, spec: Path | bool = True):
+           gpu_log: Path | None = None, spec: Path | bool = True, pre: list[str] = ()):
     """Run ext-launch on the request rooted under `root` (default `<tmp>/host`) with that root's host layout
     (`host_layout`; `env` overrides it) and `--gpu-log <host_work>/gpu-log.md` (or `gpu_log`). EXT-84: `--spec`
-    is `bound_spec` (`spec=True`), the given path, or absent (`spec=False`)."""
+    is `bound_spec` (`spec=True`), the given path, or absent (`spec=False`). `pre`: top-level options (`--json`)."""
     if isinstance(request, Path):
         request = load_request(request)
     root = root if root is not None else tmp / "host"
@@ -141,7 +141,7 @@ def launch(tmp: Path, request: dict | Path, *, profile: str = "smoke", out: Path
         shutil.copyfile(VENV_LOCK, tmp / "uv.lock")
     layout = host_layout(request, root)
     log = gpu_log if gpu_log is not None else Path(layout[ENV_HOST_WORK]) / "gpu-log.md"
-    args = [str(VENV_PYTHON), "-m", "gatedtrain.testing.synthetic", "ext-launch", "--adapter", "synthetic", "--profile", profile,
+    args = [str(VENV_PYTHON), "-m", "gatedtrain.testing.synthetic", *pre, "ext-launch", "--adapter", "synthetic", "--profile", profile,
             "--request", str(path), "--gpu-log", str(log), "--out-record", str(out), *extra]
     if smoke is not None:
         args += ["--smoke-record", str(smoke)]
