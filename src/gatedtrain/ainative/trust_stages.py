@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from importlib import metadata
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable
 
 from .. import ANALYSIS_CODE_VERSION, gates
@@ -337,7 +339,7 @@ def registered_base(full: dict) -> str | None:
     return h if isinstance(h, str) else None
 
 
-def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str) -> dict:
+def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str, served: tuple[str, str] | None = None) -> dict:
     row = SCORERS[v["scorer"]]
     return {
         "registration_version": 1,
@@ -355,7 +357,8 @@ def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str) -> dict
         "sigma_pilot": {"sigma": PILOT_SIGMA, "source": "the maximum SD of a 0/1 score (exact match)"},
         "eval_distribution": {"item_set_hash": item_set_hash, "env_version": None, "env_params_version": None},
         "sampler": dict(dep["sampler"]),
-        "base_model": {"model_ref_sha256": base_sha},
+        "base_model": {"model_ref_sha256": base_sha,
+                       **({"scenario_pack": served[0], "generator": served[1]} if served else {})},
         "evaluators": [{"id": row["evaluator"], "manifest_hash": scorers.manifest_hash()}],
         "multiplicity": {"plan": "single_gate", "family": None},
         "analysis_code_version": ANALYSIS_CODE_VERSION,
@@ -419,8 +422,16 @@ class Preregister:
                            "they agree (they may change scorer or margin first)")
         v = _values(ctx, decision)
         item_hash = _sealed_summary(ctx)["manifest_sha256"]
-        ctx.project.read_artifact(ctx.inputs["base_model"])
-        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256)
+        base_ref = ctx.project.read_artifact(ctx.inputs["base_model"])
+        served = None
+        gen = base_ref.get("generator") if isinstance(base_ref, dict) else None
+        if gen is not None:
+            pack = scenario_pack_of(gen)
+            if pack is None:
+                raise _refuse7("inputs.base_model.generator", f"no installed scenario pack serves the generator {gen!r}",
+                               "install the scenario pack that serves the base model, or fix the model reference")
+            served = (pack, gen)
+        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, served)
         problems = check_contents(base)
         if problems:
             raise Refused(problems)
@@ -486,25 +497,63 @@ def _scenario_entry_points() -> list[Any]:
     return list(metadata.entry_points(group=SCENARIO_ENTRY_POINT_GROUP))
 
 
-def scenario_generators() -> dict[str, Callable[..., Any]]:
-    """The generators of every installed scenario pack; a pack that fails to load, exposes no mapping of callables
-    or reuses a generator name is refused (`AN-8`) without echoing its message."""
-    found: dict[str, Callable[..., Any]] = {}
+# Step-1 boundary: the stages share the operator's process, so a stage can still monkeypatch a module attribute
+# (this snapshot, `_scenario_entry_points`, the scorers). What is closed here is the ordinary path: a pack's own
+# mutable `generators` dict is copied once and never re-read. Enforcement against hostile in-process code comes with
+# the step-2 keeper, which runs the sealed evaluation outside the stages' process.
+_SCENARIO_SNAPSHOT: tuple[MappingProxyType, MappingProxyType] | None = None
+
+
+def _reset_scenario_snapshot() -> None:
+    """Forget the snapshot so the next lookup reloads the entry points (tests that patch the loader)."""
+    global _SCENARIO_SNAPSHOT
+    _SCENARIO_SNAPSHOT = None
+
+
+def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType]:
+    """(generator name -> function, generator name -> pack name) of every installed scenario pack, loaded once per
+    process and frozen. A pack that fails to load, has no `generators` mapping of callables or reuses a generator
+    name is refused (`AN-8`) without echoing its message."""
+    global _SCENARIO_SNAPSHOT
+    if _SCENARIO_SNAPSHOT is not None:
+        return _SCENARIO_SNAPSHOT
+    fns: dict[str, Callable[..., Any]] = {}
+    packs: dict[str, str] = {}
     for ep in _scenario_entry_points():
         try:
-            gens = ep.load().generators
+            pack = ep.load()
         except Exception as exc:
             raise _refuse("AN-8", f"entry point {ep.name}", f"the scenario pack failed to load ({type(exc).__name__})",
                           "fix or uninstall the scenario pack") from None
-        if not (isinstance(gens, dict) and all(isinstance(k, str) and callable(v) for k, v in gens.items())):
-            raise _refuse("AN-8", f"entry point {ep.name}", "the scenario pack's `generators` is not a mapping of "
-                          "name to function", "expose `generators = {name: generate}`")
-        for name, fn in gens.items():
-            if name in found:
+        gens = getattr(pack, "generators", None)
+        if not (isinstance(gens, Mapping) and all(isinstance(k, str) and callable(v) for k, v in gens.items())):
+            raise _refuse("AN-8", f"entry point {ep.name}", "the scenario pack has no `generators` mapping of name "
+                          "to function", "expose `generators = {name: generate}`")
+        for name, fn in dict(gens).items():
+            if name in fns:
                 raise _refuse("AN-8", f"entry point {ep.name}", f"generator {name!r} is provided by two scenario packs",
                               "give each generator a unique name")
-            found[name] = fn
-    return found
+            fns[name] = fn
+            packs[name] = ep.name
+    _SCENARIO_SNAPSHOT = (MappingProxyType(fns), MappingProxyType(packs))
+    return _SCENARIO_SNAPSHOT
+
+
+def scenario_generators() -> Mapping[str, Callable[..., Any]]:
+    return _scenario_snapshot()[0]
+
+
+def scenario_pack_of(generator: Any) -> str | None:
+    """The name of the entry point whose pack provides the generator, or None."""
+    return _scenario_snapshot()[1].get(generator) if isinstance(generator, str) else None
+
+
+def registered_generator(full: dict) -> tuple[str, str] | None:
+    """(scenario pack, generator) a registration binds in its `base_model` field, or None."""
+    bm = full.get("base_model")
+    if isinstance(bm, dict) and isinstance(bm.get("scenario_pack"), str) and isinstance(bm.get("generator"), str):
+        return bm["scenario_pack"], bm["generator"]
+    return None
 
 
 _REG_KEYS = ("hash", "scorer", "direction", "margin", "alpha", "item_set_hash", "post_hoc", "amends")
@@ -571,11 +620,7 @@ def _eval_seeds(full: dict) -> list:
     return seeds
 
 
-def _score_arm(ctx: StageContext, sealed: SealedRef, model: dict, full: dict) -> list[dict]:
-    fn = scenario_generators().get(model.get("generator"))
-    if fn is None:
-        raise _refuse("AN-8", "model_ref.generator", f"no generation function is registered for {model.get('generator')!r}",
-                      "install the scenario pack that serves this model reference")
+def _score_arm(ctx: StageContext, sealed: SealedRef, fn: Callable[..., Any], model: dict, full: dict) -> list[dict]:
     sampler = full["sampler"]
     records: list[dict] = []
     for seed in _eval_seeds(full):
@@ -635,13 +680,29 @@ class EvaluateSealed:
         if not _produced_by_training(ctx.project, cand_ref):
             raise _refuse("AN-8", "inputs.candidate_model", "the candidate was not produced by a training stage",
                           "wire candidate_model from a stage that trains")
+        served = registered_generator(full)
+        if served is None:
+            raise _refuse("AN-8", "registration.base_model", "the registration names no scenario pack and generator",
+                          "register again with preregister, with a base model whose `generator` a scenario pack serves")
+        fn = scenario_generators().get(served[1])
+        if fn is None or scenario_pack_of(served[1]) != served[0]:
+            raise _refuse("AN-8", "registration.base_model.generator",
+                          f"the registered scenario pack {served[0]!r} no longer serves the generator {served[1]!r}",
+                          "install the scenario pack that was registered")
+        models: dict[str, dict] = {}
+        for arm in ("baseline", "candidate"):
+            model = ctx.project.read_artifact(ctx.inputs[f"{arm}_model"])
+            if not isinstance(model, dict):
+                raise _refuse("AN-8", f"inputs.{arm}_model", "the model reference is malformed", "rerun its stage")
+            if model.get("generator") != served[1]:
+                raise _refuse("AN-8", f"inputs.{arm}_model.generator",
+                              f"the {arm} model names the generator {model.get('generator')!r}, not the registered "
+                              f"{served[1]!r}", "both models must be served by the registered generator")
+            models[arm] = model
         out: dict[str, ArtifactRef] = {}
         for arm in ("baseline", "candidate"):
             ref = ctx.inputs[f"{arm}_model"]
-            model = ctx.project.read_artifact(ref)
-            if not isinstance(model, dict):
-                raise _refuse("AN-8", f"inputs.{arm}_model", "the model reference is malformed", "rerun its stage")
-            records = _score_arm(ctx, sealed, model, full)
+            records = _score_arm(ctx, sealed, fn, models[arm], full)
             doc = {**_meta(SCHEMA_SEALED_RECORDS), "arm": arm, "registration_hash": reg["hash"],
                    "item_set_hash": item_set, "n_items": len(records) // len(seeds), "eval_seeds": list(seeds),
                    "sampler": dict(full["sampler"]), "model_ref_sha256": ref.sha256, "records": records}

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from importlib import metadata
 from pathlib import Path
 
 import yaml
@@ -35,11 +34,41 @@ def jsonl(rows: list[dict]) -> bytes:
     return ("\n".join(json.dumps(r) for r in rows) + "\n").encode()
 
 
+class _StageEP:
+    def __init__(self, name: str, cls: type) -> None:
+        self.name, self.value, self._cls = name, f"gatedtrain.testing.synthetic_pack:{cls.__name__}", cls
+
+    def load(self) -> type:
+        return self._cls
+
+
+class _ScenarioEP:
+    name = "synthetic"
+    value = "gatedtrain.testing.synthetic_pack:SCENARIO"
+
+    def load(self):
+        return pack.SCENARIO
+
+
+def inject_pack(case: unittest.TestCase) -> None:
+    """Make the pack visible to the registry and to evaluate_sealed without any installed entry point."""
+    eps = [_StageEP(c.name, c) for c in (pack.ProfileData, pack.ChooseTaskAndBase, pack.BuildTrainSet,
+                                         pack.WriteRecipe, pack.Smoke, pack.Train)]
+    for mod, attr, value in ((stage_mod, "_plugin_entry_points", lambda: list(eps)),
+                             (trust_stages, "_scenario_entry_points", lambda: [_ScenarioEP()])):
+        real = getattr(mod, attr)
+        setattr(mod, attr, value)
+        case.addCleanup(setattr, mod, attr, real)
+    trust_stages._reset_scenario_snapshot()
+    case.addCleanup(trust_stages._reset_scenario_snapshot)
+
+
 class PackBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+        inject_pack(self)
 
     def make(self, *, noise: float = 0.0, rows: list[dict] | None = None, name: str = "proj") -> Project:
         data = self.tmp / f"{name}.jsonl"
@@ -62,22 +91,41 @@ class PackBase(unittest.TestCase):
         return out
 
 
-class RegistrationTest(unittest.TestCase):
-    def test_the_pack_is_registered_through_entry_points(self) -> None:
-        stages = {ep.name: ep.value for ep in metadata.entry_points(group="gatedtrain.stages")}
-        for name in STAGES:
-            self.assertIn(name, stages)
-        scen = {ep.name: ep.load() for ep in metadata.entry_points(group="gatedtrain.scenarios")}
-        self.assertIs(scen["synthetic"], pack.SCENARIO)
-        self.assertIn("synthetic.lookup", trust_stages.scenario_generators())
+class RegistrationTest(PackBase):
+    def test_the_pack_is_found_through_the_injected_entry_points(self) -> None:
         reg = stage_registry()
         for name in STAGES:
             self.assertIn(name, reg)
+        self.assertIs(reg["train"], pack.Train)
+        self.assertEqual(trust_stages.scenario_pack_of("synthetic.lookup"), "synthetic")
+        self.assertIs(trust_stages.scenario_generators()["synthetic.lookup"], pack.generate)
+
+    def test_the_scenario_is_immutable(self) -> None:
+        with self.assertRaises(TypeError):
+            pack.SCENARIO.generators["synthetic.lookup"] = lambda *a, **k: None
+        with self.assertRaises(Exception):
+            pack.SCENARIO.generators = {}
 
     def test_train_declares_gpu_and_trains(self) -> None:
         self.assertEqual(pack.Train.needs, frozenset({"gpu"}))
         self.assertTrue(pack.Train.trains)
         self.assertEqual(pack.Smoke.needs, frozenset())
+
+    def test_the_registration_binds_the_pack_and_generator(self) -> None:
+        proj = self.make()
+        out = self.run_all(proj, "preregister")
+        full = InProcessTrust(proj).registration(proj.read_artifact(out["preregister"]["registration"])["hash"])
+        self.assertEqual(trust_stages.registered_generator(full), ("synthetic", "synthetic.lookup"))
+
+    def test_mutating_the_pack_does_not_change_the_evaluation(self) -> None:
+        proj = self.make()
+        self.run_all(proj, "train")
+        self.assertIn("synthetic.lookup", trust_stages.scenario_generators())     # snapshot is taken
+        with self.assertRaises(TypeError):
+            pack.SCENARIO.generators["synthetic.lookup"] = lambda *a, **k: None
+        out = self.run_(proj, "evaluate_sealed").outputs
+        self.assertEqual(proj.read_artifact(self.run_(proj, "gate").outputs["gate_result"])["status"], "PASS")
+        self.assertEqual(len(proj.read_artifact(out["candidate_records"])["records"]) % 2, 0)
 
     def test_the_pipeline_passes_the_validator(self) -> None:
         spec = load_pipeline(pack.SCENARIO.pipeline)
@@ -176,7 +224,7 @@ class SmokeTest(PackBase):
             self.run_all(proj)
 
 
-class ReservationTest(PackBase):
+class ReservationTest(unittest.TestCase):
     def test_a_pluggable_stage_may_emit_train_part_but_not_a_trust_record(self) -> None:
         def plugin(schema: str) -> type:
             class _P:

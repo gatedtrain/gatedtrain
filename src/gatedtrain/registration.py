@@ -560,8 +560,12 @@ def check_contents(reg: dict, *, evaluator_id: str | None = None) -> list[Proble
     if "base_model" in reg:                  # AI-native AN-7: the registered base model reference (05 section 18)
         bm = reg["base_model"]
         h = bm.get("model_ref_sha256") if isinstance(bm, dict) else None
-        if not (isinstance(bm, dict) and set(bm) == {"model_ref_sha256"} and isinstance(h, str) and SHA_RE.match(h)):
-            bad("base_model", "base_model is not {model_ref_sha256: sha256:<64 hex>}",
+        extra = set(bm) - {"model_ref_sha256"} if isinstance(bm, dict) else set()
+        served = extra == {"scenario_pack", "generator"} and all(isinstance(bm[k], str) and bm[k] for k in extra)
+        if not (isinstance(bm, dict) and "model_ref_sha256" in bm and (not extra or served)
+                and isinstance(h, str) and SHA_RE.match(h)):
+            bad("base_model", "base_model is not {model_ref_sha256: sha256:<64 hex>} (with optional scenario_pack and "
+                "generator names, both or neither)",
                 "give `base_model: {model_ref_sha256: sha256:<64 hex>}` or remove it")
     if "created_at" in reg and _utc_time(reg["created_at"]) is None:
         bad("created_at", f"created_at {reg['created_at']!r} is not an RFC 3339 UTC time (05 section 3.7, R13-7)",

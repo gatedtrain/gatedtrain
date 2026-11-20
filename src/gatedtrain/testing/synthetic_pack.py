@@ -20,7 +20,8 @@ import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from ..ainative import scorers
 from ..ainative.project import ArtifactRef
@@ -213,7 +214,8 @@ class WriteRecipe(_Base):
 
 
 class Smoke(_Base):
-    """Fits on the first rows, scores the next rows with exact match and applies the MM-38 verdict."""
+    """Fits a stand-in baseline (a table on rows[:10]), scores rows[10:30] with exact match and applies the MM-38
+    verdict. The real base (the empty table) is not used: it always scores 0, which the binary-metric rule refuses."""
 
     name = "smoke"
     inputs = {"train_set": SCHEMA_TRAIN_PART, "recipe": SCHEMA_RECIPE}
@@ -291,8 +293,11 @@ class Scenario:
     model reference gives in `generator`, and the path of the pack's pipeline file."""
 
     name: str
-    generators: dict[str, Callable[..., Any]] = field(default_factory=dict)
+    generators: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     pipeline: Path | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "generators", MappingProxyType(dict(self.generators)))
 
 
 SCENARIO = Scenario("synthetic", {GENERATOR: generate}, Path(__file__).with_name("synthetic_pack.yaml"))

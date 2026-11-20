@@ -56,7 +56,7 @@ GENERATE_CALLS: list = []
 LABELS: dict = {}
 
 
-def model_stage(stage_name: str, rate: float, trains: bool) -> type:
+def model_stage(stage_name: str, rate: float, trains: bool, generator: str = GENERATOR) -> type:
     class _Model:
         name = stage_name
         version = "1"
@@ -69,7 +69,7 @@ def model_stage(stage_name: str, rate: float, trains: bool) -> type:
             return Proposal(self.name, "model", {}, {})
 
         def run(self, ctx, decision):
-            rec = {"schema": SCHEMA_MODEL_REF, "schema_version": 1, "generator": GENERATOR, "rate": rate,
+            rec = {"schema": SCHEMA_MODEL_REF, "schema_version": 1, "generator": generator, "rate": rate,
                    "label": stage_name}
             return {"model": ctx.project.write_artifact(self.name, "model", rec, SCHEMA_MODEL_REF)}
 
@@ -95,6 +95,7 @@ def choose_stage(base_rate: float) -> type:
 class GateBase(ti.Base):
     base_rate = 0.5
     cand_rate = 1.0
+    cand_generator = GENERATOR
 
     def setUp(self) -> None:
         super().setUp()
@@ -104,6 +105,8 @@ class GateBase(ti.Base):
         real = trust_stages._scenario_entry_points
         trust_stages._scenario_entry_points = lambda: [_TestScenario()]
         self.addCleanup(setattr, trust_stages, "_scenario_entry_points", real)
+        trust_stages._reset_scenario_snapshot()
+        self.addCleanup(trust_stages._reset_scenario_snapshot)
         GENERATE_CALLS.clear()
         LABELS.clear()
 
@@ -139,7 +142,7 @@ class GateBase(ti.Base):
                               budget={"gpu_hours": 1, "llm_usd": 1})
 
     def registry(self) -> dict:
-        return {**stage_registry(), "train_x": model_stage("train_x", self.cand_rate, True),
+        return {**stage_registry(), "train_x": model_stage("train_x", self.cand_rate, True, self.cand_generator),
                 "other_x": model_stage("other_x", self.cand_rate, False), "choose_x": choose_stage(self.base_rate)}
 
     def upto_registration(self, proj: Project) -> None:
@@ -249,6 +252,7 @@ class EvaluateSealedTest(GateBase):
         proj = self.make()
         self.upto_registration(proj)
         TEST_GENERATORS.pop(GENERATOR)
+        trust_stages._reset_scenario_snapshot()
         p = self.refused(proj, "evaluate_sealed", rule="AN-8")
         self.assertIn("generator", p.message)
 
@@ -260,9 +264,59 @@ class EvaluateSealedTest(GateBase):
             raise RuntimeError("secret " + item["input"])
 
         TEST_GENERATORS[GENERATOR] = boom
+        trust_stages._reset_scenario_snapshot()
         p = self.refused(proj, "evaluate_sealed", rule="AN-8")
         self.assertNotIn("marker", p.message)
         self.assertNotIn("secret", p.message)
+
+
+class GeneratorBindingTest(GateBase):
+    def test_the_registration_records_the_pack_and_the_generator(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+        full = InProcessTrust(proj).registration(proj.read_artifact(self.reg_ref(proj))["hash"])
+        self.assertEqual(full["base_model"]["scenario_pack"], "t7")
+        self.assertEqual(full["base_model"]["generator"], GENERATOR)
+        self.assertEqual(trust_stages.registered_generator(full), ("t7", GENERATOR))
+
+    def test_mutating_the_pack_after_the_first_load_changes_nothing(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)                       # preregister loaded the snapshot
+        TEST_GENERATORS[GENERATOR] = lambda model_ref, item, *, sampler, seed: "wrong"
+        TEST_GENERATORS["other"] = generate
+        out = self.run_(proj, "evaluate_sealed").outputs
+        cand = proj.read_artifact(out["candidate_records"])
+        self.assertTrue(all(r["score"] == 1.0 for r in cand["records"]))
+        self.assertNotIn("other", trust_stages.scenario_generators())
+        with self.assertRaises(TypeError):
+            trust_stages.scenario_generators()["x"] = generate
+
+    def test_a_pack_without_generators_is_not_called_a_load_failure(self) -> None:
+        class NoGens:
+            name = "nogens"
+
+            def load(self):
+                return object()
+
+        trust_stages._scenario_entry_points = lambda: [NoGens()]
+        trust_stages._reset_scenario_snapshot()
+        with self.assertRaises(Refused) as cm:
+            trust_stages.scenario_generators()
+        self.assertIn("no `generators`", cm.exception.problems[0].message)
+        self.assertNotIn("failed to load", cm.exception.problems[0].message)
+
+
+class OtherGeneratorTest(GateBase):
+    cand_generator = "other-generator"
+
+    def test_a_candidate_with_another_generator_is_refused(self) -> None:
+        TEST_GENERATORS["other-generator"] = generate
+        proj = self.make()
+        self.upto_registration(proj)
+        p = self.refused(proj, "evaluate_sealed", rule="AN-8")
+        self.assertIn("candidate", p.message)
+        self.assertIn("generator", p.message)
+        self.assertFalse((proj.root / "stages" / "evaluate_sealed").exists())
 
 
 class GateTest(GateBase):
