@@ -114,7 +114,7 @@ class GateBase(ti.Base):
     candidate_src = "train_x.model"
     extra_stage = False
 
-    def make(self, data: bytes | None = None, *, name: str = "proj", n: int = 400) -> Project:
+    def make(self, data: bytes | None = None, *, name: str = "proj", n: int = ti.N_DATA) -> Project:
         rows = unique_rows(n)
         LABELS.update({r["input"]: r["label"] for r in rows})
         d = self.tmp / f"{name}.jsonl"
@@ -286,10 +286,10 @@ class EvaluateSealedTest(GateBase):
         out = self.run_(proj, "evaluate_sealed").outputs
         summary = proj.read_artifact(self.run_(proj, "intake_seal").outputs["sealed_summary"])
         sealed = self.sealed_items(proj, summary["manifest_sha256"])
-        self.assertEqual(len(sealed), 155)
+        self.assertEqual(len(sealed), ti.N_NEEDED)
         for name in ("baseline_records", "candidate_records"):
             rec = proj.read_artifact(out[name])
-            self.assertEqual(len(rec["records"]), 155 * 2)               # two registered eval seeds
+            self.assertEqual(len(rec["records"]), ti.N_NEEDED * 2)               # two registered eval seeds
             for r in rec["records"]:
                 self.assertEqual(set(r), {"item_id", "seed", "score"})
                 self.assertIn(r["score"], (0.0, 1.0))
@@ -311,7 +311,7 @@ class EvaluateSealedTest(GateBase):
             self.assertEqual(sampler, ti.DEPLOY["sampler"])
             self.assertIn(seed, ti.DEPLOY["eval_seeds"])
             self.assertEqual(keys, ["input"])                            # the label stays with the scorer
-        self.assertEqual(len(GENERATE_CALLS), 155 * 2 * 2)               # items x seeds x two models
+        self.assertEqual(len(GENERATE_CALLS), ti.N_NEEDED * 2 * 2)               # items x seeds x two models
 
     def test_scores_come_from_exact_match(self) -> None:
         proj = self.make()
@@ -414,7 +414,7 @@ class GateTest(GateBase):
         self.assertEqual(res["status"], "PASS")
         self.assertGreater(res["delta_hat_natural"], 0.3)
         self.assertGreater(res["ci_lower_natural"], 0.0)
-        self.assertEqual(res["n_items"], 155)
+        self.assertEqual(res["n_items"], ti.N_NEEDED)
 
     def test_fail_when_the_candidate_is_worse(self) -> None:
         self.base_rate, self.cand_rate = 1.0, 0.5
@@ -591,8 +591,8 @@ class ReportTest(GateBase):
         self.assertIn("PASS", md.splitlines()[0])
         self.assertIn(rep["sealed_guarantee"], md)
         self.assertEqual(rep["sealed_guarantee"], InProcessTrust(proj).sealed_guarantee)
-        self.assertEqual(rep["n_sealed"], 155)
-        self.assertIn("155", md)
+        self.assertEqual(rep["n_sealed"], ti.N_NEEDED)
+        self.assertIn(str(ti.N_NEEDED), md)
         for key in ("effect", "ci_lower", "ci_upper"):
             self.assertIn(str(rep["display"][key]), md)
         self.assertEqual(len(rep["ledger"]), 1)
@@ -672,7 +672,7 @@ class ReportTest(GateBase):
         rep, _ = self.reports(proj)
         self.assertEqual(set(rep["registration"]), {"hash", "scorer", "direction", "margin", "alpha",
                                                     "item_set_hash", "post_hoc", "amends"})
-        self.assertEqual(rep["power"]["n_sealed"], 155)
+        self.assertEqual(rep["power"]["n_sealed"], ti.N_NEEDED)
         blob = self.outside_trust(proj)
         summary = proj.read_artifact(self.run_(proj, "intake_seal").outputs["sealed_summary"])
         for it in self.sealed_items(proj, summary["manifest_sha256"]):

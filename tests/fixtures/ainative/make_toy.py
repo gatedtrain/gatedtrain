@@ -1,4 +1,4 @@
-"""Regenerate `toy.jsonl`: 600 labelled rows for the synthetic scenario pack (tests/test_an_e2e.py).
+"""Regenerate `toy.jsonl`: 800 labelled rows for the synthetic scenario pack (tests/test_an_e2e.py).
 
 Run: python tests/fixtures/ainative/make_toy.py
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-N_ROWS = 600
+N_ROWS = 800
 
 
 def rows(n: int = N_ROWS) -> list[dict]:

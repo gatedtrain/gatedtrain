@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -84,6 +85,13 @@ def plain_clause() -> dict:
             "sigma_plan": "fixed"}
 
 
+# Planning SD of the paired per-item difference of two 0/1 scores: the independence bound at p = 0.5,
+# sqrt(0.5^2 * 2) (user decision, 2026-11-20). The expected sizes are computed from it, never pasted.
+SIGMA = math.sqrt(0.5)
+N_NEEDED = gates.plan(plain_clause(), {"sigma": SIGMA}, n_available=10 ** 6)["n_required"]
+N_DATA = 2 * N_NEEDED + 80          # enough distinct rows for a conclusive split (the sealed part is capped at half)
+
+
 class Base(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -154,15 +162,15 @@ class RegistryTest(unittest.TestCase):
 
 class IntakeTest(Base):
     def test_dedup_happens_before_the_split(self) -> None:
-        proj = self.make(jsonl(rows(400, dups=60)))
+        proj = self.make(jsonl(rows(N_DATA, dups=60)))
         out = self.run_(proj, "intake_seal").outputs
         train = proj.read_artifact(out["train_part"])
         summary = proj.read_artifact(out["sealed_summary"])
         sealed = self.sealed_items(proj, summary["manifest_sha256"])
         train_inputs = [r["input"] for r in train["rows"]]
         sealed_inputs = [r["input"] for r in sealed]
-        self.assertEqual(len(train_inputs) + len(sealed_inputs), 400)     # every duplicate counted once
-        self.assertEqual(len(set(train_inputs) | set(sealed_inputs)), 400)
+        self.assertEqual(len(train_inputs) + len(sealed_inputs), N_DATA)  # every duplicate counted once
+        self.assertEqual(len(set(train_inputs) | set(sealed_inputs)), N_DATA)
         self.assertFalse(set(train_inputs) & set(sealed_inputs))          # Review Focus 1
         self.assertEqual(train["n_duplicates_removed"], 60)
 
@@ -175,20 +183,22 @@ class IntakeTest(Base):
         self.nothing_written(proj)
 
     def test_split_is_deterministic_and_follows_the_power_plan(self) -> None:
-        data = jsonl(rows(400))
+        data = jsonl(rows(N_DATA))
         a, b = self.make(data, name="a"), self.make(data, name="b")
         ra, rb = self.run_(a, "intake_seal").outputs, self.run_(b, "intake_seal").outputs
         self.assertEqual(ra["train_part"].sha256, rb["train_part"].sha256)
         self.assertEqual(ra["sealed_summary"].sha256, rb["sealed_summary"].sha256)
         power = a.read_artifact(ra["power"])
-        want = gates.plan(plain_clause(), {"sigma": 0.5}, n_available=200)["n_required"]
-        self.assertEqual(want, 155)
+        want = gates.plan(plain_clause(), {"sigma": SIGMA}, n_available=N_DATA // 2)["n_required"]
+        self.assertEqual(want, N_NEEDED)
+        self.assertEqual(power["sigma"], SIGMA)
         self.assertEqual(power["n_needed"], want)
         self.assertEqual(power["n_sealed"], want)
         self.assertTrue(power["conclusive_expected"])
-        self.assertAlmostEqual(power["mde"], gates.plan(plain_clause(), {"sigma": 0.5}, n_available=want)["mde"])
-        self.assertEqual(a.read_artifact(ra["train_part"])["n"], 400 - want)
-        other = self.make(jsonl(rows(401)), name="c")
+        self.assertAlmostEqual(power["mde"], gates.plan(plain_clause(), {"sigma": SIGMA}, n_available=want)["mde"])
+        self.assertEqual(a.read_artifact(ra["train_part"])["n"], N_DATA - want)
+        self.assertIn(f"can detect a gain of {power['mde']:.2g} or more", self.plan_(a, "intake_seal").summary)
+        other = self.make(jsonl(rows(N_DATA + 1)), name="c")
         rc = self.run_(other, "intake_seal").outputs
         self.assertNotEqual(rc["sealed_summary"].sha256, ra["sealed_summary"].sha256)
 
@@ -196,13 +206,13 @@ class IntakeTest(Base):
         proj = self.make(jsonl(rows(200)))
         power = proj.read_artifact(self.run_(proj, "intake_seal", {"accept_inconclusive": True}).outputs["power"])
         self.assertEqual(power["n_sealed"], 100)
-        self.assertEqual(power["n_needed"], 155)
+        self.assertEqual(power["n_needed"], N_NEEDED)
         self.assertFalse(power["conclusive_expected"])
 
     def test_boundary_between_conclusive_and_not(self) -> None:
-        ok = self.make(jsonl(rows(310)), name="ok")
+        ok = self.make(jsonl(rows(2 * N_NEEDED)), name="ok")
         self.assertIsNone(self.plan_(ok, "intake_seal").needs_user)
-        small = self.make(jsonl(rows(308)), name="small")
+        small = self.make(jsonl(rows(2 * N_NEEDED - 2)), name="small")
         self.assertEqual(self.plan_(small, "intake_seal").needs_user, "data_too_small")
 
     def test_refusals_each_have_their_own_message_and_write_nothing(self) -> None:
@@ -246,9 +256,9 @@ class IntakeTest(Base):
         proj = self.make(jsonl(rows(40)))
         prop = self.plan_(proj, "intake_seal")
         self.assertEqual(prop.needs_user, "data_too_small")
-        self.assertEqual(prop.estimate["n_needed"], 155)
+        self.assertEqual(prop.estimate["n_needed"], N_NEEDED)
         self.assertIn("INCONCLUSIVE", prop.summary)
-        self.assertIn("270", prop.summary)                 # 2 * 155 - 40 more labelled examples
+        self.assertIn(f"about {2 * N_NEEDED - 40} more labelled examples", prop.summary)
         self.nothing_written(proj)                         # plan has no side effects
         p = self.refused(proj, "intake_seal")
         self.assertIn("accept_inconclusive", p.field)
@@ -260,11 +270,11 @@ class IntakeTest(Base):
         self.assertEqual(power["n_sealed"], 20)
 
     def test_no_stage_output_holds_sealed_item_text(self) -> None:
-        proj = self.make(jsonl(rows(400, labels=("yes", "no", "maybe"))))
+        proj = self.make(jsonl(rows(N_DATA, labels=("yes", "no", "maybe"))))
         out = self.run_(proj, "intake_seal").outputs
         summary = proj.read_artifact(out["sealed_summary"])
         sealed = self.sealed_items(proj, summary["manifest_sha256"])
-        self.assertEqual(len(sealed), 155)
+        self.assertEqual(len(sealed), N_NEEDED)
         blob = b""
         for path in sorted(proj.root.rglob("*")):
             if path.is_file() and "trust" not in path.relative_to(proj.root).parts:
@@ -272,11 +282,11 @@ class IntakeTest(Base):
         self.assertIn(b"question-", blob)                  # the training part is there
         for item in sealed:
             self.assertNotIn(item["input"].encode(), blob)
-        self.assertEqual(summary["n"], 155)
-        self.assertEqual(sum(summary["label_counts"].values()) + summary["label_counts_other"], 155)
+        self.assertEqual(summary["n"], N_NEEDED)
+        self.assertEqual(sum(summary["label_counts"].values()) + summary["label_counts_other"], N_NEEDED)
 
     def test_label_text_seen_only_in_the_sealed_part_stays_out_of_the_outputs(self) -> None:
-        data = rows(400)
+        data = rows(N_DATA)
         for i, r in enumerate(data):
             r["label"] = f"secret-label-{i}"
         proj = self.make(jsonl(data))
@@ -289,10 +299,10 @@ class IntakeTest(Base):
             self.assertIn(item["label"], {x["label"] for x in sealed})
             self.assertNotIn(item["label"], raw)
         self.assertFalse({k for k in summary["label_counts"]} - train_labels)
-        self.assertEqual(summary["label_counts_other"], 155)
+        self.assertEqual(summary["label_counts_other"], N_NEEDED)
 
     def test_records_carry_schema_and_version(self) -> None:
-        proj = self.make(jsonl(rows(400)))
+        proj = self.make(jsonl(rows(N_DATA)))
         for name, ref in self.run_(proj, "intake_seal").outputs.items():
             obj = proj.read_artifact(ref)
             self.assertEqual(obj["schema"], ref.schema)
@@ -310,7 +320,7 @@ class IntakeTest(Base):
 
 
 class PreregisterTest(Base):
-    def intake(self, n: int = 400, **kw) -> Project:
+    def intake(self, n: int = N_DATA, **kw) -> Project:
         proj = self.make(jsonl(rows(n)), **kw)
         self.run_(proj, "intake_seal")
         self.run_(proj, "choose_x")
@@ -352,7 +362,8 @@ class PreregisterTest(Base):
         self.assertEqual(full["eval_distribution"]["item_set_hash"], reg["item_set_hash"])
         self.assertEqual(full["clause"]["margin"], 0.0)
         self.assertEqual(full["clause"]["alpha"], 0.05)
-        self.assertEqual(full["sigma_pilot"]["sigma"], 0.5)
+        self.assertEqual(full["sigma_pilot"]["sigma"], SIGMA)
+        self.assertIn("independence bound", full["sigma_pilot"]["source"])
         self.assertNotIn("post_hoc", full)
         self.assertEqual(full["sampler"], DEPLOY["sampler"])             # the registered sampler is the deployment's
         self.assertEqual(full["clause"]["eval_seeds"], [11, 12])
@@ -415,7 +426,7 @@ class PreregisterTest(Base):
         self.assertTrue(back["post_hoc"])                   # going back to the old values does not undo it
 
     def test_registration_follows_the_deployment_record(self) -> None:
-        proj = self.make(jsonl(rows(400)), name="other")
+        proj = self.make(jsonl(rows(N_DATA)), name="other")
         self.run_(proj, "intake_seal")
         other = {**DEPLOY, "sampler": {"name": "s2", "temperature": 0.5, "max_new_tokens": 8}, "eval_seeds": [3]}
         reg = {**self.registry(), "choose_x": type("C", (ChooseDeployment,), {"record": other})}
@@ -430,7 +441,7 @@ class PreregisterTest(Base):
                 {**DEPLOY, "eval_seeds": []}, {**DEPLOY, "eval_seeds": [1, 1]},
                 {k: v for k, v in DEPLOY.items() if k != "sampler"}]
         for i, rec in enumerate(bads):
-            proj = self.make(jsonl(rows(400)), name=f"bad{i}")
+            proj = self.make(jsonl(rows(N_DATA)), name=f"bad{i}")
             self.run_(proj, "intake_seal")
             reg = {**self.registry(), "choose_x": type("C", (ChooseDeployment,), {"record": rec})}
             run_stage(proj, "choose_x", {}, registry=reg)

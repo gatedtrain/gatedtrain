@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from importlib import metadata
 from pathlib import Path
@@ -53,7 +54,13 @@ MAX_DATA_BYTES = 64 * 1024 * 1024
 DEFAULT_MDE = 0.10
 DEFAULT_ALPHA = 0.05
 DEFAULT_POWER = 0.8
-PILOT_SIGMA = 0.5            # the maximum SD of a 0/1 score, so the plan never under-sizes the sealed part
+# Planning SD of the paired per-item difference (candidate minus base) of two 0/1 scores: the bound when the two
+# scores are independent and each has the largest SD of a 0/1 score, 0.5, so sqrt(0.5^2 * 2) (design 05 §18.4;
+# user decision, 2026-11-20). Positively correlated arms have a smaller SD, so the plan does not under-size the
+# sealed part for them.
+PILOT_SIGMA = math.sqrt(0.5)
+PILOT_SOURCE = ("the independence bound for the SD of the paired difference of two 0/1 scores (exact match): "
+                "sqrt(0.5^2 * 2)")
 MAX_SEALED_FRACTION = 0.5
 SEALED_TEST_USED = "this project's sealed test is used; testing another candidate needs new sealed data"
 
@@ -179,7 +186,7 @@ def _split(project: Project) -> dict:
         raise _refuse("AN-6", "data", "the data has fewer than 2 distinct examples, so it cannot be split",
                       "add more labelled examples")
     cap = int(n * MAX_SEALED_FRACTION)
-    pilot = {"sigma": PILOT_SIGMA, "source": "the maximum SD of a 0/1 score (exact match)"}
+    pilot = {"sigma": PILOT_SIGMA, "source": PILOT_SOURCE}
     needed = gates.plan(_power_clause(), pilot, n_available=cap)["n_required"]
     n_sealed = min(needed, cap)
     order = sorted(unique, key=lambda r: hashlib.sha256(f"{digest}:{r['ihash']}".encode()).hexdigest())
@@ -208,7 +215,7 @@ class IntakeSeal:
         if s["conclusive"]:
             summary = (f"{s['n_unique']} distinct labelled examples: {s['n_sealed']} will be sealed for the final "
                        f"test and {len(s['train'])} are for training; the test can detect a gain of "
-                       f"{DEFAULT_MDE:g} or more.")
+                       f"{s['mde']:.2g} or more.")
         else:
             summary = (f"{s['n_unique']} distinct labelled examples are too few: the final test will most likely be "
                        f"INCONCLUSIVE (it needs {s['n_needed']} sealed examples to detect a gain of "
@@ -355,7 +362,7 @@ def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str, served:
                    "interval": "cluster_bootstrap", "blocking": True},
         "margin_justification": f"Margin {v['margin']:g} (fraction of the {v['scorer']} score) as confirmed by the "
                                 "user before any training.",
-        "sigma_pilot": {"sigma": PILOT_SIGMA, "source": "the maximum SD of a 0/1 score (exact match)"},
+        "sigma_pilot": {"sigma": PILOT_SIGMA, "source": PILOT_SOURCE},
         "eval_distribution": {"item_set_hash": item_set_hash, "env_version": None, "env_params_version": None},
         "sampler": dict(dep["sampler"]),
         "base_model": {"model_ref_sha256": base_sha,
