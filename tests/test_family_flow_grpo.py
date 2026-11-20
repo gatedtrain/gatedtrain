@@ -12,7 +12,32 @@ writes what train_flow_grpo.py writes, by the rules the family re-derives, indep
   both groups vary, all four samples are kept;
 - `samples.jsonl` (noise seed derive_seed('sample', seed, e, i), member i % G, sample_id the compact hash of
   [domain, seed, attempt, e, i, prompt_id, noise, member]), `epoch_plan.jsonl`, `train_steps.jsonl`;
-- cuts `checkpoint-1/` (global_step 2, consumed 2, filtered 2) and `checkpoint-2/` (4, 6, 2), cut.json last.
+- cuts `checkpoint-1/` (global_step 2, consumed 2, filtered 2) and `checkpoint-2/` (4, 6, 2), cut.json last;
+- run_args.json, env-runtime.json, base_ref.json and adapter_config.json carry the base and data bindings the family's
+  run checks read (base_model, base_ref with verified, train_file and its SHA-256, profile, sampler code; base_ref.json
+  files and files_sha256), so the simulated run passes `checks` with no problem.
+
+`TestReincludedAndEmptyEpochs` runs the same simulator on 2 prompts x 4 images, where the padding re-includes a
+zero-advantage sample and one epoch keeps nothing.
+
+What the simulator leaves out of the real outputs (recipe gatedtrain-recipe-flow-grpo-sd35-ocr,
+runtime/train_flow_grpo.py), and why that does not weaken these tests:
+
+- cut.json `schema`, `schema_version`, `tags`, `created_at` (:624-628): no family check reads them (`read_cut_marker`
+  needs only `files`; `cut_problem` and `checks` read epoch, counts, files, deployable, ema, seed, profile, script and
+  sampler code hashes);
+- trainer_state.json `epoch`, the counts and `note`: a listed file hashed in cut.json `files`, its fields unread;
+- samples.jsonl `ocr_text`, `ocr_error`, `utc` (:829-834): the family leaves the reward fields to the area's
+  `_reward_field_problems` hook (the recipe's SD3.5 adapter checks `ocr_error`/`ocr_text` there; this subclass
+  checks reward = ocr_acc only), and `utc` is unread; epoch_plan.jsonl `utc` and run_args.json's descriptive fields (reward engine, device, memory) are
+  unread too;
+- sample_id: the recipe hashes `canonical(...)` (:149: compact sorted JSON, ensure_ascii False), the very encoding of
+  `compact` here, under its own domain `flow-grpo-sd35` where this subclass declares `mini-flow-grpo`;
+- the padding's choice: the runtime re-includes zero-advantage samples drawn by a seeded randperm (:846); the
+  family checks only that they are kept, have advantage 0 and number fewer than num_batches_per_epoch, so the
+  simulator takes the last ones;
+- the step order: the runtime permutes the kept samples per inner epoch (:870-871); the family checks per inner
+  epoch that each kept sample is applied once in steps of equal size, not the order.
 
 Each refusal below is one fault the family must catch before a ledger is written.
 """
@@ -26,6 +51,7 @@ import shutil
 import struct
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 
 from _ext import sha_of
@@ -107,43 +133,63 @@ def build_base(d: Path) -> Path:
     return d
 
 
-def simulate() -> tuple[list[dict], list[dict], list[dict], dict[int, tuple[int, int, int]]]:
+def simulate(epochs: dict = EPOCHS, group: int = 2, nb: int = 2
+             ) -> tuple[list[dict], list[dict], list[dict], dict[int, tuple[int, int, int]]]:
+    """The logs of a run with `images_per_prompt` `group` and `num_batches_per_epoch` `nb` (one inner epoch, two
+    optimizer steps per epoch with kept samples, as resolve_settings makes them)."""
     prompt_of = {r["prompt_id"]: r["prompt"] for r in PROMPTS}
     samples, plans, steps, state = [], [], [], {}
     gs = consumed = filtered = 0
-    for e, (pids, rewards) in EPOCHS.items():
-        ids, flat = [], []
-        for i in range(4):
-            g, member = i // 2, i % 2
+    for e, (pids, rewards) in epochs.items():
+        ids, zero = [], []
+        for i in range(len(pids) * group):
+            g, member = i // group, i % group
             pid, r, noise = pids[g], rewards[g][member], derive_seed("sample", SEED, e, i)
             sid = compact([DOMAIN, SEED, ATTEMPT, e, i, pid, noise, member])
             ids.append(sid)
-            if rewards[g][0] == rewards[g][1]:
-                flat.append(sid)
+            if Fraction(r) == sum(map(Fraction, rewards[g])) / group:     # advantage 0: the group mean (:838)
+                zero.append(i)
             samples.append({"attempt": ATTEMPT, "epoch": e, "sample_index": i, "sample_id": sid, "prompt_id": pid,
                             "prompt": prompt_of[pid], "target": target_text(prompt_of[pid]), "seed": noise,
                             "member": member, "reward": r, "ocr_acc": r})
-        kept = [s for s in ids if s not in flat]
-        per_step = len(kept) // 2
+        # The padding (:840-848): a nonzero count that is not a multiple of nb re-includes zero-advantage samples.
+        # The runtime picks them with a seeded randperm; the family checks only that they have advantage 0 and are
+        # fewer than nb, so the last ones stand in here.
+        true_count = len(ids) - len(zero)
+        need = (nb - true_count % nb) % nb
+        reinc = zero[len(zero) - need:] if need and len(zero) >= need else []
+        kept = [ids[i] for i in range(len(ids)) if i not in zero or i in reinc]
+        flat = [ids[i] for i in zero if i not in reinc]
         first = gs + 1
-        for k in range(2):
-            gs += 1
-            steps.append({"step": gs, "epoch": e, "inner": 0, "sample_ids": kept[k * per_step:(k + 1) * per_step]})
-        plans.append({"epoch": e, "filter_reason": "zero_advantage", "kept": kept, "filtered": flat, "reincluded": [],
-                      "steps": [first, gs]})
+        if kept:
+            per_step = len(kept) // 2
+            for k in range(2):
+                gs += 1
+                steps.append({"step": gs, "epoch": e, "inner": 0,
+                              "sample_ids": kept[k * per_step:(k + 1) * per_step]})
+        plans.append({"epoch": e, "filter_reason": "zero_advantage", "kept": kept, "filtered": flat,
+                      "reincluded": [ids[i] for i in reinc], "steps": [first, gs] if kept else []})
         consumed += len(kept)
         filtered += len(flat)
         state[e] = (gs, consumed, filtered)
     return samples, plans, steps, state
 
 
-def build_cut(out: Path, epoch: int, gs: int, consumed: int, filtered: int) -> Path:
+def base_files(base: Path) -> dict[str, str]:
+    """base_ref.json `files`: {relative path: "sha256:<hex>"} of the base without `.cache/`."""
+    return {e["path"]: "sha256:" + e["sha256"] for e in manifest_entries(base) if not e["path"].startswith(".cache/")}
+
+
+def build_cut(out: Path, epoch: int, gs: int, consumed: int, filtered: int, files: dict[str, str]) -> Path:
     d = out / f"checkpoint-{epoch}"
     d.mkdir(parents=True)
     (d / flow_grpo.LORA_WEIGHTS).write_bytes(lora_bytes(f"lora {epoch}"))
-    (d / "adapter_config.json").write_text(json.dumps({"r": 4, "weights": "raw"}), encoding="utf-8")
+    (d / "adapter_config.json").write_text(json.dumps({
+        "r": 4, "weights": "raw", "base_model_name_or_path": "org/mini", "base_model_revision": "b" * 40}),
+        encoding="utf-8")
     (d / "sampler.json").write_text(json.dumps(SAMPLER), encoding="utf-8")
-    (d / "base_ref.json").write_text(json.dumps({"repo": "org/mini", "revision": "b" * 40}), encoding="utf-8")
+    (d / "base_ref.json").write_text(json.dumps({"repo": "org/mini", "revision": "b" * 40, "files": files,
+                                                 "files_sha256": compact(files)}), encoding="utf-8")
     (d / "trainer_state.json").write_text(json.dumps({"global_step": gs}), encoding="utf-8")
     files = {n: file_sha256(d / n) for n in flow_grpo.CUT_FILES}
     (d / "cut.json").write_text(json.dumps({
@@ -154,6 +200,7 @@ def build_cut(out: Path, epoch: int, gs: int, consumed: int, filtered: int) -> P
 
 
 class FlowCase(unittest.TestCase):
+    EPOCHS, GROUP, SETTINGS = EPOCHS, 2, SETTINGS
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="gatedtrain-family-flow-"))
@@ -165,17 +212,27 @@ class FlowCase(unittest.TestCase):
         write_jsonl(self.data / "train.jsonl", PROMPTS)
         self.out = self.tmp / "out"
         self.out.mkdir()
-        samples, plans, steps, self.state = simulate()
+        samples, plans, steps, self.state = simulate(self.EPOCHS, self.GROUP, self.SETTINGS["num_batches_per_epoch"])
         write_jsonl(self.out / "samples.jsonl", samples)
         write_jsonl(self.out / "epoch_plan.jsonl", plans)
         write_jsonl(self.out / "train_steps.jsonl", steps)
-        self.args = {"seed": SEED, "attempt": ATTEMPT, "settings": dict(SETTINGS), "sampler": SAMPLER,
-                     "sampler_sha256": compact(SAMPLER), "n_train_prompts": len(PROMPTS),
-                     "script_sha256": "sha256:" + "6" * 64, "sampler_code_sha256": "sha256:" + "5" * 64}
+        files = base_files(self.base)
+        self.args = {"seed": SEED, "attempt": ATTEMPT, "settings": dict(self.SETTINGS), "sampler": SAMPLER,
+                     "sampler_sha256": compact(SAMPLER), "n_train_prompts": len(PROMPTS), "profile": "full",
+                     "script_sha256": "sha256:" + "6" * 64, "sampler_code_sha256": "sha256:" + "5" * 64,
+                     "base_model": "/base", "train_file": "/data/train.jsonl",
+                     "train_file_sha256": file_sha256(self.data / "train.jsonl"),
+                     "base_ref": {"repo": "org/mini", "revision": "b" * 40, "files_sha256": compact(files),
+                                  "verified": True}}
         self.write_args()
+        (self.out / "env-runtime.json").write_text(json.dumps({"sampler_code_sha256": "sha256:" + "5" * 64}),
+                                                   encoding="utf-8")
         for e, (gs, consumed, filtered) in self.state.items():
-            build_cut(self.out, e, gs, consumed, filtered)
-        (self.out / ".checkpoint-3.partial").mkdir()                       # never a cut
+            build_cut(self.out, e, gs, consumed, filtered, files)
+        (self.out / f".checkpoint-{len(self.EPOCHS) + 1}.partial").mkdir()       # never a cut
+        self.launch = {"script_sha256": "sha256:" + "6" * 64, "training_seed": SEED, "profile": "full",
+                       "mounts": [{"host": str(self.base), "container": "/base", "mode": "ro"},
+                                  {"host": str(self.data), "container": "/data", "mode": "ro"}]}
 
     def write_args(self) -> None:
         (self.out / "run_args.json").write_text(json.dumps(self.args), encoding="utf-8")
@@ -452,6 +509,94 @@ class TestConsumptionRefusedPlanAndSteps(FlowCase):
         self.assertRefused("beyond run_args.json settings.epochs 1")
 
 
+class TestReincludedAndEmptyEpochs(FlowCase):
+    """The padding's positive path and an epoch that keeps nothing (train_flow_grpo.py :840-848, :854-858), on 2
+    prompts x 4 images (num_batches_per_epoch 2, gradient_accumulation_steps 1):
+
+    - epoch 1: group 0 rewards (1, 0.25, 0.25, 0.5) has 3 nonzero advantages, group 1 is flat; 3 is odd, so one
+      zero-advantage sample (sample_index 7, of the flat group) is re-included: 4 kept, 4 filtered;
+    - epoch 2: both groups flat: 0 kept, 8 filtered, plan steps [], no optimizer step; its cut repeats global_step 2;
+    - epoch 3: group 0 (1, 0, 0.5, 0.5) keeps 2, the flat group 1 and the two mean-reward members are filtered."""
+
+    EPOCHS = {1: (("p0", "p1"), ((1.0, 0.25, 0.25, 0.5), (0.5,) * 4)),
+              2: (("p2", "p3"), ((0.0,) * 4, (1.0,) * 4)),
+              3: (("p0", "p2"), ((1.0, 0.0, 0.5, 0.5), (0.75,) * 4))}
+    GROUP = 4
+    SETTINGS = dict(SETTINGS, samples_per_epoch=8, images_per_prompt=4, epochs=3)
+
+    def plans(self) -> list[dict]:
+        return read_jsonl(self.out / "epoch_plan.jsonl")
+
+    def plan(self, e: int, **change) -> None:
+        self.edit("epoch_plan.jsonl", lambda docs: docs.__setitem__(e - 1, dict(docs[e - 1], **change)))
+
+    def test_accepted(self):
+        p1, p2, p3 = self.plans()
+        samples = read_jsonl(self.out / "samples.jsonl")
+        self.assertEqual(p1["reincluded"], [samples[7]["sample_id"]])                 # the simulator's own shape
+        self.assertEqual((len(p1["kept"]), len(p2["kept"]), p2["steps"], len(p3["kept"])), (4, 0, [], 2))
+        self.assertEqual(self.state, {1: (2, 4, 4), 2: (2, 4, 12), 3: (4, 6, 18)})
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(self.run_checks(), [])
+        rows = self.ad.consumption(self.out, self.data, self.cuts())["rows"]
+        consumed = sorted(r["step"] for r in rows if r["outcome"] == "consumed")
+        self.assertEqual(consumed, [1, 1, 2, 2, 3, 4])
+        self.assertEqual([r["outcome"] for r in rows].count("filtered"), 18)
+        reinc = [r for r in rows if r["data_ref"]["row"] == "sha256:" + hashlib.sha256(b"p1").hexdigest()
+                 and r["outcome"] == "consumed"]
+        self.assertEqual(len(reinc), 1)                               # the re-included member of the flat group
+
+    def run_checks(self) -> list[str]:
+        return [p.message for p in self.ad.checks(last_cut=self.out / "checkpoint-3", base=self.base,
+                                                  launch=self.launch, base_field="base", stage_out=self.out,
+                                                  data=self.data)]
+
+    def test_reincluded_with_advantage(self):
+        """Only a zero-advantage sample is re-included: swap the re-included one for a sample with advantage."""
+        p = self.plans()[0]
+        samples = read_jsonl(self.out / "samples.jsonl")
+        self.plan(1, reincluded=[samples[0]["sample_id"]])
+        self.assertRefused("1 reincluded sample(s) have a reward other than their group mean")
+        self.plan(1, reincluded=p["reincluded"])
+        self.assertEqual(self.problems(), [])
+
+    def test_reincluded_too_many(self):
+        """The padding re-includes at most nb - 1 samples: three flat-group members kept as re-included."""
+        sid = [x["sample_id"] for x in read_jsonl(self.out / "samples.jsonl")]
+        self.plan(1, kept=[sid[i] for i in (0, 1, 2, 5, 6, 7)], filtered=[sid[3], sid[4]],
+                  reincluded=[sid[i] for i in (5, 6, 7)])
+        self.assertRefused("reincluded (3) is not a subset of kept smaller than num_batches_per_epoch 2")
+
+    def test_reincluded_dropped(self):
+        """A flat-group member kept but not listed as re-included is a plain kept zero-advantage sample."""
+        self.plan(1, reincluded=[])
+        self.assertRefused("prompt group 1 has equal rewards (zero advantage), but 1 of its samples are kept without "
+                           "being reincluded")
+
+    def test_empty_epoch_with_steps(self):
+        """An epoch that keeps nothing has no optimizer step and plan steps []."""
+        self.plan(2, steps=[3, 4])
+        self.assertRefused("epoch 2 names steps [3, 4], not the epoch's steps [] (no kept samples)")
+
+    def test_empty_epoch_trained(self):
+        """Optimizer steps logged for an epoch that keeps nothing (the later steps renumbered to stay consecutive)."""
+        self.edit("train_steps.jsonl", lambda docs: docs[:2] + [
+            {"step": 3, "epoch": 2, "inner": 0, "sample_ids": []},
+            {"step": 4, "epoch": 2, "inner": 0, "sample_ids": []}] + [dict(d, step=d["step"] + 2) for d in docs[2:]])
+        self.plan(3, steps=[5, 6])
+        self.assertRefused("train_steps.jsonl epoch 2 has 2 optimizer steps, but epoch_plan.jsonl keeps no samples of it")
+
+    def test_empty_epoch_cut_counts(self):
+        ck = self.out / "checkpoint-2"
+        doc = json.loads((ck / "cut.json").read_text(encoding="utf-8"))
+        (ck / "cut.json").write_text(json.dumps(dict(doc, global_step=3, samples_filtered=4)), encoding="utf-8")
+        msgs = self.problems()
+        self.assertTrue(any("checkpoint-2 cut.json global_step is 3, but train_steps.jsonl logs 2 steps up to epoch 2"
+                            in m for m in msgs), msgs)
+        self.assertTrue(any("checkpoint-2 cut.json samples_filtered is 4, but epoch_plan.jsonl filters 12" in m
+                            for m in msgs), msgs)
+
+
 class TestConsumptionRefusedSettings(FlowCase):
 
     def test_settings(self):
@@ -515,12 +660,10 @@ class TestOverlapAndPins(FlowCase):
         return [p.message for p in out]
 
     def test_family_checks(self):
-        launch = {"script_sha256": "sha256:" + "6" * 64, "training_seed": SEED, "profile": "full", "mounts": []}
+        launch = self.launch
         family = ("n_train_prompts", "run_args.json script_sha256", "sampler_sha256", "settings.ema",
                   "adapter_config.json weights", "reward is not ocr", "cut.json ema")
-        clean = self.run_check_messages(launch)
-        for word in family:
-            self.assertFalse(any(word in m for m in clean), (word, clean))
+        self.assertEqual(self.run_check_messages(launch), [])           # the simulated run passes every run check
         self.args.update(n_train_prompts=3, script_sha256="sha256:" + "7" * 64, sampler_sha256=compact({}))
         self.args["settings"] = dict(SETTINGS, ema=True, reward="brightness")
         self.write_args()
