@@ -277,9 +277,6 @@ class FixRoundTests(Base):
         self.assertIn("EXT-RES-1", self.rules(probs))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def rec(a, restore_=None, end_status=None, repaired=False):
     return AttemptRecord(a, "2026-11-20T10:00:00Z", restore_, end_status, repaired)
@@ -410,6 +407,22 @@ class ChainTests(Base):
         _, probs = self.chain([rec(1), rec(2, self.rs(c10)), rec(3, self.rs(c30), "ok")], [c10, c20, c30])
         self.assertEqual(self.rules(probs), ["EXT-RES-2"])
 
+    def test_two_cuts_at_one_step_refuse(self):
+        c10, dup = self.make_cut(10, 1), self.make_cut(10, 1)
+        other = self.dir / "cuts" / "other-10"
+        other.mkdir()
+        (other / "cut.json").write_bytes(b"{}")
+        _, probs = segment_chain(pairs_of(rec(1), rec(2, self.rs(c10), "ok")), [(10, c10[1]), (10, other)],
+                                 run_id="r", max_steps=30)
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_non_final_attempt_without_cut_restores_same_cut(self):
+        c10 = self.make_cut(10, 1)
+        segs, probs = self.chain([rec(1), rec(2, self.rs(c10)), rec(3, self.rs(c10), "ok")], [c10])
+        self.assertEqual(probs, [])
+        self.assertEqual([(s.attempt, s.branch_step, s.end_step) for s in segs],
+                         [(1, None, 10), (2, 10, 10), (3, 10, 30)])
+
     def test_repaired_restore_accepted_when_committed(self):
         c10 = self.make_cut(10, 1)
         segs, probs = self.chain([rec(1), rec(2, self.rs(c10, repaired=True), "ok", True)], [c10])
@@ -460,3 +473,40 @@ class SplitTests(unittest.TestCase):
     def test_unknown_attempt_refuses(self):
         _, _, probs = split_steps(self.CHAIN, self.rows(1, range(1, 11)) + self.rows(2, range(11, 21)) + self.rows(7, [3]))
         self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"])
+
+    def test_final_attempt_step_beyond_max_refuses(self):
+        _, _, probs = split_steps(self.CHAIN, self.rows(1, range(1, 11)) + self.rows(2, range(11, 22)))
+        self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"])
+
+    def test_step_at_or_below_branch_step_refuses(self):
+        # Attempt 2 (branch 10) records step 10 again: not orphaned, a defect.
+        _, orphaned, probs = split_steps(self.CHAIN, self.rows(1, range(1, 11)) + self.rows(2, range(10, 21)))
+        self.assertEqual((sorted({p.rule for p in probs}), orphaned), (["EXT-RES-4"], []))
+
+    def test_step_zero_and_negative_refuse(self):
+        for bad in (0, -3):
+            _, orphaned, probs = split_steps(self.CHAIN, self.rows(1, range(1, 11)) + self.rows(2, range(11, 21))
+                                             + self.rows(1, [bad]))
+            self.assertEqual((sorted({p.rule for p in probs}), orphaned), (["EXT-RES-4"], []), bad)
+
+    def test_malformed_records_refuse(self):
+        good = self.rows(1, range(1, 11)) + self.rows(2, range(11, 21))
+        for bad in ({"step": 3}, {"attempt": 1}, {"attempt": 1, "step": "3"}, {"attempt": True, "step": 3},
+                    {"attempt": 1, "step": True}, {"attempt": 1, "step": 2.0}, {"attempt": None, "step": 1}):
+            _, _, probs = split_steps(self.CHAIN, good + [bad])
+            self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"], bad)
+
+    def test_non_final_attempt_without_cut_is_all_orphaned(self):
+        # Attempt 2 wrote no cut; attempt 3 restores cut 10 again. Attempt 2's records are orphaned.
+        chain = [Segment(1, "r.1", None, None, 10, None), Segment(2, "r.2", 1, 10, 10, "checkpoint-10"),
+                 Segment(3, "r.3", 2, 10, 20, "checkpoint-10")]
+        records = self.rows(1, range(1, 14)) + self.rows(2, range(11, 16)) + self.rows(3, range(11, 21))
+        kept, orphaned, probs = split_steps(chain, records)
+        self.assertEqual(probs, [])
+        self.assertEqual(sorted(r["step"] for r in kept), list(range(1, 21)))
+        self.assertEqual({r["attempt"] for r in orphaned}, {1, 2})
+        self.assertEqual(len(orphaned), 3 + 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

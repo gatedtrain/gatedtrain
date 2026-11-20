@@ -299,9 +299,13 @@ def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts
 
     info: dict[int, tuple[Path, str | None, dict | None]] = {}
     for step, path in cuts:
-        if step not in info:
-            sha, doc = _read_cut(Path(path))
-            info[step] = (Path(path), sha, doc)
+        if step in info:
+            problems.append(Problem("EXT-RES-2", f"cuts/{Path(path).name}",
+                                    f"two committed cuts at step {step}: {info[step][0].name} and {Path(path).name}",
+                                    "collect a run with one committed cut per step"))
+            continue
+        sha, doc = _read_cut(Path(path))
+        info[step] = (Path(path), sha, doc)
     ne = [r for _, r in aligned if r is not None]
     writer: dict[int, int] = {}
     if len(ne) > 1:
@@ -368,7 +372,10 @@ def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts
 
 def split_steps(chain: list[Segment], records: list[dict]) -> tuple[list[dict], list[dict], list[Problem]]:
     """(kept, orphaned, problems) (EXT-RES-4). A record of attempt A is kept iff `branch_step_A < step <= end_step_A`
-    (branch 0 for the first attempt), else orphaned. Every step 1..max_steps (the last segment's end) must have
+    (branch 0 for the first attempt). It is orphaned only when A is not the final segment and `step > end_step_A`
+    (steps run after A's last cut and redone by a later attempt). A record that is malformed (`attempt` or `step`
+    missing, not an int, a bool, or step < 1), has step > max_steps, or step <= branch_step_A refuses, since
+    orphaned records are excluded from every rollup and would hide consumption. Every step 1..max_steps (the last segment's end) must have
     kept records from exactly one attempt; a record of an attempt outside the chain refuses."""
     problems: list[Problem] = []
     fix = "collect a run whose kept records cover every step exactly once"
@@ -377,16 +384,31 @@ def split_steps(chain: list[Segment], records: list[dict]) -> tuple[list[dict], 
     orphaned: list[dict] = []
     owners: dict[int, set[int]] = {}
     unknown: set = set()
-    for r in records:
-        s = seg.get(r["attempt"])
-        if s is None:
-            unknown.add(r["attempt"])
+    max_steps = chain[-1].end_step if chain else 0
+    bad: list[str] = []
+    for i, r in enumerate(records):
+        a, st = (r.get("attempt"), r.get("step")) if isinstance(r, dict) else (None, None)
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (a, st)) or st < 1:
+            bad.append(f"record {i}: `attempt` and `step` must be integers with step >= 1")
             continue
-        if (s.branch_step or 0) < r["step"] <= s.end_step:
+        s = seg.get(a)
+        if s is None:
+            unknown.add(a)
+            continue
+        if st > max_steps:
+            bad.append(f"record {i} (attempt {a}): step {st} is beyond max_steps {max_steps}")
+        elif st <= (s.branch_step or 0):
+            bad.append(f"record {i} (attempt {a}): step {st} is not above the attempt's branch step "
+                       f"{s.branch_step or 0}")
+        elif st <= s.end_step:
             kept.append(r)
-            owners.setdefault(r["step"], set()).add(s.attempt)
+            owners.setdefault(st, set()).add(s.attempt)
         else:
             orphaned.append(r)
+    for m in bad[:5]:
+        problems.append(Problem("EXT-RES-4", "records", m, fix))
+    if len(bad) > 5:
+        problems.append(Problem("EXT-RES-4", "records", f"{len(bad) - 5} more malformed or out-of-range records", fix))
     for a in sorted(unknown, key=str):
         problems.append(Problem("EXT-RES-4", "records", f"records of attempt {a!r}, which is not in the segment chain",
                                 fix))
