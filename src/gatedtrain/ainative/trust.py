@@ -2,8 +2,8 @@
 
 `TrustBackend` holds the sealed items and the preregistrations; `AlphaLedger` holds the significance budget. The
 stages talk only to these interfaces, so a keeper daemon in step 2 replaces the stubs without changing a stage.
-The step 1 stubs run in the operator process: they keep the sealed items in memory and say so in
-`sealed_guarantee`.
+The step 1 stubs run in the operator process: the operator and every stage can read the sealed items and read and
+rewrite the trust records and the attempt log, and `sealed_guarantee` says so.
 
 Both stubs persist their state under `<root>/trust/` (sealed items, registrations, `ledger.jsonl`), written by temp
 file plus rename and never through a symbolic link, so a new process sees the same state. The step 1 store is
@@ -23,7 +23,11 @@ from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
 from .project import Project, _refuse_links, _write_atomic
 
-UNSEALED_GUARANTEE = "unsealed (step 1): the operator process can read the sealed items"
+UNSEALED_GUARANTEE = ("unsealed (step 1): the operator process can read the sealed items, and every stage can read "
+                      "and rewrite the trust records and the attempt log")
+# A spent test: the alpha is per project in step 1, so a new project on the same data would get a fresh alpha with
+# the same sealed split; the fix asks for new sealed data instead (step 2 keys the budget by the sealed set).
+NEW_TEST_FIX = "this project's sealed test is used; a new test needs new sealed data"
 
 
 @dataclass(frozen=True)
@@ -78,7 +82,7 @@ def _hex(digest: object) -> str:
 
 def _refuse_sealed_claim() -> Refused:
     return Refused([Problem("AN-8", "trust/sealed_evaluation", "the sealed evaluation claim is missing or damaged",
-                            "this project's sealed test is used; a new test needs new sealed data")])
+                            NEW_TEST_FIX)])
 
 
 def _read_trust_file(project: Project, rel: str) -> bytes | None:
@@ -233,7 +237,7 @@ class FixedAlphaLedger:
                     row = None
                 if not isinstance(row, dict):
                     raise Refused([Problem("AN-9", self.REL, "the ledger has a line that is not a JSON object",
-                                           "the ledger was damaged; start a new project")])
+                                           f"the ledger was damaged; {NEW_TEST_FIX}")])
                 rows.append(row)
         return rows
 
@@ -269,7 +273,7 @@ class FixedAlphaLedger:
 
     def spend(self, attempt_id: str) -> float:
         spent = Refused([Problem("AN-9", "gate", "the alpha budget is spent: step 1 allows one gate test per project",
-                                 "start a new project for another test")])
+                                 NEW_TEST_FIX)])
         if any(r.get("event") == "spend" for r in self._lines()) or not self._claim():
             raise spent
         self._append({"event": "spend", "attempt_id": attempt_id, "alpha": self.alpha})

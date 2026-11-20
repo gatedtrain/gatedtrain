@@ -408,7 +408,9 @@ class TrustStubTest(unittest.TestCase):
 
     def test_in_process_trust(self) -> None:
         t = InProcessTrust(self.project)
-        self.assertEqual(t.sealed_guarantee, "unsealed (step 1): the operator process can read the sealed items")
+        self.assertEqual(t.sealed_guarantee, "unsealed (step 1): the operator process can read the sealed items, "
+                                             "and every stage can read and rewrite the trust records and the "
+                                             "attempt log")
         items = [{"q": "a", "label": "x"}, {"q": "b", "label": "y"}, {"q": "c", "label": "x"}]
         ref = t.seal(items)
         s = t.sealed_summary(ref)

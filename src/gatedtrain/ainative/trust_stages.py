@@ -36,7 +36,7 @@ from ..registration import check_contents, max_unpaired, min_paired, resolved_ev
 from . import scorers
 from .project import ArtifactRef, Project, _refuse_links, _utc_now, _write_atomic
 from .stage import Proposal, StageContext
-from .trust import SealedRef
+from .trust import NEW_TEST_FIX, SealedRef
 
 SCHEMA_VERSION = 1
 SCHEMA_TRAIN_PART = "gatedtrain.ainative.train_part"
@@ -307,7 +307,7 @@ def _values(ctx: StageContext, decision: dict) -> dict:
     alpha = ctx.ledger.available()
     if not _num(alpha) or not 0 < alpha < 0.5:
         raise _refuse7("alpha", f"no alpha is available to register (available: {alpha!r})",
-                       "the alpha budget is spent; start a new project")
+                       NEW_TEST_FIX)
     return {"scorer": scorer, "direction": direction, "margin": float(margin), "alpha": float(alpha)}
 
 
@@ -815,7 +815,7 @@ class Gate:
         available = ctx.ledger.available()
         if not (_num(available) and available > 0):
             raise _refuse("AN-9", "gate", "the alpha budget is spent: step 1 allows one gate test per project",
-                          "start a new project for another test")
+                          NEW_TEST_FIX)
         reg, full = _registered(ctx, "AN-9")
         clause = dict(full["clause"])
         if clause.get("direction") != reg["direction"] or clause.get("margin") != reg["margin"]:
@@ -877,6 +877,25 @@ METRIC_UNITS = {"exact_match": "share of items answered exactly (0 to 1)"}
 REPORT_MD = "report.md"
 
 
+LIMIT_ALPHA_PER_PROJECT = ("the alpha is per project in step 1: a new project on the same data gets a fresh alpha "
+                           "and the same sealed split, so its test would not be independent of this one (step 2 keys "
+                           "the alpha by the sealed set)")
+LIMIT_METRIC_CONFIRMATION = ("the metric confirmation is the decision flag metric_confirmed, set by whoever runs the "
+                             "stages; step 1 has no separate channel that shows the sentence to the user")
+
+
+def known_limits(guarantee: str, attempts: list[dict]) -> list[dict]:
+    """The report's known limits, from constants and records: the backend's guarantee, the per-project alpha, the
+    metric confirmation flag and the number of `evaluate_sealed` attempts in the attempt log (refused ones too)."""
+    n = sum(1 for a in attempts if a.get("stage") == "evaluate_sealed" and a.get("event") == "start")
+    return [{"id": "sealed_guarantee", "text": guarantee},
+            {"id": "alpha_per_project", "text": LIMIT_ALPHA_PER_PROJECT},
+            {"id": "metric_confirmation", "text": LIMIT_METRIC_CONFIRMATION},
+            {"id": "sealed_evaluations", "attempts": n,
+             "text": f"the sealed set was scored in {n} evaluate_sealed attempt{'' if n == 1 else 's'} (refused "
+                     "attempts included); one project allows one evaluated candidate"}]
+
+
 def _round(x: Any) -> Any:
     return round(x, 4) if isinstance(x, float) else x
 
@@ -932,7 +951,9 @@ def render_markdown(report: dict) -> str:
     lines += ["", "## Sealed evaluation and gate log"]
     for a in report["attempts"]:
         lines.append(f"- {a['stage']} attempt {a['attempt']} {a['event']} at {a['utc']}")
-    lines += ["", "## Known limits", report["sealed_guarantee"], ""]
+    lines += ["", "## Known limits"]
+    lines += [f"- {x['text']}" for x in report["known_limits"]]
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -960,7 +981,7 @@ class Report:
         gate = ctx.project.read_artifact(ctx.inputs["gate_result"])
         if gate.get("registration_hash") != reg["hash"] or gate.get("post_hoc") is not reg["post_hoc"]:
             raise _refuse("AN-10", "inputs.gate_result", "the gate result is not for the latest registration",
-                          "rerun the gate in a new project or rerun report with the matching result")
+                          "rerun report with the gate result of the latest registration")
         keep = {"schema", "schema_version"}
         attempts = [{"stage": r.get("stage"), "attempt": r.get("attempt"), "event": r.get("event"), "utc": r.get("utc"),
                      "key": r.get("key")}
@@ -977,7 +998,8 @@ class Report:
                             "baseline_score": _round(gate["baseline_score"]),
                             "candidate_score": _round(gate["candidate_score"]), "mde_planned": _round(power["mde"])},
                 "ledger": ctx.ledger.entries(), "attempts": attempts,
-                "sealed_guarantee": ctx.trust.sealed_guarantee}
+                "sealed_guarantee": ctx.trust.sealed_guarantee,
+                "known_limits": known_limits(ctx.trust.sealed_guarantee, attempts)}
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
         report = self._build(ctx)
@@ -1004,7 +1026,10 @@ class Report:
         if report.get("status") != _effective_status(gate.get("status"), reg["post_hoc"]):
             problems.append(Problem("AN-10", "report.status", "the report status differs from the gate result",
                                     "rerun report"))
-        if report.get("sealed_guarantee") != ctx.trust.sealed_guarantee:
+        limits = report.get("known_limits")
+        if report.get("sealed_guarantee") != ctx.trust.sealed_guarantee or not isinstance(limits, list) or \
+                limits != known_limits(ctx.trust.sealed_guarantee, report.get("attempts") or []):
             problems.append(Problem("AN-10", "report.sealed_guarantee",
-                                    "the report does not state the trust backend's guarantee", "rerun report"))
+                                    "the report does not state the trust backend's guarantee and the known limits "
+                                    "built from the records", "rerun report"))
         return problems

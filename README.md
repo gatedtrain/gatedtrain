@@ -83,13 +83,19 @@ gatedtrain project report ./proj
 
 `--pipeline` is the path of a pipeline YAML. `--gpu-hours` is recorded in
 `project.yaml` as the budget; step 1 enforces nothing. `run` of the `gate` stage exits 0 on PASS and 1 otherwise;
-a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. The gate spends the
-project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result object per call.
+a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. A project scores one
+candidate on its sealed items: `evaluate_sealed` may score the same candidate again but refuses another one. The
+gate spends the project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result
+object per call.
 
 **Trust boundary in step 1.** Stages run in the operator's process. CLI outputs carry only hashes of the sealed
 items, but in step 1 they sit in plain files under `<root>/trust/` that the operator and any stage can read and
 rewrite, as can the attempt log; the report's `sealed_guarantee` says so ("unsealed (step 1): the operator process
-can read the sealed items"). Enforcement arrives with the step-2 keeper.
+can read the sealed items, and every stage can read and rewrite the trust records and the attempt log").
+Enforcement arrives with the step-2 keeper. In step 1 the alpha is per project: a new project on the same data
+would get a fresh alpha and the same sealed split, so a new test needs new sealed data. The report's known limits
+list these points, that the metric confirmation is the decision flag `metric_confirmed` set by whoever runs the
+stages, and how many `evaluate_sealed` attempts the project made.
 
 `project create` copies the pipeline into `<root>/pipeline.yaml` and records its sha256; the project refuses a copy
 that was changed. To use another pipeline, create a new project. A stage that refuses in `run` before writing outputs is logged as `refused` and changes no stage state; a refusal

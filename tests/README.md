@@ -1900,8 +1900,9 @@ assert their reason. Suite: 1,369 tests, 40 skipped in CI (among them the root-o
 ## 12. AI-native step 1 (AN-1 to AN-10)
 
 Design revision 21, `05-evaluation-and-lineage.md` §18. Step 1 runs on a CPU only synthetic pack. The trust backend is
-`InProcessTrust` (`sealed_guarantee`: "unsealed (step 1): the operator process can read the sealed items") and the
-alpha ledger is `FixedAlphaLedger` (alpha 0.05, one attempt). The keeper daemon and the alpha-investing variant are
+`InProcessTrust` (`sealed_guarantee`: "unsealed (step 1): the operator process can read the sealed items, and every
+stage can read and rewrite the trust records and the attempt log") and the alpha ledger is `FixedAlphaLedger` (alpha
+0.05, one attempt per project; the alpha is per project in step 1). The keeper daemon and the alpha-investing variant are
 step 2 and are not tested here.
 
 | Rule | Behaviour pinned | Test file |
@@ -1915,7 +1916,7 @@ step 2 and are not tested here.
 | AN-7 | `preregister`: registration fields, metric from the library, nothing trains before confirmation, amendment marks `post_hoc` | `tests/test_an_intake.py` |
 | AN-8 | `evaluate_sealed`: records out, no item content out; the stub states its guarantee; one sealed evaluation per project (a claim in the trust store bound to the candidate's model hash: the same candidate may be scored again, another candidate is refused, and the report lists every `evaluate_sealed` attempt) | `tests/test_an_gate.py` |
 | AN-9 | `gate` on the sealed records: item-set hash check, `post_hoc`, `FixedAlphaLedger` refuses a second attempt, attempt log | `tests/test_an_gate.py` |
-| AN-10 | `report` from records only; `sealed_guarantee` in the known limits; unrecorded numbers refused | `tests/test_an_gate.py` |
+| AN-10 | `report` from records only; a known-limits list (`sealed_guarantee`, the per-project alpha, the `metric_confirmed` flag, the number of `evaluate_sealed` attempts) in `report.json` and `report.md`; unrecorded numbers refused; spent-alpha fixes ask for new sealed data, not a new project | `tests/test_an_gate.py` |
 | all | End to end on the synthetic pack | `tests/test_an_e2e.py`, `tests/test_an_synthetic_pack.py` |
 
 `gatedtrain project` (AN-11). `create <root> --goal --data --pipeline [--gpu-hours]`, `plan`, `run [--decision FILE]`,

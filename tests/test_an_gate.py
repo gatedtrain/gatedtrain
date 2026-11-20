@@ -500,6 +500,24 @@ class GateTest(GateBase):
         self.assertEqual(cm.exception.problems[0].rule, "AN-9")
         self.assertEqual(len(FixedAlphaLedger(proj).entries()), 1)
 
+    def test_spent_alpha_fix_texts_ask_for_new_sealed_data_not_a_new_project(self) -> None:
+        """Final review I1: a new project on the same data would get a fresh alpha and the same sealed split."""
+        from gatedtrain.ainative.trust import NEW_TEST_FIX
+
+        self.assertEqual(NEW_TEST_FIX, "this project's sealed test is used; a new test needs new sealed data")
+        proj = self.make()
+        self.through(proj, "gate")
+        fixes = []
+        for stage, decision in (("gate", {"rerun": True, "again": 1}),
+                                ("preregister", {"metric_confirmed": True, "margin": 0.05, "rerun": True})):
+            with self.assertRaises(Refused) as cm:
+                self.run_(proj, stage, decision)
+            fixes.append(cm.exception.problems[0].fix)
+        with self.assertRaises(Refused) as cm:
+            FixedAlphaLedger(proj).spend("again")
+        fixes.append(cm.exception.problems[0].fix)
+        self.assertEqual(fixes, [NEW_TEST_FIX] * 3)
+
     def test_same_gate_run_again_returns_the_recorded_result(self) -> None:
         proj = self.make()
         self.upto_registration(proj)
@@ -582,6 +600,31 @@ class ReportTest(GateBase):
         self.assertEqual(rep["registration"]["scorer"], "exact_match")
         self.assertIn("exact_match", md)
         self.assertIn("share of items", md)                               # the metric unit
+
+    def test_known_limits_is_a_list_built_from_constants_and_records(self) -> None:
+        proj = self.make()
+        rep, md = self.reports(proj)
+        limits = rep["known_limits"]
+        self.assertEqual([x["id"] for x in limits],
+                         ["sealed_guarantee", "alpha_per_project", "metric_confirmation", "sealed_evaluations"])
+        by_id = {x["id"]: x for x in limits}
+        self.assertEqual(by_id["sealed_guarantee"]["text"], UNSEALED_GUARANTEE)
+        self.assertEqual(by_id["sealed_guarantee"]["text"], rep["sealed_guarantee"])
+        for words in ("read the sealed items", "rewrite", "trust records", "attempt log"):
+            self.assertIn(words, UNSEALED_GUARANTEE)
+        self.assertIn("per project", by_id["alpha_per_project"]["text"])
+        self.assertIn("same sealed split", by_id["alpha_per_project"]["text"])
+        self.assertIn("metric_confirmed", by_id["metric_confirmation"]["text"])
+        self.assertEqual(by_id["sealed_evaluations"]["attempts"], 1)
+        self.assertIn("1 evaluate_sealed attempt", by_id["sealed_evaluations"]["text"])
+        section = md.split("## Known limits\n", 1)[1]
+        for x in limits:
+            self.assertIn(f"- {x['text']}\n", section)
+
+    def test_the_readme_quotes_the_guarantee_exactly(self) -> None:
+        readme = " ".join((Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8").split())
+        self.assertTrue(f'"{UNSEALED_GUARANTEE}"' in readme, "README.md must quote sealed_guarantee exactly")
+        self.assertTrue("alpha is per project" in readme, "README.md must say the alpha is per project")
 
     def test_every_number_in_report_md_is_in_report_json(self) -> None:
         proj = self.make()
