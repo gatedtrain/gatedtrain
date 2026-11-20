@@ -768,6 +768,20 @@ class CollectTwoClauses(unittest.TestCase):
         self.assertEqual(rules, {"EXT-ARM"})
         self.assertFalse(runs.exists() and any(runs.iterdir()))
 
+    def test_same_arm_through_a_link_refused(self):
+        """Review of the 3.12 path fix (S4): arms are told apart by the directory itself (`st_dev`, `st_ino`), not by
+        a resolved path string, so one arm passed again through a symbolic link is passed twice."""
+        link = self.tmp / "length-base-link"
+        if not link.is_symlink():
+            link.symlink_to(self.length_base)
+        runs = self.runs()
+        proc = self.collect(runs, arms=[(self.sc.baseline, self.sc.candidate), (self.length_base, link)])
+        self.assertEqual(proc.returncode, EXIT_REFUSED, describe(proc))
+        hits = [e for e in parse_errors(proc.stderr) if e["rule"] == "EXT-ARM" and "passed twice" in e["message"]]
+        self.assertEqual([e["field"] for e in hits], ["--eval-candidate"], describe(proc))
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(runs.exists() and any(runs.iterdir()))
+
     def test_item_without_cluster_field_refused(self):
         # R18-3: an item set without the clause's cluster field refuses the collect; the registration follows the
         # new item set hash, so the field is the only problem.

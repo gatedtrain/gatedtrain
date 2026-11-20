@@ -6,7 +6,7 @@ broken line is reported. `ext-collect` and `ext-merge-eval` share it.
 
 Line rules (EXT-1): keys `item` (non-empty string), `repeat` (in range(K)), `seed` (= the arm's
 `eval_seeds[repeat]`), `score` and `error` (exactly one non-null), optional `sub_metrics` (finite numbers),
-`output_ref` (`{path, sha256}` naming a file inside the arm with that SHA-256) and `item_meta` (an object,
+`output_ref` (`{path, sha256}` naming a regular file inside the arm with that SHA-256) and `item_meta` (an object,
 never paired). A score is a finite number (not a boolean or a string) inside the evaluator's registered
 range (MM-3); an error is `{class, message}` with a class the registry declares (MM-4). An item outside the
 registered set is not refused here: the gate reports it (`unknown_item`, MM-6).
@@ -14,19 +14,29 @@ registered set is not refused here: the gate reports it (`unknown_item`, MM-6).
 Metadata and provenance checks (EXT-44, EXT-45, EXT-47): eval_meta values compare as canonical
 JSON bytes, so `true` never equals `1` (`same_json`); an `output_ref` never names a file the arm itself
 holds (`items.jsonl`, `eval_meta.json`, `merge.json`, `judge_batches.jsonl`), so a merge or a collect copy
-never overwrites one, and it resolves inside the arm (no symbolic link out); `provenance_problems` checks a
-merged arm's `merge.json` against its sources.
+never overwrites one; `provenance_problems` checks a merged arm's `merge.json` against its sources.
+
+An `output_ref` path (MM-1) is relative, has no `..`, and no component of it is a symbolic link (hard links are
+allowed). `open_output_ref` opens it component by component from the arm directory without following links
+(`O_NOFOLLOW` under `dir_fd`), so neither a link nor a path longer than `PATH_MAX` reaches a file outside the arm,
+and `copy_output_ref` (collect, merge) copies the bytes it hashes: a file swapped after the check is refused,
+never copied. A path that cannot be opened is a problem, never a traceback (docs/findings.md, "Review of the 3.12
+path fix").
 """
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import math
+import os
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..canonical import canonical_json, file_sha256, text_lines
-from ..paths import resolve
+from ..errors import Problem, Refused
 from ..renamed import old_schema_note
 
 META_SCHEMA = "gatedtrain.item_eval"
@@ -58,11 +68,29 @@ def _finite(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+def _file_state(path: Path, *, regular: bool = True) -> str | None:
+    """None when `path` exists (as a regular file, if `regular`), "missing" when it does not, else the errno name of
+    why it cannot be inspected. Never raises: `Path.is_file()` and `Path.exists()` raise on Python 3.12 for an
+    error such as ENAMETOOLONG or EACCES, which is a problem to report, not a traceback."""
+    try:
+        mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except OSError as exc:
+        return _errname(exc)
+    except ValueError:                                     # an embedded NUL byte
+        return "ValueError"
+    return "missing" if regular and not stat.S_ISREG(mode) else None
+
+
 def read_meta(arm: Path) -> tuple[dict | None, list[str]]:
     """eval_meta.json with exactly the MM-2 keys (`created_at` optional)."""
     path = Path(arm) / "eval_meta.json"
-    if not path.is_file():
+    state = _file_state(path)
+    if state == "missing":
         return None, [f"{path} is missing"]
+    if state:
+        return None, [f"{path} cannot be read ({state})"]
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -116,26 +144,114 @@ def _output_ref_problem(arm: Path, ref: Any) -> str | None:
         return f"output_ref path {ref['path']!r} leaves the arm"
     if len(rel.parts) == 1 and rel.parts[0] in RESERVED_FILES:
         return f"output_ref path {ref['path']!r} names a file of the arm itself ({', '.join(RESERVED_FILES)})"
-    target = (Path(arm) / ref["path"])
+    fd, why = open_output_ref(arm, ref["path"])
+    if fd is None:
+        return why
     try:
-        inside = resolve(target).is_relative_to(resolve(arm))
-    except OSError:
-        inside = False
-    if not inside:
-        return f"output_ref path {ref['path']!r} leaves the arm"
-    if not target.is_file():
-        return f"output_ref file {ref['path']!r} is absent"
-    if ref["sha256"] != file_sha256(target):
+        got = _sha256_fd(fd)
+    except OSError as exc:
+        return f"output_ref file {ref['path']!r} cannot be read ({_errname(exc)})"
+    finally:
+        os.close(fd)
+    if ref["sha256"] != got:
         return f"output_ref file {ref['path']!r} differs from its sha256"
     return None
+
+
+def _errname(exc: OSError) -> str:
+    return errno.errorcode.get(exc.errno, exc.__class__.__name__) if exc.errno else exc.__class__.__name__
+
+
+def _sha256_fd(fd: int, out=None) -> str:
+    """SHA-256 of what is read from `fd` (from its current offset), written on to the binary file `out` if given."""
+    h = hashlib.sha256()
+    while chunk := os.read(fd, 1 << 20):
+        h.update(chunk)
+        if out is not None:
+            out.write(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def open_output_ref(arm: Path, path: str) -> tuple[int | None, str | None]:
+    """MM-1, EXT-45: (a read-only descriptor of the regular file `path` names inside `arm`, None) or (None, why).
+    The arm directory is opened as given (it may itself be a link); then each component of `path` is opened under
+    the descriptor of the one before with `O_NOFOLLOW` (`O_DIRECTORY` but for the last, `O_NONBLOCK` for the last so
+    a FIFO never blocks). A symbolic link anywhere refuses, a hard link is a regular file; no lexical or `realpath`
+    form of the path is used, so its length is never limited by `PATH_MAX`. `path` must have passed the lexical
+    checks of `_output_ref_problem` (relative, no `..`)."""
+    parts = PurePosixPath(path).parts
+    try:
+        dir_fd = os.open(arm, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        return None, f"output_ref file {path!r} cannot be opened: the arm directory cannot be ({_errname(exc)})"
+    try:
+        for i, name in enumerate(parts):
+            last = i == len(parts) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_NONBLOCK if last else os.O_DIRECTORY)
+            try:
+                fd = os.open(name, flags, dir_fd=dir_fd)
+            except OSError as exc:
+                return None, _open_problem(path, name, dir_fd, exc)
+            if last:
+                try:
+                    regular = stat.S_ISREG(os.fstat(fd).st_mode)
+                except OSError:
+                    regular = False
+                if not regular:
+                    os.close(fd)
+                    return None, f"output_ref file {path!r} is not a regular file"
+                return fd, None
+            os.close(dir_fd)
+            dir_fd = fd
+        return None, f"output_ref file {path!r} is absent"            # no parts: refused lexically before
+    finally:
+        os.close(dir_fd)
+
+
+def _open_problem(path: str, name: str, dir_fd: int, exc: OSError) -> str:
+    """Why component `name` (under `dir_fd`) of output_ref `path` did not open: a symbolic link (`O_NOFOLLOW` gives
+    ELOOP for the last component and ENOTDIR with `O_DIRECTORY`), absent, or another error by its errno name."""
+    try:
+        link = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
+    except OSError:
+        link = False
+    if link or exc.errno == errno.ELOOP:
+        return f"output_ref path {path!r} contains a symbolic link ({name!r}; MM-1 allows none)"
+    if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+        return f"output_ref file {path!r} is absent"
+    return f"output_ref file {path!r} cannot be opened ({_errname(exc)})"
+
+
+def copy_output_ref(arm: Path, ref: dict, dst: Path, *, flag: str) -> None:
+    """Copy the `output_ref` file of `arm` to `dst` (collect, merge): the bytes come from the descriptor
+    `open_output_ref` gives and are hashed while copied, so a file changed or swapped for a link after the line
+    checks is refused (Refused, EXT-ARM on `flag`; the caller removes its partial output), never copied. A failed
+    write of `dst` raises OSError."""
+    fd, why = open_output_ref(arm, ref["path"])
+    if fd is None:
+        raise Refused([Problem("EXT-ARM", flag, f"{arm}: {why} (changed after it was checked)",
+                               "do not change an arm while it is collected or merged")])
+    try:
+        with open(dst, "wb") as out:
+            got = _sha256_fd(fd, out)
+    finally:
+        os.close(fd)
+    if got != ref["sha256"]:
+        dst.unlink(missing_ok=True)
+        raise Refused([Problem("EXT-ARM", flag, f"{arm}: output_ref file {ref['path']!r} differs from its sha256 "
+                               "(changed after it was checked)",
+                               "do not change an arm while it is collected or merged")])
 
 
 def read_lines(arm: Path, *, seeds: list[int], score_range, error_classes) -> tuple[list[dict], list[str]]:
     """Every line of `<arm>/items.jsonl` checked against the EXT-1 rules. Returns (records, problems); a
     record keeps its `item_meta` (the caller drops it before the gate)."""
     path = Path(arm) / "items.jsonl"
-    if not path.is_file():
+    state = _file_state(path)
+    if state == "missing":
         return [], [f"{path} is missing (pass an arm directory, not its parent)"]
+    if state:
+        return [], [f"{path} cannot be read ({state})"]
     lo, hi = (list(score_range) + [None, None])[:2]
     k = len(seeds)
     records: list[dict] = []
@@ -232,8 +348,11 @@ def provenance_problems(arm: Path, meta: dict, *, nel_benchmark: str | None, row
     `ext_merge_eval`, `from_nel.convert_records` of the runs' `results.jsonl` (the registered `item_rows`) for
     `ext_from_nel`. An edited score, a dropped or reordered line is refused."""
     path = Path(arm) / "merge.json"
-    if not path.exists():
+    state = _file_state(path, regular=False)
+    if state == "missing":
         return []
+    if state:
+        return [f"merge.json cannot be read ({state}); provenance cannot be checked"]
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

@@ -27,7 +27,7 @@ from .. import TAGS
 from ..canonical import file_sha256, write_canonical
 from ..errors import Problem, Refused
 from . import registry
-from .arm import items_text, merge_records, read_lines, read_meta, same_json
+from .arm import copy_output_ref, items_text, merge_records, read_lines, read_meta, same_json
 
 MERGE_SCHEMA = "gatedtrain.ext_merge_eval"
 
@@ -137,10 +137,10 @@ def merge_eval(registration: Path, out: Path, runs: list[Path]) -> Path:
         for rec in info["records"]:
             ref = rec.get("output_ref")
             if ref:
-                if ref["path"] in outputs and outputs[ref["path"]][1] != ref["sha256"]:
+                if ref["path"] in outputs and outputs[ref["path"]][1]["sha256"] != ref["sha256"]:
                     problems.append(Problem("EXT-MERGE", info["field"], f"output {ref['path']} differs between runs",
                                             "give each run's outputs distinct paths"))
-                outputs[ref["path"]] = (info["run"] / ref["path"], ref["sha256"])
+                outputs[ref["path"]] = (info["run"], ref, info["field"])
     if problems:
         raise Refused(problems)
     merged = merge_records([(info["records"], info["meta"]["eval_seeds"]) for info in infos], seeds)
@@ -155,9 +155,9 @@ def merge_eval(registration: Path, out: Path, runs: list[Path]) -> Path:
         meta = {k: v for k, v in first.items() if k != "created_at"}
         meta["eval_seeds"] = seeds
         write_canonical(tmp / "eval_meta.json", meta)
-        for rel, (src, _) in outputs.items():
+        for rel, (run, ref, field) in outputs.items():           # MM-1: the checked bytes, never a swapped file
             (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, tmp / rel)
+            copy_output_ref(run, ref, tmp / rel, flag=field)
         write_canonical(tmp / "merge.json", {
             "schema": MERGE_SCHEMA, "schema_version": "1.0", "tags": list(TAGS),
             "sources": [{"path": str(i["run"].absolute()), "seeds": list(i["meta"]["eval_seeds"]),

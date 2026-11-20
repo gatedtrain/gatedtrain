@@ -27,7 +27,7 @@ An evaluator adapter writes one **arm directory** per evaluated checkpoint: `ite
   | `score` | finite number or null | Deciding metric in **natural units** (WER as WER, not negated) |
   | `error` | null or `{class, message}` | Evaluator-infrastructure failure only (MM-4); `score` is null iff `error` is non-null |
   | `sub_metrics` | object of finite numbers or null | Optional, descriptive only, never gated |
-  | `output_ref` | null or `{path, sha256}` | Generated output (image, video, transcript, CAD code, episode log) relative to the arm directory |
+  | `output_ref` | null or `{path, sha256}` | Generated output (image, video, transcript, CAD code, episode log) relative to the arm directory; no component is a symbolic link (hard links are allowed); opened component by component without following links, and collect copies the bytes it checked |
   | `item_meta` | object or null | Optional, for example `{task, init_state}`; not used for pairing |
 
   Unknown top-level keys are refused (no silent schema drift).

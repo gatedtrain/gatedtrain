@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from _ext import (EVALUATOR_ID, LABEL, SEEDS, baseline_score, build_arm, gpu_step_script, guard_log, launch_label,
+from _ext import (EVALUATOR_ID, LABEL, container_uid, SEEDS, baseline_score, build_arm, gpu_step_script, guard_log, launch_label,
                   merge, write_canonical)
 from _support import TIERB_ROOT, TIERB_ROOT_ENV, EXIT_OK, EXIT_REFUSED, VENV_PYTHON, cli_env, describe, parse_errors
 from test_ext_from_nel import convert, nel_runs, scorer_candidate
@@ -108,7 +108,7 @@ class TestHostPathsLaunch(LaunchCase):
 
     def test_gid_zero_refused(self):
         req = golden_request()
-        req["user"] = "1000:0"
+        req["user"] = f"{container_uid()}:0"
         self.launch_refused(req, "user")
 
     @unittest.skipUnless(host_socket_gids(), "no Docker daemon socket on this host")
@@ -116,7 +116,7 @@ class TestHostPathsLaunch(LaunchCase):
         for gid in sorted(host_socket_gids()):
             with self.subTest(gid=gid):
                 req = golden_request()
-                req["user"] = f"1000:{gid}"
+                req["user"] = f"{container_uid()}:{gid}"
                 self.launch_refused(req, "user")
 
 
@@ -139,7 +139,7 @@ class TestHostPathsCollect(CollectCase):
     def test_probe_p4_proc_root_and_docker_gid(self):
         """Review probe p4: /proc/1/root read-only and the docker group's gid (984 here): both refused."""
         gid = sorted(host_socket_gids())[0]
-        path = self.with_mount("/proc/1/root", user=f"1000:{gid}")
+        path = self.with_mount("/proc/1/root", user=f"{container_uid()}:{gid}")
         self.refused("EXT-LAUNCH", "--launch-record.mounts[4].host", launch=path)
         self.refused("EXT-LAUNCH", "--launch-record.user", launch=path)
 
@@ -155,14 +155,14 @@ class TestSocketGidLookup(unittest.TestCase):
     def test_injected_gid_refused(self):
         req = unit_request(self.root)
         self.assertEqual(problems(req), [])
-        req["user"] = "1000:4242"
-        cfg = unit_config(req, primary_gid=lambda uid: 4242)          # EXT-66: 4242 is uid 1000's primary group
+        req["user"] = f"{container_uid()}:4242"
+        cfg = unit_config(req, primary_gid=lambda uid: 4242)          # EXT-66: 4242 is the uid's primary group
         self.assertIn("user", [f for f, _ in problems(req, gids={4242}, config=cfg)])
         self.assertEqual(problems(req, gids={984}, config=cfg), [])
 
     def test_record_gid_refused(self):
         rec = unit_request(self.root)
-        rec["user"] = "1000:4242"
+        rec["user"] = f"{container_uid()}:4242"
         cfg = unit_config(rec, primary_gid=lambda uid: 4242)
         self.assertIn("user", [f for f, _ in problems(rec, gids={4242}, kind="record", config=cfg)])
 

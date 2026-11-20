@@ -535,6 +535,56 @@ Source: the area runtime `<mm-root>/area10-agentic` (README section 0, in partic
   3.13 resolves the rest (`tests/test_paths.py`: 2,000 random paths over a tree of link chains, a loop and `..`; the
   `/proc` cases where the link is not readable).
 
+## Review of the 3.12 path fix (2026-11-19)
+
+A review of the lenient `realpath` change (previous section) reproduced each finding below with a script before the
+fix; the reproductions are now tests (`tests/test_path_review.py`, tests/README.md section 11.34).
+
+- **S1, S2, S5 (`output_ref` resolved by path).** `arm._output_ref_problem` checked that the lenient `realpath` of
+  `<arm>/<path>` lay inside the arm, then hashed and copied by path. Where the lexical resolution exceeds `PATH_MAX`
+  the lenient `realpath` keeps the rest of the path unresolved, so a link chain (`a` and `a/b` each a 2.5 KB relative
+  chain, `b/leak` a link to a host file; S2) or a relative arm under a long cwd (S1) passed the check while the kernel
+  opened the host file, and `ext-collect` copied it into the run. An absent path longer than `PATH_MAX` raised
+  `OSError` (ENAMETOOLONG) out of the check (S5). **Maintainers' decision (2026-11-19): an `output_ref` path contains
+  no symbolic link at all** (hard links are allowed; MULTIMODAL-SPEC MM-1). `arm.open_output_ref` opens the arm
+  directory, then each component under the previous descriptor with `O_NOFOLLOW` (`O_DIRECTORY` for directories,
+  `O_NONBLOCK` for the file, which must be regular by `fstat`) and hashes from that descriptor. Messages: `output_ref
+  path '<p>' contains a symbolic link ('<component>'; MM-1 allows none)`, `output_ref file '<p>' is absent`, `... is
+  not a regular file`, `... cannot be opened (<errno name>)`, `... cannot be opened: the arm directory cannot be
+  (<errno name>)`; `leaves the arm` (absolute or `..`, checked lexically) and `differs from its sha256` are unchanged.
+- **Copy after the check.** `ext-collect` (both copy sites) and `ext-merge-eval` copied `output_ref` files with
+  `shutil.copyfile` by path after the checks, so a file swapped in between was copied. `arm.copy_output_ref` copies
+  from the descriptor of the same walk, hashing while it copies; a link or a different hash is refused (EXT-ARM on the
+  arm's flag, `(changed after it was checked)`), and the partial output is removed as for any refusal.
+- **Arm files under a long path.** `read_meta`, `read_lines` and `provenance_problems` used `Path.is_file()` and
+  `Path.exists()`, which raise ENAMETOOLONG (and EACCES) on Python 3.12; they now report `<file> cannot be read
+  (<errno name>)`.
+- **S3 (link loop on 3.12).** `Path.resolve()` raises `RuntimeError` for a symbolic link loop on Python 3.12. The
+  spec's `file:` URIs and the spec path (`spec.py`), the manifest `root` (`canonical.manifest_document`) and
+  `warmup --out` (`cli.py`) now resolve with `gatedtrain.paths`, so a loop is a refusal; this replaces "paths the user
+  names on the command line keep `Path.resolve()`" of the previous section.
+- **S4 (duplicate arms).** With several clauses, `ext-collect` told arms apart by their resolved path string, which
+  differs for one directory reached by two paths when resolution stops early (a path past `PATH_MAX`). Arms are now
+  keyed by `(st_dev, st_ino)` of the directory; an arm that cannot be inspected is refused.
+- **S6 (EXT-113).** `_in_tree` judged the interpreter's host file by the lenient `realpath`, so a loop, a missing
+  file or an unreadable link below a tree's lexical path counted as inside it. It now uses the strict `realpath`, and
+  a path that does not resolve is in no tree.
+- **C1 (fixtures tied to uid 1000).** The launch fixtures named `user: "1000:1000"`, and EXT-63 requires the output
+  directory, which the tests create, to be owned by the container's uid, so the suite passed only as uid 1000 and CI
+  ran it through `sudo -u '#1000'`. The fixtures now use `_ext.container_user()` (the running uid and its primary
+  group; the golden request and command carry a `<user>` placeholder filled at load time); the tests skip with a
+  reason as root, for a uid without a user database entry, or when that primary group owns a Docker socket.
+  `.github/workflows/test.yml` runs the suite as the runner user.
+- **T1, T2 (`test_paths` oracle).** On 3.12 the random comparison left every path through the loop out, and no case
+  had a regular file in the middle, so a 3.12-style loop (stop and keep the rest), an undetected loop (a hang) and
+  catching only `FileNotFoundError` and `PermissionError` (ENOTDIR) survived. `test_fixed_values` pins values that
+  3.12 and 3.13 both give (`loop1/x`, `loop1/../a`, `a/f/x`, `a/f/..`, ...), and a `SIGALRM` watchdog fails a test
+  that does not end in 30 s. The review's mutants M1a, M1b and M2b are killed on 3.12 and 3.13.
+- **T3.** A loop as an `output_ref` component is a case of `test_path_review` (refused as a symbolic link).
+- **T4.** A loop and an unreadable link (`/proc/1/root`) at the launch record's `output_dir` against `--stage-out`,
+  the SDK's `bound_mounts` and the diffusers family's mount checks give a mismatch or no binding, never a traceback.
+- **T5.** Not addressed in this change.
+
 ## The CPU demo across machines (found by CI, 2026-11-20)
 
 - **The demo's gate depended on the runner's CPU.** The stand-ins train on one thread with deterministic algorithms,

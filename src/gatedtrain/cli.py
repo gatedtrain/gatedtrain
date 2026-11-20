@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import STUB_MARK, __version__
 from .errors import Problem, Refused
+from .paths import resolve
 
 EXIT_OK, EXIT_NOT_PASS, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
 
@@ -50,7 +51,7 @@ def cmd_run(args) -> int:
 def cmd_warmup(args) -> int:
     from .stubs import trainer
 
-    out = Path(args.out).resolve()
+    out = resolve(args.out)
     if out.exists():
         return _refuse([Problem("WARMUP-OUT", "--out", f"{out} already exists; a warm-up never overwrites",
                                 "pass a new --out directory")])

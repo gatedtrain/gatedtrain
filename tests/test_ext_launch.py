@@ -22,7 +22,7 @@ import yaml
 
 from _ext import (ENV_HOST_WORK, ENV_INPUT_ROOTS, ENV_INTERPRETER, ENV_INTERPRETER_TREES, ENV_MIRROR_ROOT, ENV_OUTPUT_ROOT,
                   EXPORT_CONTAINER, EXT, INTERPRETER_TEXT, LABEL, SCRIPT_TEXT,
-                  gpu_step_script, jcs, launch_label, smoke_record, write_bound_spec)
+                  container_user, gpu_step_script, jcs, launch_label, smoke_record, write_bound_spec)
 from _support import EXIT_OK, EXIT_REFUSED, SKEL_ROOT, VENV_PYTHON, cli_env, describe, file_sha256, parse_errors
 
 import subprocess
@@ -131,7 +131,7 @@ def launch(tmp: Path, request: dict | Path, *, profile: str = "smoke", out: Path
     (`host_layout`; `env` overrides it) and `--gpu-log <host_work>/gpu-log.md` (or `gpu_log`). EXT-84: `--spec`
     is `bound_spec` (`spec=True`), the given path, or absent (`spec=False`)."""
     if isinstance(request, Path):
-        request = yaml.safe_load(request.read_text(encoding="utf-8"))
+        request = load_request(request)
     root = root if root is not None else tmp / "host"
     request = rooted(request, root)
     path = tmp / "request.yaml"
@@ -155,8 +155,13 @@ def launch(tmp: Path, request: dict | Path, *, profile: str = "smoke", out: Path
     return subprocess.run(args, cwd=str(tmp), env=e, capture_output=True, text=True, timeout=60), out
 
 
+def load_request(path: Path) -> dict:
+    """A request file with its `<user>` placeholder filled (`_ext.container_user`, EXT-63)."""
+    return yaml.safe_load(path.read_text(encoding="utf-8").replace("<user>", container_user()))
+
+
 def golden_request() -> dict:
-    return yaml.safe_load(GOLDEN_REQUEST.read_text(encoding="utf-8"))
+    return load_request(GOLDEN_REQUEST)
 
 
 class LaunchCase(unittest.TestCase):
@@ -183,7 +188,8 @@ class TestGoldenCommand(LaunchCase):
         proc, out = launch(self.tmp, GOLDEN_REQUEST)
         self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
         label = json.loads(out.read_text(encoding="utf-8"))["label"]
-        self.assertEqual(unrooted(proc.stdout, self.tmp / "host", label), GOLDEN_COMMAND.read_text(encoding="utf-8"))
+        want = GOLDEN_COMMAND.read_text(encoding="utf-8").replace(" --user <user> ", f" --user {container_user()} ")
+        self.assertEqual(unrooted(proc.stdout, self.tmp / "host", label), want)
 
     def test_record_contents(self):
         proc, out = launch(self.tmp, GOLDEN_REQUEST)

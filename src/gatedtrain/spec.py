@@ -20,6 +20,7 @@ from typing import Any
 import yaml
 
 from .errors import Problem, Refused
+from .paths import resolve
 from .registration import (GATE_TO_CLAUSE, check_against_gate, check_amendment, clause_list, is_multi,
                            normalize_clause, read_registration)
 
@@ -115,12 +116,12 @@ def _uri_path(uri: str, spec_dir: Path) -> tuple[Path | None, str | None]:
         uri, hex_ = m.group("loc"), m.group("hex")
     if not uri.startswith("file:"):
         return None, hex_
-    return (spec_dir / uri[len("file:"):]).resolve(), hex_
+    return resolve(spec_dir / uri[len("file:"):]), hex_        # lenient: a link loop never raises (S3)
 
 
 def load_spec(spec_path: Path) -> Workflow:
     """Parse and validate the spec and its registration. Raises Refused with every problem found."""
-    spec_path = Path(spec_path).resolve()
+    spec_path = resolve(spec_path)
     problems: list[Problem] = []
 
     def bad(rule: str, fld: str, msg: str, fix: str) -> None:

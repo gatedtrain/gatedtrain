@@ -1837,3 +1837,29 @@ absolute links and `..` (on 3.12 the paths through the loop are left out, where 
 on); `/proc/1/root`, `/proc/1/root/run`, `//proc/1/root`, `/proc/1/cwd` and a link to `/proc/1/root` are kept as they
 are, without raising (skipped when `/proc/1/root` is readable, as for root). `.github/workflows/test.yml` runs the
 suite on 3.12 and 3.13 for every push and pull request. Suite: 1,310 tests.
+
+### 11.34 Review of the 3.12 path fix (2026-11-19)
+
+Findings S1 to S6, C1 and T1 to T4 of the review of section 11.32 (`docs/findings.md`, "Review of the 3.12 path
+fix"). MM-1 (maintainers' decision 2026-11-19): an `output_ref` path contains no symbolic link (hard links are
+allowed); it is opened component by component from the arm without following links (`arm.open_output_ref`), and
+`ext-collect` and `ext-merge-eval` copy the bytes they hash (`arm.copy_output_ref`; a file changed or swapped after the
+check is refused, EXT-ARM). **Tests.** `tests/test_path_review.py` (18): plain files and hard links accepted; a link
+to a file or directory inside or outside the arm, a dangling link and a loop refused (`contains a symbolic link`); the
+review's S2 chain (`a`, `a/b` relative 2.5 KB chains, `b/leak` to a host file, which the kernel opens) and S1 (a
+relative arm, a path past `PATH_MAX` ending in a link) refused, a regular file past `PATH_MAX` accepted; S5 (absent
+past `PATH_MAX`) absent; below a regular file absent; a directory and a FIFO not a regular file (without blocking); a
+300-byte component `ENAMETOOLONG`; an unreadable file `EACCES` (skipped as root); `read_meta`, `read_lines` and
+`provenance_problems` under an arm path past `PATH_MAX` give `cannot be read (ENAMETOOLONG)`; `copy_output_ref` copies,
+and refuses a file swapped for a link or changed (nothing left at the destination); `ext-merge-eval` in process with
+the swap between check and copy refused, no output; S3: a spec `file:` URI through a link loop and a spec path that is
+a loop refused (on 3.12 `Path.resolve()` raised `RuntimeError`); T4: a loop and `/proc/1/root/x` as the launch record's
+`output_dir` (mismatch with `--stage-out`), in `sdk.bound_mounts` (no binding) and in the diffusers family's
+`mount_binding_problems` (EXT-BASE, EXT-DATA; an unresolvable extra mount is ignored); S6: an interpreter path through
+a loop, missing, or under `/proc/1/root` is in no EXT-113 tree. `test_paths.TestRealpath.test_fixed_values` (T1, T2):
+values 3.12 and 3.13 both give for paths through the loop and below a regular file, and a 30 s `SIGALRM` watchdog per
+test. `test_r18_clauses.CollectTwoClauses.test_same_arm_through_a_link_refused` (S4): one arm passed again through a
+symbolic link is `passed twice`. C1: the launch fixtures run the container as `_ext.container_user()` (the running uid
+and its primary group; `<user>` in `fixtures/ext/launch-request.golden.yaml` and `launch-command.golden.txt`), so the
+suite runs as any non-root user; it skips those tests as root, for a uid without a user database entry, or when the
+primary group owns a Docker socket. Suite: 1,330 tests.

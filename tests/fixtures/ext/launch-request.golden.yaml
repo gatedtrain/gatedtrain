@@ -9,6 +9,8 @@
 # Review round 3 (EXT-63): the output lies under the output root (`/data/gatedtrain-mm/out`), outside host_work; the base
 # model and the export lie under host_work; `test_ext_launch.host_layout` gives ext-launch host_work `/data/gatedtrain-work`,
 # that output root and the input root `/data`.
+# `<user>` is filled at load time with the uid running the tests and its primary group (`_ext.container_user`):
+# EXT-63 requires the output directory, which the tests create, to be owned by the container's uid.
 area: 1
 label: ext-synthetic-smoke
 host_work: /data/gatedtrain-work
@@ -21,7 +23,7 @@ training_seed: 42
 gpus: true
 network: none
 network_reason: null
-user: "1000:1000"
+user: "<user>"
 env:
   DO_NOT_TRACK: "1"
   FLASHINFER_WORKSPACE_BASE: /tmp/cache

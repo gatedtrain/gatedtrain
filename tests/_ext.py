@@ -62,6 +62,36 @@ ENV_HOST_WORK, ENV_OUTPUT_ROOT, ENV_INPUT_ROOTS = ("GATEDTRAIN_EXT_HOST_WORK", "
 ENV_MIRROR_ROOT, ENV_INTERPRETER, ENV_INTERPRETER_TREES = ("GATEDTRAIN_EXT_MIRROR_ROOT", "GATEDTRAIN_EXT_INTERPRETER",
                                                           "GATEDTRAIN_EXT_INTERPRETER_TREES")
 LABEL = "ext-synthetic-full"
+
+
+def container_user() -> str:
+    """The `<uid>:<gid>` a test's launch request or record runs the container as: the uid running the tests and its
+    primary group. EXT-63 requires the run's output directory to be owned by the container's uid, and the tests create
+    that directory, so the fixtures follow the user running them instead of naming uid 1000 (review of the 3.12 path
+    fix, C1). Raises SkipTest where no such user can launch: root (EXT-70 refuses uid 0), a uid without a user
+    database entry, or a primary group that owns a Docker daemon socket (EXT-66, EXT-51)."""
+    import pwd
+    import unittest
+
+    from gatedtrain.ext.launch import docker_socket_gids
+
+    uid = os.getuid()
+    if uid == 0:
+        raise unittest.SkipTest("the tests run as root; a launch never runs a container as uid 0 (EXT-70) and the "
+                                "output directory must be owned by the container's uid (EXT-63): run as a non-root user")
+    try:
+        gid = pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        raise unittest.SkipTest(f"uid {uid} has no user database entry; the container runs as a host user (EXT-66)")
+    if gid in docker_socket_gids():
+        raise unittest.SkipTest(f"the primary group {gid} of uid {uid} owns a Docker daemon socket; no container may "
+                                "run in that group (EXT-51)")
+    return f"{uid}:{gid}"
+
+
+def container_uid() -> int:
+    """The uid of `container_user()`, for requests that pair it with another gid."""
+    return int(container_user().split(":")[0])
 # EXT-83 (review round 4, M3): the training script, mounted read-only at CODE_CONTAINER; its SHA-256 is recorded by
 # ext-launch and written by the training script into `<out>/env-runtime.json` `script_sha256`.
 CODE_CONTAINER = "/inputs/code"
@@ -313,7 +343,7 @@ def build_stage_out(root: Path, *, steps: tuple[int, ...] = (5, 10), max_steps: 
     (root / "README.md").write_text("---\nbase_model: null\nlibrary_name: transformers\n---\n# stage-out (fixture)\n",
                                     encoding="utf-8")
     (root / "env-freeze.txt").write_text(freeze_text(freeze), encoding="utf-8")
-    runtime = {"python": "3.12.16", "uid": 1000}
+    runtime = {"python": "3.12.16", "uid": os.getuid()}
     if script_sha256 is not None:
         runtime["script_sha256"] = script_sha256
     (root / "env-runtime.json").write_text(json.dumps(runtime, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -457,7 +487,7 @@ def launch_record(*, host_work: Path, stage_out: Path, base: Path, train: Path, 
                       {"host": str(code), "container": CODE_CONTAINER, "mode": "ro"},
                       {"host": str(stage_out), "container": "/out", "mode": "rw"}],
            "tmpfs": ["/tmp"], "network": "none", "network_reason": None,
-           "user": "1000:1000", "env_names": ["HF_HOME", "HF_HUB_OFFLINE"], "gpu_est_h": 2.5,
+           "user": container_user(), "env_names": ["HF_HOME", "HF_HUB_OFFLINE"], "gpu_est_h": 2.5,
            "gpu_used_h": 3.12, "output_dir": str(stage_out), "output_root": str(out_root),
            "gpu_step_sha256": file_sha256(script) if script.is_file() else None,
            "allow_network": False, "interpreter_path": INTERPRETER_CONTAINER,

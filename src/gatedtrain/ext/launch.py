@@ -632,8 +632,11 @@ class ArgvBinding:
 
 
 def _in_tree(host: str, trees: tuple[str, ...]) -> bool:
-    """EXT-113: whether the host file's resolved path lies strictly inside one of `trees` (lexical or resolved)."""
-    real = _realpath(host)
+    """EXT-113: whether the host file's resolved path lies strictly inside one of `trees` (lexical or resolved). The
+    path resolves strictly: one that does not resolve on this host (a loop, an unreadable link) is in no tree (S6)."""
+    real = _strict(host)
+    if real is None:
+        return False
     return any(_is_parent(t, real) for tree in trees for t in _variants(tree))
 
 

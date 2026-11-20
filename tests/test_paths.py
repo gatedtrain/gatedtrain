@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import random
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -19,8 +20,21 @@ from pathlib import Path
 from gatedtrain.paths import realpath, resolve
 
 
+WATCHDOG_S = 30                                   # a resolution that never ends (an undetected loop) fails, never hangs
+
+
 class TestRealpath(unittest.TestCase):
     def setUp(self):
+        self.expired = False
+
+        def expired(signum, frame):                # AssertionError: realpath catches OSError (TimeoutError is one)
+            self.expired = True
+            raise AssertionError(f"the test did not end within {WATCHDOG_S} s (a symbolic link loop not detected?)")
+
+        old = signal.signal(signal.SIGALRM, expired)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        signal.alarm(WATCHDOG_S)
+        self.addCleanup(signal.alarm, 0)
         self.tmp = tempfile.mkdtemp(prefix="gatedtrain-paths-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         root = self.tmp
@@ -49,6 +63,8 @@ class TestRealpath(unittest.TestCase):
         3.13 (and `gatedtrain.paths`) resolve the rest."""
         compared = 0
         for case in self.cases():
+            if self.expired:
+                break
             if sys.version_info < (3, 13) and "loop1" in case:
                 continue
             try:
@@ -59,7 +75,26 @@ class TestRealpath(unittest.TestCase):
                 self.assertEqual(realpath(case), want)
                 self.assertEqual(resolve(case), Path(want))
             compared += 1
+        self.assertFalse(self.expired)
         self.assertGreater(compared, 1500)
+
+    def test_fixed_values(self):
+        """Review of the 3.12 path fix (T1, T2): expected values that Python 3.12 and 3.13 both give, so they hold
+        on every supported Python without the standard library as the oracle (the random comparison leaves the loop
+        out on 3.12): a link loop is kept and what follows it resolved, `..` after the loop leaves it; below a
+        regular file (`a/f/x`: ENOTDIR from `lstat`) the rest is kept, and `a/f/..` is `a`. The watchdog of `setUp`
+        turns a resolution that never ends (a loop not detected) into a failure instead of a hang."""
+        t = self.tmp
+        Path(t, "a", "f").write_text("regular file", encoding="utf-8")
+        cases = {f"{t}/loop1/x": f"{t}/loop1/x", f"{t}/loop1": f"{t}/loop1", f"{t}/loop2/x/y": f"{t}/loop2/x/y",
+                 f"{t}/loop1/../a": f"{t}/a", f"{t}/a/f": f"{t}/a/f", f"{t}/a/f/x": f"{t}/a/f/x", f"{t}/a/f/x/y": f"{t}/a/f/x/y",
+                 f"{t}/a/f/..": f"{t}/a", f"{t}/a/f/../sub": f"{t}/a/sub", f"{t}/to_a/f/x": f"{t}/a/f/x"}
+        for case, want in cases.items():
+            if self.expired:
+                break
+            with self.subTest(case=case):
+                self.assertEqual(realpath(case), want)
+                self.assertEqual(os.path.realpath(case), want, "the standard library agrees on this Python")
 
     @unittest.skipIf(os.access("/proc/1/root", os.R_OK) or not os.path.islink("/proc/1/root"),
                      "/proc/1/root is readable here (root) or absent")

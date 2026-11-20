@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from _ext import (ADAPTER, BASE_CONTAINER, CODE_CONTAINER, ENV_HOST_WORK, ENV_INPUT_ROOTS, ENV_INTERPRETER, ENV_INTERPRETER_TREES,
+from _ext import (ADAPTER, BASE_CONTAINER, CODE_CONTAINER, container_uid, container_user, ENV_HOST_WORK, ENV_INPUT_ROOTS, ENV_INTERPRETER, ENV_INTERPRETER_TREES,
                   ENV_MIRROR_ROOT, ENV_OUTPUT_ROOT, EVALUATOR_ID, EXPORT_CONTAINER, SCRIPT_CONTAINER,
                   EXT, INTERPRETER_CONTAINER, SEEDS, ExtScenario, baseline_score, build_arm, build_stage_out, build_train, gpu_step_script, guard_log, launch_label,
                   gsm8k_rows, write_canonical)
@@ -293,7 +293,7 @@ def scenario_request(sc: ExtScenario, out: Path, **overrides) -> dict:
     req = {"area": 1, "label": "ext-synthetic-full", "host_work": str(sc.host_work),
            "runtime": {"kind": "container", "image": "sha256:" + "ab" * 32},
            "framework": {"name": "synthetic-trainer", "version": "1.0.0", "commit": None}, "training_seed": 42, "gpus": True,
-           "network": "none", "network_reason": None, "user": "1000:1000",
+           "network": "none", "network_reason": None, "user": container_user(),
            "env": {"HF_HOME": "/tmp/hf", "HF_HUB_OFFLINE": "1"},
            "mounts": [{"host": str(sc.base), "container": BASE_CONTAINER, "mode": "ro"},
                       {"host": str(sc.export), "container": EXPORT_CONTAINER, "mode": "ro"},
@@ -494,10 +494,11 @@ class TestPrimaryGroup(Launch3):
 
     def test_supplementary_groups_refused(self):
         """Probe p_iso3: /etc with gid 42 (shadow), /var/log with gid 4 (adm): the gid alone is refused now."""
-        for gid in (4, 42, 1001):
+        primary = int(container_user().split(":")[1])
+        for gid in [g for g in (4, 42, 1001, 1002) if g != primary]:
             with self.subTest(gid=gid):
                 req = golden_request()
-                req["user"] = f"1000:{gid}"
+                req["user"] = f"{container_uid()}:{gid}"
                 self.refused_at(req, "EXT-LAUNCH", "--request.user")
 
     def test_unit(self):
