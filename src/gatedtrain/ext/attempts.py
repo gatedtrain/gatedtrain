@@ -1,5 +1,5 @@
-"""Attempt records of a resumable external run and their alignment with the host guard's events
-(EXT-RES-1, EXT-RES-3; tests/README.md section 11.35).
+"""Attempt records of a resumable external run, their alignment with the host guard's events, the segment chain
+and the kept/orphaned split (EXT-RES-1 to EXT-RES-4; tests/README.md section 11.35).
 
 A run's `attempts.jsonl` holds, per attempt A (1, 2, ... in launch order), a `start` line
 `{"event": "start", "attempt": A, "utc": ..., "restore": null | {"cut", "last_step_included",
@@ -17,7 +17,18 @@ attempt (paired with None), allowed only if it ended `PREEMPTED` and is not the 
 Chain rule (design 5.3, 5.3a). Any guard `END rc!=0` for the label refuses. The final attempt is the LAST
 guard attempt: it is `END rc=0` (the label's last terminal event, EXT-53), paired with a run `start` line
 whose `end` line has status "ok". Every other non-empty attempt has no `end` line and its guard attempt ended
-`PREEMPTED` (EXT-RES-3)."""
+`PREEMPTED` (EXT-RES-3).
+
+Segment rule (design 5.2, 05 12.4; linear chains only). Empty attempts are skipped. The first non-empty attempt
+has `restore` null. Attempt k>1 restores the newest committed cut written by attempts 1..k-1 (EXT-RES-2). A cut
+is committed when it is in the `cuts` list ext-collect passes in; its writer is the integer `attempt` of its
+`cut.json` when every committed cut has one. Without writer information the check is weaker: the named cut must
+be committed and no older than the previous attempt's restore (a restore of an older cut is a rollback), and a
+null restore is accepted. The restore's `last_step_included` and `cut_json_sha256` must match the cut and its
+`cut.json` bytes (read without following links). A repaired restore is checked the same way (EXT-RES-7 adds its
+own validity checks). A later attempt with no earlier cut restores nothing and starts at branch step 0. A
+non-final segment ends at the next attempt's branch step; the final one at `max_steps`. A record of attempt A is
+kept iff `branch_step_A < step <= end_step_A` (EXT-RES-4)."""
 
 from __future__ import annotations
 
@@ -247,3 +258,147 @@ def align(records: list[AttemptRecord], guard: list[GuardAttempt]
     if not any(r is not None for _, r in pairs):
         p1("attempts.jsonl", "no run start line", _FIX)
     return pairs, problems
+
+
+@dataclass(frozen=True)
+class Segment:
+    attempt: int
+    attempt_id: str              # f"{run_id}.{attempt}"
+    parent: int | None           # previous non-empty attempt
+    branch_step: int | None      # None for the first attempt; else the restored cut's last_step_included (0: none)
+    end_step: int                # last step this segment keeps
+    restore_cut: str | None
+
+
+def _read_cut(path: Path) -> tuple[str | None, dict | None]:
+    """(sha256 of `<path>/cut.json`, its JSON object or None), or (None, None) when unreadable (no link following)."""
+    try:
+        dfd = armfs.open_arm(path)
+        try:
+            data = armfs.read_file(dfd, "cut.json")
+        finally:
+            os.close(dfd)
+    except armfs.Unreadable:
+        return None, None
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return armfs.sha256(data), None
+    return armfs.sha256(data), doc if isinstance(doc, dict) else None
+
+
+def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts: list[tuple[int, Path]], *,
+                  run_id: str, max_steps: int) -> tuple[list[Segment], list[Problem]]:
+    """The segments of the non-empty attempts in `aligned` (rule in the module docstring) and the EXT-RES-2 problems."""
+    problems: list[Problem] = []
+
+    def p2(attempt: int, msg: str) -> None:
+        problems.append(Problem("EXT-RES-2", f"attempts.jsonl attempt {attempt}", msg,
+                                "restore only the newest committed cut of the earlier attempts; a rollback is not "
+                                "supported (linear chains), start a new launch instead"))
+
+    info: dict[int, tuple[Path, str | None, dict | None]] = {}
+    for step, path in cuts:
+        if step not in info:
+            sha, doc = _read_cut(Path(path))
+            info[step] = (Path(path), sha, doc)
+    writer = {st: i[2].get("attempt") if i[2] else None for st, i in info.items()}
+    use_writer = bool(info) and all(isinstance(w, int) and not isinstance(w, bool) for w in writer.values())
+
+    ne = [r for _, r in aligned if r is not None]
+    segs: list[Segment] = []
+    steps: list[int] = []                 # branch step of each non-empty attempt (0 for the first)
+    for idx, r in enumerate(ne):
+        rs = r.restore
+        if idx == 0:
+            if rs is not None:
+                p2(r.attempt, "the first attempt has a restore")
+            steps.append(0)
+            segs.append(Segment(r.attempt, f"{run_id}.{r.attempt}", None, None, max_steps, None))
+            continue
+        prev_step = steps[-1]
+        if use_writer:
+            earlier = {e.attempt for e in ne[:idx]}
+            cand = [st for st, w in writer.items() if w in earlier]
+            expected = max(cand) if cand else None
+        else:
+            expected = None
+        branch = 0
+        if rs is None:
+            if use_writer and expected is not None:
+                p2(r.attempt, f"the attempt restores no cut although checkpoint-{expected} was committed")
+        else:
+            step = rs.get("last_step_included")
+            name = rs.get("cut")
+            c = info.get(step) if isinstance(step, int) and not isinstance(step, bool) else None
+            if c is None or c[0].name != name:
+                p2(r.attempt, f"the restored cut {name!r} (last_step_included {step!r}) is not a committed cut")
+            else:
+                branch = step
+                doc = c[2] or {}
+                if rs.get("cut_json_sha256") != c[1]:
+                    p2(r.attempt, f"cut_json_sha256 of {name} does not match its cut.json")
+                if "last_step_included" in doc and doc["last_step_included"] != step:
+                    p2(r.attempt, f"last_step_included {step} of {name} does not match its cut.json")
+                if use_writer and step != expected:
+                    p2(r.attempt, f"{name} is not the newest committed cut of the earlier attempts "
+                                  f"(checkpoint-{expected})")
+                elif not use_writer and step < prev_step:
+                    p2(r.attempt, f"{name} is older than the previous attempt's restore (checkpoint-{prev_step})")
+        steps.append(branch)
+        prev = segs[-1]
+        segs[-1] = Segment(prev.attempt, prev.attempt_id, prev.parent, prev.branch_step, branch, prev.restore_cut)
+        segs.append(Segment(r.attempt, f"{run_id}.{r.attempt}", prev.attempt, branch, max_steps,
+                            rs.get("cut") if rs else None))
+    return segs, problems
+
+
+def split_steps(chain: list[Segment], records: list[dict]) -> tuple[list[dict], list[dict], list[Problem]]:
+    """(kept, orphaned, problems) (EXT-RES-4). A record of attempt A is kept iff `branch_step_A < step <= end_step_A`
+    (branch 0 for the first attempt), else orphaned. Every step 1..max_steps (the last segment's end) must have
+    kept records from exactly one attempt; a record of an attempt outside the chain refuses."""
+    problems: list[Problem] = []
+    fix = "collect a run whose kept records cover every step exactly once"
+    seg = {s.attempt: s for s in chain}
+    kept: list[dict] = []
+    orphaned: list[dict] = []
+    owners: dict[int, set[int]] = {}
+    unknown: set = set()
+    for r in records:
+        s = seg.get(r["attempt"])
+        if s is None:
+            unknown.add(r["attempt"])
+            continue
+        if (s.branch_step or 0) < r["step"] <= s.end_step:
+            kept.append(r)
+            owners.setdefault(r["step"], set()).add(s.attempt)
+        else:
+            orphaned.append(r)
+    for a in sorted(unknown, key=str):
+        problems.append(Problem("EXT-RES-4", "records", f"records of attempt {a!r}, which is not in the segment chain",
+                                fix))
+    if not chain:
+        problems.append(Problem("EXT-RES-4", "records", "the segment chain is empty", fix))
+        return kept, orphaned, problems
+    max_steps = chain[-1].end_step
+    gaps = [n for n in range(1, max_steps + 1) if n not in owners]
+    over = sorted(n for n, o in owners.items() if len(o) > 1)
+    if gaps:
+        problems.append(Problem("EXT-RES-4", "records", f"no kept record at steps {_ranges(gaps)} of 1..{max_steps}",
+                                fix))
+    if over:
+        problems.append(Problem("EXT-RES-4", "records", f"kept records of more than one attempt at steps "
+                                                        f"{_ranges(over)}", fix))
+    return kept, orphaned, problems
+
+
+def _ranges(steps: list[int]) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(steps):
+        j = i
+        while j + 1 < len(steps) and steps[j + 1] == steps[j] + 1:
+            j += 1
+        out.append(str(steps[i]) if i == j else f"{steps[i]}-{steps[j]}")
+        i = j + 1
+    return ", ".join(out)

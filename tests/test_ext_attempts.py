@@ -9,7 +9,8 @@ import unittest
 from pathlib import Path
 
 from gatedtrain.errors import Problem, Refused
-from gatedtrain.ext.attempts import AttemptRecord, GuardAttempt, align, guard_attempts, read_attempts
+from gatedtrain.ext.attempts import (AttemptRecord, GuardAttempt, Segment, align, guard_attempts, read_attempts,
+                                     segment_chain, split_steps)
 
 LABEL = "run-a"
 
@@ -278,3 +279,155 @@ class FixRoundTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def rec(a, restore_=None, end_status=None, repaired=False):
+    return AttemptRecord(a, "2026-11-20T10:00:00Z", restore_, end_status, repaired)
+
+
+def pairs_of(*recs):
+    """Aligned pairs with a dummy guard attempt (None records are empty attempts)."""
+    return [(GuardAttempt(i + 1, "2026-11-20T10:00:00Z", "preempted", 143), r) for i, r in enumerate(recs)]
+
+
+class ChainTests(Base):
+    def make_cut(self, step, attempt=None, extra=None):
+        d = self.dir / "cuts" / f"checkpoint-{step}"
+        d.mkdir(parents=True, exist_ok=True)
+        doc = {"files": {}, "last_step_included": step}
+        if attempt is not None:
+            doc["attempt"] = attempt
+        doc.update(extra or {})
+        data = json.dumps(doc).encode()
+        (d / "cut.json").write_bytes(data)
+        return step, d, "sha256:" + __import__("hashlib").sha256(data).hexdigest()
+
+    def rs(self, cut, step=None, repaired=False):
+        s, d, sha = cut
+        return {"cut": d.name, "last_step_included": step if step is not None else s, "cut_json_sha256": sha,
+                "repaired": repaired}
+
+    def chain(self, recs, cuts, max_steps=30):
+        return segment_chain(pairs_of(*recs), [(s, d) for s, d, _ in cuts], run_id="r", max_steps=max_steps)
+
+    def test_single_segment(self):
+        segs, probs = self.chain([rec(1, None, "ok")], [])
+        self.assertEqual(probs, [])
+        self.assertEqual(segs, [Segment(1, "r.1", None, None, 30, None)])
+
+    def test_two_attempts_restore_newest_cut(self):
+        c10, c20 = self.make_cut(10, 1), self.make_cut(20, 1)
+        segs, probs = self.chain([rec(1), rec(2, self.rs(c20), "ok")], [c10, c20])
+        self.assertEqual(probs, [])
+        self.assertEqual(segs, [Segment(1, "r.1", None, None, 20, None), Segment(2, "r.2", 1, 20, 30, "checkpoint-20")])
+
+    def test_restore_of_older_cut_refuses(self):
+        c10, c20 = self.make_cut(10, 1), self.make_cut(20, 1)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10, c20])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_restore_of_older_cut_refuses_without_writer_info(self):
+        c10, c20, c30 = self.make_cut(10), self.make_cut(20), self.make_cut(30)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c20)), rec(3, self.rs(c10), "ok")], [c10, c20, c30])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_restore_of_uncommitted_cut_refuses(self):
+        c10 = self.make_cut(10, 1)
+        ghost = (20, self.dir / "cuts" / "checkpoint-20", "sha256:" + "1" * 64)
+        _, probs = self.chain([rec(1), rec(2, self.rs(ghost), "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_restore_sha_mismatch_refuses(self):
+        c10 = self.make_cut(10, 1)
+        bad = dict(self.rs(c10), cut_json_sha256="sha256:" + "2" * 64)
+        _, probs = self.chain([rec(1), rec(2, bad, "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_restore_last_step_mismatch_refuses(self):
+        c10 = self.make_cut(10, 1)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10, step=9), "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_first_attempt_with_restore_refuses(self):
+        c10 = self.make_cut(10, 1)
+        _, probs = self.chain([rec(1, self.rs(c10), "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_empty_attempt_is_skipped(self):
+        c10 = self.make_cut(10, 1)
+        segs, probs = self.chain([rec(1), None, rec(2, self.rs(c10), "ok")], [c10])
+        self.assertEqual(probs, [])
+        self.assertEqual([(s.attempt, s.parent, s.branch_step) for s in segs], [(1, None, None), (2, 1, 10)])
+
+    def test_later_attempt_without_prior_cut_restarts_from_scratch(self):
+        segs, probs = self.chain([rec(1), rec(2, None, "ok")], [])
+        self.assertEqual(probs, [])
+        self.assertEqual((segs[0].end_step, segs[1].branch_step), (0, 0))
+
+    def test_later_attempt_without_restore_despite_cut_refuses(self):
+        c10 = self.make_cut(10, 1)
+        _, probs = self.chain([rec(1), rec(2, None, "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_three_attempts_chain(self):
+        c10, c20 = self.make_cut(10, 1), self.make_cut(20, 2)
+        segs, probs = self.chain([rec(1), rec(2, self.rs(c10)), rec(3, self.rs(c20), "ok")], [c10, c20])
+        self.assertEqual(probs, [])
+        self.assertEqual([(s.attempt, s.parent, s.branch_step, s.end_step) for s in segs],
+                         [(1, None, None, 10), (2, 1, 10, 20), (3, 2, 20, 30)])
+
+    def test_restore_missing_newest_cut_of_attempt_one_refuses(self):
+        c10, c20, c30 = self.make_cut(10, 1), self.make_cut(20, 1), self.make_cut(30, 2)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10)), rec(3, self.rs(c30), "ok")], [c10, c20, c30])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_repaired_restore_accepted_when_committed(self):
+        c10 = self.make_cut(10, 1)
+        segs, probs = self.chain([rec(1), rec(2, self.rs(c10, repaired=True), "ok", True)], [c10])
+        self.assertEqual(probs, [])
+        self.assertEqual(segs[1].restore_cut, "checkpoint-10")
+
+    def test_repaired_restore_of_uncommitted_cut_refuses(self):
+        ghost = (10, self.dir / "cuts" / "checkpoint-10", "sha256:" + "1" * 64)
+        _, probs = self.chain([rec(1), rec(2, self.rs(ghost, repaired=True), "ok", True)], [])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+
+class SplitTests(unittest.TestCase):
+    CHAIN = [Segment(1, "r.1", None, None, 10, None), Segment(2, "r.2", 1, 10, 20, "checkpoint-10")]
+
+    @staticmethod
+    def rows(attempt, steps):
+        return [{"attempt": attempt, "step": s} for s in steps]
+
+    def test_orphaned_records_after_last_cut(self):
+        records = self.rows(1, range(1, 14)) + self.rows(2, range(11, 21))
+        kept, orphaned, probs = split_steps(self.CHAIN, records)
+        self.assertEqual(probs, [])
+        self.assertEqual(sorted((r["attempt"], r["step"]) for r in orphaned), [(1, 11), (1, 12), (1, 13)])
+        self.assertEqual(sorted(r["step"] for r in kept), list(range(1, 21)))
+
+    def test_multiple_records_per_step_from_one_attempt_are_fine(self):
+        records = self.rows(1, [1, 1, 2]) + self.rows(2, [3, 3])
+        chain = [Segment(1, "r.1", None, None, 2, None), Segment(2, "r.2", 1, 2, 3, "checkpoint-2")]
+        kept, orphaned, probs = split_steps(chain, records)
+        self.assertEqual((probs, len(kept), orphaned), ([], 5, []))
+
+    def test_gap_refuses(self):
+        records = self.rows(1, range(1, 11)) + self.rows(2, range(12, 21))
+        _, _, probs = split_steps(self.CHAIN, records)
+        self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"])
+
+    def test_missing_tail_refuses(self):
+        _, _, probs = split_steps(self.CHAIN, self.rows(1, range(1, 11)) + self.rows(2, range(11, 20)))
+        self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"])
+
+    def test_overlap_refuses(self):
+        # A malformed chain whose kept ranges overlap: both attempts keep step 10.
+        chain = [Segment(1, "r.1", None, None, 10, None), Segment(2, "r.2", 1, 9, 20, "checkpoint-9")]
+        _, _, probs = split_steps(chain, self.rows(1, range(1, 11)) + self.rows(2, range(10, 21)))
+        self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"])
+
+    def test_unknown_attempt_refuses(self):
+        _, _, probs = split_steps(self.CHAIN, self.rows(1, range(1, 11)) + self.rows(2, range(11, 21)) + self.rows(7, [3]))
+        self.assertEqual(sorted({p.rule for p in probs}), ["EXT-RES-4"])
