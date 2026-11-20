@@ -441,6 +441,29 @@ class TestFromNelReadsOnce(ScenarioCase):
                 self.assertIn("cannot read", str(cm.exception))
                 self.assertIn("full_config.yaml: ValueError", str(cm.exception))
 
+    def test_checks_and_conversion_use_the_bytes_read(self):
+        """Round 3: once `_read_run_files` has read a run, nothing reads its config or results again by path: both
+        files are removed right after the read, and the conversion still succeeds with the same output as an
+        undisturbed one (a parse of full_config.yaml or a read of results.jsonl by path would fail)."""
+        from gatedtrain.ext import from_nel
+
+        plain = self.convert(self.runs("plain"))
+        runs = self.runs("gone")
+        real = from_nel._read_run_files
+
+        def read_then_remove(run, benchmark):
+            data, why = real(run, benchmark)
+            (Path(run) / "full_config.yaml").unlink()
+            for results in Path(run).glob("*/results.jsonl"):
+                results.unlink()
+            return data, why
+
+        with mock.patch.object(from_nel, "_read_run_files", read_then_remove):
+            out = self.convert(runs)
+        self.assertEqual((out / "items.jsonl").read_bytes(), (plain / "items.jsonl").read_bytes())
+        self.assertEqual(json.loads((out / "eval_meta.json").read_text(encoding="utf-8"))["eval_seeds"],
+                         json.loads((plain / "eval_meta.json").read_text(encoding="utf-8"))["eval_seeds"])
+
     def test_config_swapped_after_the_checks_is_not_recorded(self):
         from gatedtrain.ext import from_nel
 
