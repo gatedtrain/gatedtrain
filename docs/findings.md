@@ -663,3 +663,11 @@ Round 2 of the review (ids prefixed `R2-`). Each was reproduced first and is now
 - **MM-5.** The sources root is where sources may be read from, not evidence that they are authentic.
 - Not in this change (a follow-up): stage outputs read by path (`manifest_entries`, `sdk.read_json`, `read_jsonl`,
   `families/flow_grpo`), `tierb-collect`'s copies, per-file-type size caps, output hash caching and a total cap.
+
+## Review of PR 2, round 3
+
+- **R3-1 An empty or `null` NeMo Evaluator config was read again by path.** `yaml.safe_load` gives None for an empty
+  file, `null` or `~`, which `tierb._run_seed_and_repeats` and `_run_sampler` take as "no config given" and read
+  `full_config.yaml` again by path, following a link or blocking on a FIFO the container swapped in after the armfs
+  read. `ext-from-nel` now refuses a config that is not a mapping before calling them
+  (`tests/test_arm_reads.py`, `test_null_config_refused_without_a_second_read`).
