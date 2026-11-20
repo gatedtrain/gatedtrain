@@ -16,7 +16,7 @@ from gatedtrain.ainative.pipeline import load_pipeline, pipeline_problems
 from gatedtrain.ainative.project import Project, create_project
 from gatedtrain.ainative.stage import TRUST_STAGES, Proposal, stage_registry
 from gatedtrain.ainative.trust import InProcessTrust, SealedRef
-from gatedtrain.ainative import scorers
+from gatedtrain.ainative import scorers, trust_stages
 from gatedtrain.ainative.trust_stages import SCHEMA_DEPLOYMENT, IntakeSeal, Preregister
 from gatedtrain.errors import Refused
 from gatedtrain.registration import check_contents, resolved_evaluator_hash
@@ -48,6 +48,19 @@ DEPLOY = {"schema": SCHEMA_DEPLOYMENT, "schema_version": 1,
           "sampler": {"name": "registered-sampler", "temperature": 0.9, "max_new_tokens": 32}, "eval_seeds": [11, 12]}
 
 
+INTAKE_GENERATOR = "intake-generator"
+
+
+class _IntakeScenario:
+    """A test-only `gatedtrain.scenarios` entry point serving the base model's generator (the loader is patched)."""
+    name = "intake"
+    value = "test:intake"
+    generators = {INTAKE_GENERATOR: lambda model_ref, item, *, sampler, seed: None}
+
+    def load(self):
+        return self
+
+
 class ChooseDeployment:
     """Stands in for the pluggable stage (choose_task_and_base) that produces the deployment record."""
     name = "choose_x"
@@ -63,7 +76,7 @@ class ChooseDeployment:
         return Proposal(self.name, "choose", {}, {})
 
     def run(self, ctx, decision):
-        base = {"schema": SCHEMA_MODEL, "schema_version": 1, "label": "base"}
+        base = {"schema": SCHEMA_MODEL, "schema_version": 1, "label": "base", "generator": INTAKE_GENERATOR}
         return {"deployment": ctx.project.write_artifact(self.name, "deployment", self.record, SCHEMA_DEPLOYMENT),
                 "base": ctx.project.write_artifact(self.name, "base", base, SCHEMA_MODEL)}
 
@@ -97,6 +110,11 @@ class Base(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+        real = trust_stages._scenario_entry_points
+        trust_stages._scenario_entry_points = lambda: [_IntakeScenario()]
+        self.addCleanup(setattr, trust_stages, "_scenario_entry_points", real)
+        trust_stages._reset_scenario_snapshot()
+        self.addCleanup(trust_stages._reset_scenario_snapshot)
 
     def make(self, data: bytes, *, name: str = "proj") -> Project:
         d = self.tmp / f"{name}.jsonl"
@@ -448,6 +466,28 @@ class PreregisterTest(Base):
             with self.assertRaises(Refused):
                 run_stage(proj, "preregister", {"metric_confirmed": True}, registry=reg)
             self.assertFalse((proj.root / "trust" / "registrations").exists())
+
+    def test_a_base_model_without_a_generator_is_refused_before_training(self) -> None:
+        """Final review I5: evaluate_sealed needs the generator; refusing it there would come after training."""
+
+        class NoGenerator(ChooseDeployment):
+            def run(self, ctx, decision):
+                out = super().run(ctx, decision)
+                base = {"schema": SCHEMA_MODEL, "schema_version": 1, "label": "base"}
+                out["base"] = ctx.project.write_artifact(self.name, "base", base, SCHEMA_MODEL)
+                return out
+
+        proj = self.make(jsonl(rows(N_DATA)))
+        reg = {**self.registry(), "choose_x": NoGenerator}
+        for stage in ("intake_seal", "choose_x"):
+            run_stage(proj, stage, {}, registry=reg)
+        with self.assertRaises(Refused) as cm:
+            run_stage(proj, "preregister", {"metric_confirmed": True}, registry=reg)
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field), ("AN-7", "inputs.base_model.generator"))
+        self.assertIn("generator", p.fix)
+        self.assertFalse((proj.root / "trust" / "registrations").exists())
+        self.assertEqual(proj.read_attempts()[-1]["event"], "refused")
 
     def test_deployment_input_is_required(self) -> None:
         self.assertEqual(Preregister.inputs, {"sealed_summary": "gatedtrain.ainative.sealed_summary",

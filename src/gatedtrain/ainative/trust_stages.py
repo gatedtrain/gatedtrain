@@ -431,15 +431,19 @@ class Preregister:
         v = _values(ctx, decision)
         item_hash = _sealed_summary(ctx)["manifest_sha256"]
         base_ref = ctx.project.read_artifact(ctx.inputs["base_model"])
-        served = None
         gen = base_ref.get("generator") if isinstance(base_ref, dict) else None
-        if gen is not None:
-            pack = scenario_pack_of(gen)
-            if pack is None:
-                raise _refuse7("inputs.base_model.generator", f"no installed scenario pack serves the generator {gen!r}",
-                               "install the scenario pack that serves the base model, or fix the model reference")
-            served = (pack, gen)
-        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, served)
+        if not isinstance(gen, str) or not gen:
+            # evaluate_sealed resolves both arms through the registered generator; refusing only there would come
+            # after training, so a base model reference without one is refused here, before anything trains.
+            raise _refuse7("inputs.base_model.generator", "the base model reference names no `generator`, so the "
+                           "sealed evaluation could not run the models",
+                           "have the stage that produces the base model write a model reference whose `generator` "
+                           "an installed scenario pack serves")
+        pack = scenario_pack_of(gen)
+        if pack is None:
+            raise _refuse7("inputs.base_model.generator", f"no installed scenario pack serves the generator {gen!r}",
+                           "install the scenario pack that serves the base model, or fix the model reference")
+        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, (pack, gen))
         problems = check_contents(base)
         if problems:
             raise Refused(problems)
