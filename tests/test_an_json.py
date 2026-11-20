@@ -39,6 +39,7 @@ MINIMAL_ARGS = {
     "ext-from-nel": ["--registration", "r.yaml", "--adapter", "a", "--evaluator", "e", "--items", "i",
                      "--checkpoint", "c", "--out", "o", "run1"],
     "ext-arm-fill": ["--adapter", "a", "--checkpoint", "c", "--items", "i", "arm"],
+    "project": ["status", "root"],
 }
 
 
@@ -148,6 +149,81 @@ class TestJson(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             runner._log("after")                       # the flag is reset once main returns
         self.assertEqual(err.getvalue(), "[gatedtrain] after\n")
+
+    def test_json_not_pass_is_ok_false_with_exit_1(self):
+        """A gate that did not pass: `ok` false, exit 1 (EXIT_NOT_PASS), still one object and an empty stderr."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        from gatedtrain import cli
+
+        for status in ("FAIL", "INCONCLUSIVE"):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch("gatedtrain.runner.run", lambda spec, runs_root: (self.tmp / "r1", {"status": status}, "t\n")), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(["--json", "run", "spec.yaml"])
+            self.assertEqual(code, 1, status)
+            self.assertEqual(err.getvalue(), "")
+            doc = json.loads(out.getvalue())
+            self.assertEqual((doc["ok"], doc["exit"], doc["data"]["report"]["status"]), (False, 1, status))
+
+    def test_argparse_errors_are_wrapped_under_json(self):
+        for argv, command in ((["--json", "project", "run", "root"], "project"),            # missing positional
+                              (["--json", "no-such-command"], "no-such-command"),
+                              (["--json", "validate"], "validate"),
+                              (["--json", "run", "spec.yaml", "--bogus"], "run")):
+            proc = run_cli(argv, cwd=self.tmp)
+            self.assertEqual(proc.returncode, 2, describe(proc))
+            self.assertEqual(proc.stderr, "", describe(proc))
+            self.assertEqual(proc.stdout.count("\n"), 1, describe(proc))
+            doc = json.loads(proc.stdout)
+            self.assertEqual((doc["schema"], doc["command"], doc["ok"], doc["exit"]),
+                             ("gatedtrain.cli_result", command, False, 2), argv)
+            self.assertEqual(doc["problems"][0]["rule"], "USAGE")
+            self.assertNotIn("Traceback", proc.stdout)
+
+    def test_argparse_errors_without_json_are_unchanged(self):
+        proc = run_cli(["validate"], cwd=self.tmp)
+        self.assertEqual((proc.returncode, proc.stdout), (2, ""))
+        self.assertIn("usage:", proc.stderr)
+
+    def test_json_before_the_subcommand_only(self):
+        """The legacy `impact ... --json` flag is not the envelope switch: a usage error stays argparse text."""
+        proc = run_cli(["impact", "--json"], cwd=self.tmp)
+        self.assertEqual(proc.returncode, 2, describe(proc))
+        self.assertIn("usage:", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_an_uncaught_exception_is_wrapped_under_json(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        from gatedtrain import cli
+
+        out, err = io.StringIO(), io.StringIO()
+        boom = RuntimeError("secret /private/path token=abc")
+        with mock.patch("gatedtrain.cli.cmd_validate", side_effect=boom), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = cli.main(["--json", "validate", "spec.yaml"])
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue(), "")
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["command"], doc["ok"], doc["exit"]), ("validate", False, 1))
+        self.assertEqual(doc["problems"][0]["rule"], "INTERNAL")
+        self.assertIn("RuntimeError", doc["problems"][0]["message"])
+        for leak in ("secret", "/private/path", "token=abc", "Traceback"):
+            self.assertNotIn(leak, out.getvalue())
+
+    def test_an_uncaught_exception_without_json_still_propagates(self):
+        from unittest import mock
+
+        from gatedtrain import cli
+
+        with mock.patch("gatedtrain.cli.cmd_validate", side_effect=RuntimeError("bug")), \
+                self.assertRaises(RuntimeError):
+            cli.main(["validate", "spec.yaml"])
 
     def test_emit_and_result_json(self):
         r = Result("x", False, 3, {"a": 1}, [Problem("R", "f", "m", "x")], ["w"])

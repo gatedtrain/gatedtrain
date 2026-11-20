@@ -3,6 +3,9 @@
 Exit codes: 0 success (for `run`, the gate passed); 1 `run` completed but the
 gate is FAIL, INCONCLUSIVE or MISSING; 2 usage error; 3 refused (spec or
 registration error, hash mismatch, existing `--out`, unknown impact target).
+Under the top-level `--json` an argparse usage error is the envelope with exit 2 (rule `USAGE`) and an uncaught
+exception is the envelope with exit 1 (rule `INTERNAL`, the exception class only; no traceback), the code the text
+mode gives for a traceback. Without `--json` both behave as argparse and Python always did.
 """
 
 from __future__ import annotations
@@ -267,8 +270,206 @@ def cmd_ext_arm_fill(args) -> int:
     return _tierb_call(args, go)
 
 
+# AN-11: `gatedtrain project ...`, thin wrappers over `ainative.machine` and `ainative.project`.
+
+_GATE_STAGE = "gate"
+
+
+def _project_command(args) -> str:
+    return f"project {args.project_cmd}"
+
+
+def _pfinish(args, data: dict, human: str = "", *, ok: bool = True, exit_code: int = EXIT_OK) -> int:
+    return emit(Result(_project_command(args), ok, exit_code, data, [], []), as_json=_as_json(args), human=human)
+
+
+def _prefuse(args, problems: list[Problem]) -> int:
+    return emit(Result(_project_command(args), False, EXIT_REFUSED, {}, list(problems), []),
+                as_json=_as_json(args), human="")
+
+
+def _ref_data(refs: dict) -> dict:
+    return {name: {"schema": r.schema, "sha256": r.sha256, "path": r.path} for name, r in sorted(refs.items())}
+
+
+def _load_decision(path: str | None) -> dict:
+    if path is None:
+        return {}
+    try:
+        doc = json.loads(Path(path).read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise Refused([Problem("AN-11", "--decision", f"cannot read the decision file ({type(exc).__name__})",
+                               "pass a JSON file holding one object")]) from None
+    if not isinstance(doc, dict):
+        raise Refused([Problem("AN-11", "--decision", "the decision file must hold one JSON object",
+                               "pass a JSON file holding one object, e.g. {\"metric_confirmed\": true}")])
+    return doc
+
+
+def _done_output(project, stage: str, name: str):
+    """The record of a `done` stage's output, or None when the stage is not done (or is stale)."""
+    from .ainative.machine import _load_spec, _recorded_outputs, _states
+    from .ainative.stage import stage_registry
+
+    state = _states(project, _load_spec(project), stage_registry()).get(stage)
+    if state is None or state["status"] != "done":
+        return None
+    return project.read_artifact(_recorded_outputs(project, state)[name])
+
+
+def cmd_project_create(args) -> int:
+    from .ainative.pipeline import load_pipeline
+    from .ainative.project import create_project
+
+    pipeline = Path(args.pipeline).absolute()
+    try:
+        load_pipeline(pipeline)                                  # syntax only; stage types are checked on `plan`/`run`
+        project = create_project(Path(args.root).absolute(), goal=args.goal, data=Path(args.data).absolute(),
+                                 pipeline=str(pipeline), budget={"gpu_hours": args.gpu_hours, "llm_usd": 0})
+    except Refused as exc:
+        return _prefuse(args, exc.problems)
+    return _pfinish(args, {"root": str(project.root), "pipeline": project.pipeline, "budget": project.budget},
+                    f"project: {project.root}\n")
+
+
+def cmd_project_plan(args) -> int:
+    from .ainative.machine import plan_stage
+    from .ainative.project import Project
+
+    try:
+        proposal = plan_stage(Project.load(Path(args.root)), args.stage)
+    except Refused as exc:
+        return _prefuse(args, exc.problems)
+    data = {"stage": proposal.stage, "summary": proposal.summary, "choices": proposal.choices,
+            "estimate": proposal.estimate, "needs_user": proposal.needs_user}
+    human = f"{proposal.stage}: {proposal.summary}\n" + (f"needs_user: {proposal.needs_user}\n" if proposal.needs_user else "")
+    return _pfinish(args, data, human)
+
+
+def cmd_project_run(args) -> int:
+    from .ainative.machine import run_stage
+    from .ainative.project import Project
+
+    try:
+        project = Project.load(Path(args.root))
+        result = run_stage(project, args.stage, _load_decision(args.decision))
+        data = {"stage": result.stage, "key": result.key, "attempt": result.attempt, "reused": result.reused,
+                "outputs": _ref_data(result.outputs)}
+        status = None
+        if result.stage == _GATE_STAGE and "gate_result" in result.outputs:
+            status = project.read_artifact(result.outputs["gate_result"]).get("status")
+            data["status"] = status
+    except Refused as exc:
+        return _prefuse(args, exc.problems)
+    human = f"{result.stage}: {'reused' if result.reused else 'done'}\n" + (f"gate: {status}\n" if status else "")
+    if result.stage == _GATE_STAGE:                              # `run` of the gate: EXIT_OK on PASS only
+        ok = status == "PASS"
+        return _pfinish(args, data, human, ok=ok, exit_code=EXIT_OK if ok else EXIT_NOT_PASS)
+    return _pfinish(args, data, human)
+
+
+def cmd_project_status(args) -> int:
+    from .ainative.machine import status
+    from .ainative.project import Project
+
+    try:
+        project = Project.load(Path(args.root))
+        stages = status(project)
+        gate = _done_output(project, _GATE_STAGE, "gate_result")
+    except Refused as exc:
+        return _prefuse(args, exc.problems)
+    gate_status = gate.get("status") if isinstance(gate, dict) else None
+    data = {"goal": project.goal, "stages": {n: {"status": s["status"],
+                                                 "last_event": (s["last_attempt"] or {}).get("event")}
+                                             for n, s in stages.items()},
+            "gate": gate_status, "passed": gate_status == "PASS"}
+    lines = [f"{n}: {s['status']}\n" for n, s in data["stages"].items()]
+    lines.append(f"gate: {gate_status or 'not run'}\n")
+    return _pfinish(args, data, "".join(lines))
+
+
+def cmd_project_report(args) -> int:
+    from .ainative.project import Project
+
+    try:
+        project = Project.load(Path(args.root))
+        report = _done_output(project, "report", "report")
+    except Refused as exc:
+        return _prefuse(args, exc.problems)
+    if report is None:
+        return _prefuse(args, [Problem("AN-11", "report", "there is no report: the report stage is not done, so the "
+                                       "project has no gate result to report (it did not pass)",
+                                       "run the stages in order up to `report`; `project status` shows where it stopped")])
+    ok = report.get("status") == "PASS"
+    md = project.root / "stages" / "report" / "report.md"
+    human = md.read_text(encoding="utf-8") if md.is_file() else f"status: {report.get('status')}\n"
+    return _pfinish(args, {"report": report, "report_md": str(md)}, human, ok=ok,
+                    exit_code=EXIT_OK if ok else EXIT_NOT_PASS)
+
+
+def _add_project(sub) -> None:
+    p = sub.add_parser("project", help="AI-native project (step 1 preview): create, plan, run, status, report")
+    ps = p.add_subparsers(dest="project_cmd", required=True)
+
+    c = ps.add_parser("create", help="create a project directory for one goal")
+    c.add_argument("root", help="a new or empty directory")
+    c.add_argument("--goal", required=True, help="what the project is for, in words")
+    c.add_argument("--data", required=True, help="the labelled data (a file or directory); its hash is recorded")
+    c.add_argument("--pipeline", required=True, metavar="NAME",
+                   help="the pipeline spec: the path of a pipeline YAML (the loader resolves a path, not a registry "
+                        "name); stored as an absolute path")
+    c.add_argument("--gpu-hours", type=float, default=0.0, metavar="H",
+                   help="the GPU-hour budget; step 1 only records it in project.yaml and does not enforce it")
+    c.set_defaults(func=cmd_project_create)
+
+    c = ps.add_parser("plan", help="show what a stage would do, without running it")
+    c.add_argument("root")
+    c.add_argument("stage", help="a stage name of the pipeline")
+    c.set_defaults(func=cmd_project_plan)
+
+    c = ps.add_parser("run", help="run one stage; `gate` exits 0 on PASS and 1 otherwise")
+    c.add_argument("root")
+    c.add_argument("stage", help="a stage name of the pipeline")
+    c.add_argument("--decision", metavar="FILE", help="a JSON object with the decision for this stage")
+    c.set_defaults(func=cmd_project_run)
+
+    c = ps.add_parser("status", help="the status of every stage and the gate result, if any")
+    c.add_argument("root")
+    c.set_defaults(func=cmd_project_status)
+
+    c = ps.add_parser("report", help="print the report; refused when the report stage is not done")
+    c.add_argument("root")
+    c.set_defaults(func=cmd_project_report)
+
+
+class _UsageError(Exception):
+    pass
+
+
+class _Parser(argparse.ArgumentParser):
+    """Under the top-level `--json`, a usage error is raised (and wrapped by `main`) instead of printed and exited."""
+
+    json_errors = False
+
+    def error(self, message: str):
+        if _Parser.json_errors:
+            raise _UsageError(message)
+        super().error(message)
+
+
+def _json_requested(argv: list[str]) -> tuple[bool, str]:
+    """(top-level `--json` given, the subcommand token): only options before the first positional count."""
+    as_json = False
+    for tok in argv:
+        if tok == "--json":
+            as_json = True
+        elif not tok.startswith("-"):
+            return as_json, tok
+    return as_json, "gatedtrain"
+
+
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="gatedtrain", description=f"walking-skeleton prototype {__version__} "
+    ap = _Parser(prog="gatedtrain", description=f"walking-skeleton prototype {__version__} "
                                  f"(prototype, unpromotable; Tier A stand-ins are {STUB_MARK})")
     ap.add_argument("--version", action="version", version=f"gatedtrain {__version__}")
     ap.add_argument("--json", action="store_true",
@@ -398,16 +599,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", help="the plain base directory a LoRA cut was trained on (EXT-126, MM-18)")
     p.add_argument("arm", help="the arm directory (items.jsonl, eval_meta.json); eval_meta.json is rewritten")
     p.set_defaults(func=cmd_ext_arm_fill)
+
+    _add_project(sub)
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     from . import runner
 
-    args = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    as_json, first = _json_requested(argv)
+    _Parser.json_errors = as_json
+    try:
+        args = build_parser().parse_args(argv)
+    except _UsageError as exc:                           # AN-1: a usage error is the envelope too (exit 2)
+        problem = Problem("USAGE", "argv", str(exc), "see `gatedtrain --help`")
+        return emit(Result(first, False, EXIT_USAGE, {}, [problem], []), as_json=True, human="")
+    finally:
+        _Parser.json_errors = False
     runner.QUIET = _as_json(args)                        # AN-1: no progress lines on stderr under --json
     try:
         return args.func(args)
+    except Exception as exc:
+        if not _as_json(args):
+            raise
+        name = _project_command(args) if args.command == "project" else args.command
+        problem = Problem("INTERNAL", "", f"unexpected {type(exc).__name__}; this is a bug", "report it")
+        return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem], []), as_json=True, human="")
     finally:
         runner.QUIET = False
 

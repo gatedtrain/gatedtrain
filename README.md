@@ -60,11 +60,35 @@ the report fields and control runs, or the [Tier B runbook](docs/tier-b-runbook.
 | `ext-launch` | Check an external run request, write the launch record and print the command for the operator. Use `--recheck` to verify the record before running it. |
 | `ext-from-nel`, `ext-merge-eval`, `ext-arm-fill` | Build and verify the per-item results for each side of the evaluation. |
 | `ext-collect` | Compare the candidate and baseline on the same evaluation items, then write the gate report, consumption ledger and checkpoint lineage. |
+| `project` | AI-native projects (preview): `create`, `plan`, `run`, `status`, `report`. See below. |
 | `impact` | Look up a shard across recorded runs. Each answer reports its precision as `row`, `iteration` or `stage`. |
 
 Gates support superiority, non-inferiority and equivalence. The registration fixes the margin, alpha, target
 power and evaluation seeds before the run. The report includes the decision, achieved power and an
 `underpowered` flag.
+
+## AI-native projects (preview)
+
+`gatedtrain project` runs one goal as a project directory: a fixed pipeline of five trust stages (`intake_seal`,
+`preregister`, `evaluate_sealed`, `gate`, `report`) around the stages a pipeline file plugs in. Step 1 is a preview
+for CPU-only work and the synthetic scenario pack in `gatedtrain.testing`, which is not registered as an entry point.
+
+```sh
+gatedtrain project create ./proj --goal "..." --data labelled.jsonl --pipeline pipeline.yaml [--gpu-hours H]
+gatedtrain project plan ./proj <stage>                       # what a stage would do; changes nothing
+gatedtrain project run ./proj <stage> [--decision file.json] # stages run in pipeline order
+gatedtrain project status ./proj
+gatedtrain project report ./proj
+```
+
+`--pipeline` is the path of a pipeline YAML (stored as an absolute path). `--gpu-hours` is recorded in
+`project.yaml` as the budget; step 1 enforces nothing. `run` of the `gate` stage exits 0 on PASS and 1 otherwise;
+a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. The gate spends the
+project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result object per call.
+
+**Trust boundary in step 1.** Stages run in the operator's process. The sealed evaluation items are hash-only to
+the operator, but a step-1 stage can read and rewrite the trust records and the attempt log, so a report states
+`sealed_guarantee` as "unsealed (step 1)". Enforcement arrives with the step-2 keeper.
 
 ## Adapter plugins
 
