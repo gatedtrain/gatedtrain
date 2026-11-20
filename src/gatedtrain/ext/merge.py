@@ -24,9 +24,10 @@ from pathlib import Path
 import yaml
 
 from .. import TAGS
-from ..canonical import file_sha256, write_canonical
+from ..canonical import write_canonical
 from ..errors import Problem, Refused
 from . import registry
+from .armfs import ArmSnapshot
 from .arm import copy_output_ref, items_text, merge_records, read_lines, read_meta, same_json
 
 MERGE_SCHEMA = "gatedtrain.ext_merge_eval"
@@ -73,11 +74,12 @@ def merge_eval(registration: Path, out: Path, runs: list[Path]) -> Path:
     infos = []
     for r, run in enumerate(map(Path, runs)):
         fld = f"runs[{r}]"
-        meta, why = read_meta(run)
+        snap = ArmSnapshot.read(run)                     # read once: checked, hashed into merge.json (A5)
+        meta, why = read_meta(run, snap)
         if meta is None or why:
             problems += [Problem("EXT-MERGE", fld, f"{run}: {m}", fix) for m in why]
             continue
-        infos.append({"run": run, "meta": meta, "field": fld})
+        infos.append({"run": run, "meta": meta, "field": fld, "snap": snap})
     ids = sorted({i["meta"].get("evaluator_id") for i in infos}, key=str)
     if len(ids) > 1:
         problems.append(Problem("EXT-MERGE", "runs", f"the runs name different evaluators {ids}", fix))
@@ -105,7 +107,7 @@ def merge_eval(registration: Path, out: Path, runs: list[Path]) -> Path:
             else:
                 covered[s] = fld
         recs, bad = read_lines(run, seeds=run_seeds, score_range=row["score_range"],
-                               error_classes=tuple(row["error_classes"]))
+                               error_classes=tuple(row["error_classes"]), snap=info["snap"])
         problems += [Problem("EXT-MERGE", fld, f"{run}: {m}", fix) for m in bad]
         info["records"] = recs
     for s in seeds:
@@ -140,7 +142,7 @@ def merge_eval(registration: Path, out: Path, runs: list[Path]) -> Path:
                 if ref["path"] in outputs and outputs[ref["path"]][1]["sha256"] != ref["sha256"]:
                     problems.append(Problem("EXT-MERGE", info["field"], f"output {ref['path']} differs between runs",
                                             "give each run's outputs distinct paths"))
-                outputs[ref["path"]] = (info["run"], ref, info["field"])
+                outputs[ref["path"]] = (info, ref)      # canonical paths (read_lines): one spelling per file
     if problems:
         raise Refused(problems)
     merged = merge_records([(info["records"], info["meta"]["eval_seeds"]) for info in infos], seeds)
@@ -155,14 +157,14 @@ def merge_eval(registration: Path, out: Path, runs: list[Path]) -> Path:
         meta = {k: v for k, v in first.items() if k != "created_at"}
         meta["eval_seeds"] = seeds
         write_canonical(tmp / "eval_meta.json", meta)
-        for rel, (run, ref, field) in outputs.items():           # MM-1: the checked bytes, never a swapped file
+        for rel, (info, ref) in outputs.items():                # MM-1: the checked bytes, never a swapped file
             (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
-            copy_output_ref(run, ref, tmp / rel, flag=field)
+            copy_output_ref(info["run"], ref, tmp / rel, flag=info["field"], key=info["snap"].key)
         write_canonical(tmp / "merge.json", {
             "schema": MERGE_SCHEMA, "schema_version": "1.0", "tags": list(TAGS),
-            "sources": [{"path": str(i["run"].absolute()), "seeds": list(i["meta"]["eval_seeds"]),
-                         "items_sha256": file_sha256(i["run"] / "items.jsonl"),
-                         "eval_meta_sha256": file_sha256(i["run"] / "eval_meta.json")} for i in infos],
+            "sources": [{"path": os.path.abspath(i["run"]), "seeds": list(i["meta"]["eval_seeds"]),
+                         "items_sha256": i["snap"].files["items.jsonl"].sha256,              # the bytes merged
+                         "eval_meta_sha256": i["snap"].files["eval_meta.json"].sha256} for i in infos],
             "notes": ["Repeats relabelled by the registered seed order (G-16 semantics, MULTIMODAL-SPEC MM-5)."],
         })
         os.rename(tmp, out)

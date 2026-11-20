@@ -6,6 +6,18 @@ to find which checkpoints may have consumed a training shard, for example after 
 
 This is a prototype. Outputs carry the tags `prototype` and `unpromotable`.
 
+## Changes since 0.3.0
+
+Not released yet. Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs/findings.md,
+"Review of the 3.12 path fix" and "Review of PR 2"):
+
+- A symbolic link anywhere in an `output_ref` path, or as an arm's `items.jsonl`, `eval_meta.json` or `merge.json`,
+  is refused, also one that stays inside the arm. Write copies or hard links.
+- `output_ref` paths must be in canonical form: relative, UTF-8, no NUL, no `.`, `..` or empty component
+  (`outputs/x.png`, not `./outputs//x.png`).
+- A merged arm's sources (`merge.json` `sources[].path`, or `run_dir` for `ext-from-nel`) must lie under the host's
+  output root, or under the directory given to `ext-collect --sources-root`.
+
 ## Install and run the demo
 
 From a checkout with Python 3.12 or 3.13, create a virtual environment and validate the demo spec.

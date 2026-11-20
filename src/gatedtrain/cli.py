@@ -173,7 +173,8 @@ def cmd_ext_collect(args) -> int:
                                         launch_record=Path(args.launch_record), smoke_record=Path(args.smoke_record),
                                         eval_baseline=[Path(a) for a in args.eval_baseline],
                                         eval_candidate=[Path(a) for a in args.eval_candidate],
-                                        runs_root=Path(args.runs_root))
+                                        runs_root=Path(args.runs_root),
+                                        sources_root=Path(args.sources_root) if args.sources_root else None)
     except Refused as exc:
         return _refuse(exc.problems)
     print(f"run_dir: {run_dir}")
@@ -317,6 +318,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-candidate", required=True, action="append",
                    help="the candidate arm; with several clauses, once per clause in the gate's evaluator order")
     p.add_argument("--runs-root", default="runs")
+    p.add_argument("--sources-root", help="the directory a merged arm's sources (merge.json) must lie under "
+                   "(MM-5); default: the host's output root")
     p.set_defaults(func=cmd_ext_collect)
 
     p = sub.add_parser("ext-merge-eval", help="external run: merge per-item arm runs into one arm (MM-5)")

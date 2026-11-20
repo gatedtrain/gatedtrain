@@ -19,6 +19,7 @@ cluster order), so the rounded bounds agree exactly and the unrounded ones to fl
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -780,6 +781,100 @@ class CollectTwoClauses(unittest.TestCase):
         hits = [e for e in parse_errors(proc.stderr) if e["rule"] == "EXT-ARM" and "passed twice" in e["message"]]
         self.assertEqual([e["field"] for e in hits], ["--eval-candidate"], describe(proc))
         self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(runs.exists() and any(runs.iterdir()))
+
+    def collect_in_process(self, arms: list[tuple[Path, Path]], runs: Path, hook=None):
+        """ext-collect in this process (review of PR 2): `hook()` runs after every check passed, before the arms are
+        copied (at `runner.copy_registration`), as a container still writing its arms would."""
+        from gatedtrain import runner
+        from gatedtrain.ext.collect import collect
+
+        real = runner.copy_registration
+
+        def hooked(wf, run_dir):
+            if hook is not None:
+                hook()
+            return real(wf, run_dir)
+
+        sc = self.sc
+        with _r18.patched(), mock.patch.dict(os.environ, sc.env()), \
+                mock.patch.object(runner, "copy_registration", hooked):
+            return collect(sc.paths["spec"], adapter="synthetic", stage_out=sc.stage_out, launch_record=sc.launch,
+                           smoke_record=sc.smoke, eval_baseline=[b for b, _ in arms],
+                           eval_candidate=[c for _, c in arms], runs_root=runs)
+
+    def test_same_arm_past_path_max_refused(self):
+        """Review of PR 2 (C1): the S4 alias that a resolved path string misses. With the working directory deeper
+        than PATH_MAX, `arm` (a link to the length baseline) and `lnk` (a link to `arm`) cannot be inspected by path,
+        so the lenient `realpath` keeps both names and gives two keys; the opened directory is one."""
+        from gatedtrain.errors import Refused
+
+        deep = self.tmp / f"deep-{type(self).n}"
+        deep.mkdir()
+        fd = os.open(deep, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for name in ["d" * 250] * 17:
+                os.mkdir(name, dir_fd=fd)
+                nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+                os.close(fd)
+                fd = nxt
+            os.symlink(str(self.length_base), "arm", dir_fd=fd)
+            os.symlink("arm", "lnk", dir_fd=fd)
+            cwd = os.getcwd()
+            os.fchdir(fd)
+        finally:
+            os.close(fd)
+        try:
+            self.assertGreater(len(os.getcwd()), os.pathconf("/", "PC_PATH_MAX"))
+            with self.assertRaises(Refused) as cm:
+                self.collect_in_process([(self.sc.baseline, self.sc.candidate), (Path("arm"), Path("lnk"))],
+                                        self.runs())
+        finally:
+            os.chdir(cwd)
+        hits = [p for p in cm.exception.problems if p.rule == "EXT-ARM" and "passed twice" in p.message]
+        self.assertEqual([p.field for p in hits], ["--eval-candidate"], cm.exception.problems)
+
+    def test_arm_files_changed_after_the_checks(self):
+        """Review of PR 2 (A1, C2), several clauses: the run holds the bytes that were checked (`items.jsonl`
+        swapped for a link to a host file, `eval_meta.json` rewritten and a `merge.json` link added after the checks
+        change nothing), and an output swapped for a link after the checks refuses the collect, leaving no run."""
+        from gatedtrain.errors import Refused
+
+        secret = self.tmp / "HOST_SECRET"
+        secret.write_bytes(b"host secret\n")
+        cand = self.length_arm("candidate-length-swap", lambda i: length_score(i) + (i % 5))
+        before = {n: (cand / n).read_bytes() for n in ("items.jsonl", "eval_meta.json")}
+
+        def swap_files():
+            (cand / "items.jsonl").unlink()
+            (cand / "items.jsonl").symlink_to(secret)
+            (cand / "eval_meta.json").write_bytes(b"{}")
+            (cand / "merge.json").symlink_to(secret)
+
+        run_dir, _, _ = self.collect_in_process([(self.sc.baseline, self.sc.candidate), (self.length_base, cand)],
+                                                self.runs(), swap_files)
+        got = run_dir / "eval" / "candidate" / "length"
+        self.assertEqual({n: (got / n).read_bytes() for n in before}, before)
+        self.assertFalse((got / "merge.json").exists())
+
+        out = self.length_arm("candidate-length-ref", lambda i: length_score(i) + (i % 5))
+        lines = [json.loads(l) for l in (out / "items.jsonl").read_text(encoding="utf-8").splitlines()]
+        (out / "outputs").mkdir()
+        (out / "outputs" / "a.txt").write_bytes(b"output")
+        lines[0]["output_ref"] = {"path": "outputs/a.txt", "sha256": "sha256:" + hashlib.sha256(b"output").hexdigest()}
+        (out / "items.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines), encoding="utf-8")
+
+        def swap_output():
+            (out / "outputs" / "a.txt").unlink()
+            (out / "outputs" / "a.txt").symlink_to(secret)
+
+        runs = self.runs()
+        with self.assertRaises(Refused) as cm:
+            self.collect_in_process([(self.sc.baseline, self.sc.candidate), (self.length_base, out)], runs,
+                                    swap_output)
+        (p,) = cm.exception.problems
+        self.assertEqual((p.rule, p.field), ("EXT-ARM", "--eval-candidate"))
+        self.assertIn("contains a symbolic link", p.message)
         self.assertFalse(runs.exists() and any(runs.iterdir()))
 
     def test_item_without_cluster_field_refused(self):

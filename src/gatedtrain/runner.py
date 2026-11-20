@@ -320,13 +320,15 @@ def read_arm_records(arm_dir: Path, *, scorer_key: str | None = None) -> list[di
     return out
 
 
-def results_lines(path: Path) -> list[tuple[int, dict[str, Any] | None]]:
+def results_lines(path: Path, text: str | None = None) -> list[tuple[int, dict[str, Any] | None]]:
     """The strict per-line rule of `read_arm_records` (R11A-28), shared with `tierb.merge_eval`: every non-blank
     line of a NeMo Evaluator `results.jsonl` with its 1-based line number, and the parsed record, or None when
     the line does not parse, is not a JSON object or has no `problem_idx`. Blank lines are skipped; nothing is
-    coerced, dropped or overwritten (duplicates are the caller's to report)."""
+    coerced, dropped or overwritten (duplicates are the caller's to report). `text`: the content, already read."""
     out: list[tuple[int, dict[str, Any] | None]] = []
-    for n, line in enumerate(text_lines(Path(path).read_text(encoding="utf-8")), start=1):
+    if text is None:
+        text = Path(path).read_text(encoding="utf-8")
+    for n, line in enumerate(text_lines(text), start=1):
         if not line.strip():
             continue
         try:

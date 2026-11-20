@@ -83,6 +83,7 @@ class CollectCase(unittest.TestCase):
 
     def refused(self, rule: str, field_prefix: str | None = None, **collect_kw):
         runs = self.runs()
+        collect_kw.setdefault("sources_root", self.tmp)  # MM-5: merged arms' sources are built under the test root
         proc = self.sc.collect(runs, **collect_kw)
         self.assertEqual(proc.returncode, EXIT_REFUSED, describe(proc))
         errs = parse_errors(proc.stderr)
@@ -93,6 +94,7 @@ class CollectCase(unittest.TestCase):
         return hits
 
     def passes(self, **collect_kw) -> dict:
+        collect_kw.setdefault("sources_root", self.tmp)
         proc = self.sc.collect(self.runs(), **collect_kw)
         self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
         return load_report(parse_run_dir(proc.stdout))

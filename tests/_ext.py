@@ -64,28 +64,38 @@ ENV_MIRROR_ROOT, ENV_INTERPRETER, ENV_INTERPRETER_TREES = ("GATEDTRAIN_EXT_MIRRO
 LABEL = "ext-synthetic-full"
 
 
+REQUIRE_CONTAINER_USER = "GATEDTRAIN_REQUIRE_CONTAINER_USER"
+
+
 def container_user() -> str:
     """The `<uid>:<gid>` a test's launch request or record runs the container as: the uid running the tests and its
     primary group. EXT-63 requires the run's output directory to be owned by the container's uid, and the tests create
     that directory, so the fixtures follow the user running them instead of naming uid 1000 (review of the 3.12 path
     fix, C1). Raises SkipTest where no such user can launch: root (EXT-70 refuses uid 0), a uid without a user
-    database entry, or a primary group that owns a Docker daemon socket (EXT-66, EXT-51)."""
+    database entry, or a primary group that owns a Docker daemon socket (EXT-66, EXT-51). With
+    `GATEDTRAIN_REQUIRE_CONTAINER_USER=1` (CI) it raises AssertionError instead, so those tests fail rather than
+    skip (review of PR 2, C3)."""
     import pwd
     import unittest
 
     from gatedtrain.ext.launch import docker_socket_gids
 
+    def unusable(why: str) -> BaseException:
+        if os.environ.get(REQUIRE_CONTAINER_USER) == "1":
+            return AssertionError(f"{why} ({REQUIRE_CONTAINER_USER}=1)")
+        return unittest.SkipTest(why)
+
     uid = os.getuid()
     if uid == 0:
-        raise unittest.SkipTest("the tests run as root; a launch never runs a container as uid 0 (EXT-70) and the "
-                                "output directory must be owned by the container's uid (EXT-63): run as a non-root user")
+        raise unusable("the tests run as root; a launch never runs a container as uid 0 (EXT-70) and the output "
+                       "directory must be owned by the container's uid (EXT-63): run as a non-root user")
     try:
         gid = pwd.getpwuid(uid).pw_gid
     except KeyError:
-        raise unittest.SkipTest(f"uid {uid} has no user database entry; the container runs as a host user (EXT-66)")
+        raise unusable(f"uid {uid} has no user database entry; the container runs as a host user (EXT-66)")
     if gid in docker_socket_gids():
-        raise unittest.SkipTest(f"the primary group {gid} of uid {uid} owns a Docker daemon socket; no container may "
-                                "run in that group (EXT-51)")
+        raise unusable(f"the primary group {gid} of uid {uid} owns a Docker daemon socket; no container may run in "
+                       "that group (EXT-51)")
     return f"{uid}:{gid}"
 
 
@@ -656,12 +666,14 @@ class ExtScenario:
 
     def collect(self, runs_root: Path, *, adapter: str = ADAPTER, stage_out: Path | None = None,
                 baseline: Path | None = None, candidate: Path | None = None, launch: Path | None = None,
-                smoke: Path | None = None, spec: Path | None = None, timeout: int = 300):
+                smoke: Path | None = None, spec: Path | None = None, timeout: int = 300,
+                sources_root: Path | None = None):
+        """ext-collect of the scenario; `sources_root` is `--sources-root` (MM-5; default: the output root)."""
         args = ["ext-collect", str(spec or self.paths["spec"]), "--adapter", adapter,
                 "--stage-out", str(stage_out or self.stage_out),
                 "--launch-record", str(launch or self.launch), "--smoke-record", str(smoke or self.smoke),
                 "--eval-baseline", str(baseline or self.baseline), "--eval-candidate", str(candidate or self.candidate),
-                "--runs-root", str(runs_root)]
+                "--runs-root", str(runs_root)] + (["--sources-root", str(sources_root)] if sources_root else [])
         return run_cli(args, cwd=self.root, timeout=timeout, env=self.env())
 
 

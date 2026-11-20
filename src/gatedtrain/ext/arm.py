@@ -16,27 +16,28 @@ JSON bytes, so `true` never equals `1` (`same_json`); an `output_ref` never name
 holds (`items.jsonl`, `eval_meta.json`, `merge.json`, `judge_batches.jsonl`), so a merge or a collect copy
 never overwrites one; `provenance_problems` checks a merged arm's `merge.json` against its sources.
 
-An `output_ref` path (MM-1) is relative, has no `..`, and no component of it is a symbolic link (hard links are
-allowed). `open_output_ref` opens it component by component from the arm directory without following links
-(`O_NOFOLLOW` under `dir_fd`), so neither a link nor a path longer than `PATH_MAX` reaches a file outside the arm,
-and `copy_output_ref` (collect, merge) copies the bytes it hashes: a file swapped after the check is refused,
-never copied. A path that cannot be opened is a problem, never a traceback (docs/findings.md, "Review of the 3.12
-path fix").
+Files are read through `armfs` (docs/findings.md, "Review of the 3.12 path fix" and "Review of PR 2"): nothing is
+read by path and no symbolic link is followed below the arm directory. `items.jsonl`, `eval_meta.json` and
+`merge.json` are read once (`ArmSnapshot`) and every check parses those bytes. An `output_ref` path (MM-1) is a
+relative path in canonical form (UTF-8, no NUL, no `.`, `..` or empty component) with no symbolic link (hard links
+are allowed), and `copy_output_ref` (collect, merge) copies the bytes it hashes, so a file swapped after the check
+is refused, never copied. Provenance sources (MM-5) are read the same way below the sources root. A path that
+cannot be read is a problem, never a traceback, and a refused file's content is never echoed.
 """
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import math
 import os
-import stat
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from ..canonical import canonical_json, file_sha256, text_lines
+from ..canonical import canonical_json, text_lines
 from ..errors import Problem, Refused
+from .armfs import (ArmSnapshot, Unreadable, errname, open_arm, open_dir, open_regular, path_problem, read_file,
+                    sha256, under_root)
 from ..renamed import old_schema_note
 
 META_SCHEMA = "gatedtrain.item_eval"
@@ -68,33 +69,28 @@ def _finite(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
-def _file_state(path: Path, *, regular: bool = True) -> str | None:
-    """None when `path` exists (as a regular file, if `regular`), "missing" when it does not, else the errno name of
-    why it cannot be inspected. Never raises: `Path.is_file()` and `Path.exists()` raise on Python 3.12 for an
-    error such as ENAMETOOLONG or EACCES, which is a problem to report, not a traceback."""
+def _snapshot(arm: Path, snap: ArmSnapshot | None) -> ArmSnapshot:
+    return snap if snap is not None else ArmSnapshot.read(arm)
+
+
+def _json(data: bytes) -> tuple[Any, str | None]:
     try:
-        mode = os.stat(path).st_mode
-    except (FileNotFoundError, NotADirectoryError):
-        return "missing"
-    except OSError as exc:
-        return _errname(exc)
-    except ValueError:                                     # an embedded NUL byte
-        return "ValueError"
-    return "missing" if regular and not stat.S_ISREG(mode) else None
+        return json.loads(data.decode("utf-8")), None
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        return None, exc.__class__.__name__
 
 
-def read_meta(arm: Path) -> tuple[dict | None, list[str]]:
-    """eval_meta.json with exactly the MM-2 keys (`created_at` optional)."""
+def read_meta(arm: Path, snap: ArmSnapshot | None = None) -> tuple[dict | None, list[str]]:
+    """eval_meta.json with exactly the MM-2 keys (`created_at` optional), from the snapshot's bytes (`snap`, else
+    read now)."""
+    snap = _snapshot(arm, snap)
     path = Path(arm) / "eval_meta.json"
-    state = _file_state(path)
-    if state == "missing":
-        return None, [f"{path} is missing"]
-    if state:
-        return None, [f"{path} cannot be read ({state})"]
-    try:
-        meta = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, [f"{path} does not parse ({exc.__class__.__name__})"]
+    why = snap.problem("eval_meta.json")
+    if why:
+        return None, [why]
+    meta, bad = _json(snap.files["eval_meta.json"].data)
+    if bad:
+        return None, [f"{path} does not parse ({bad})"]
     if not isinstance(meta, dict):
         return None, [f"{path} is not a JSON object"]
     out = []
@@ -134,23 +130,23 @@ def meta_differences(meta: dict, expected: dict[str, Any]) -> list[str]:
     return out
 
 
-def _output_ref_problem(arm: Path, ref: Any) -> str | None:
+def _output_ref_problem(arm: Path, ref: Any, key: tuple[int, int] | None = None) -> str | None:
     if ref is None:
         return None
     if not (isinstance(ref, dict) and set(ref) == {"path", "sha256"} and isinstance(ref["path"], str)):
         return "output_ref is not {path, sha256}"
-    rel = PurePosixPath(ref["path"])
-    if rel.is_absolute() or ".." in rel.parts or not ref["path"]:
-        return f"output_ref path {ref['path']!r} leaves the arm"
-    if len(rel.parts) == 1 and rel.parts[0] in RESERVED_FILES:
+    why = path_problem(ref["path"])
+    if why:
+        return f"output_ref path {ref['path']!r} {why}"
+    if "/" not in ref["path"] and ref["path"] in RESERVED_FILES:
         return f"output_ref path {ref['path']!r} names a file of the arm itself ({', '.join(RESERVED_FILES)})"
-    fd, why = open_output_ref(arm, ref["path"])
+    fd, why = open_output_ref(arm, ref["path"], key)
     if fd is None:
         return why
     try:
         got = _sha256_fd(fd)
-    except OSError as exc:
-        return f"output_ref file {ref['path']!r} cannot be read ({_errname(exc)})"
+    except Unreadable as exc:
+        return exc.text(f"output_ref file {ref['path']!r}")
     finally:
         os.close(fd)
     if ref["sha256"] != got:
@@ -158,108 +154,83 @@ def _output_ref_problem(arm: Path, ref: Any) -> str | None:
     return None
 
 
-def _errname(exc: OSError) -> str:
-    return errno.errorcode.get(exc.errno, exc.__class__.__name__) if exc.errno else exc.__class__.__name__
-
-
 def _sha256_fd(fd: int, out=None) -> str:
-    """SHA-256 of what is read from `fd` (from its current offset), written on to the binary file `out` if given."""
+    """SHA-256 of what is read from `fd`, written on to the binary file `out` if given. A read error is Unreadable
+    (the arm's fault); a write error stays OSError (the output's)."""
     h = hashlib.sha256()
-    while chunk := os.read(fd, 1 << 20):
+    while True:
+        try:
+            chunk = os.read(fd, 1 << 20)
+        except OSError as exc:
+            raise Unreadable("error", errname(exc)) from None
+        if not chunk:
+            return "sha256:" + h.hexdigest()
         h.update(chunk)
         if out is not None:
             out.write(chunk)
-    return "sha256:" + h.hexdigest()
 
 
-def open_output_ref(arm: Path, path: str) -> tuple[int | None, str | None]:
+def open_output_ref(arm: Path, path: str, key: tuple[int, int] | None = None) -> tuple[int | None, str | None]:
     """MM-1, EXT-45: (a read-only descriptor of the regular file `path` names inside `arm`, None) or (None, why).
-    The arm directory is opened as given (it may itself be a link); then each component of `path` is opened under
-    the descriptor of the one before with `O_NOFOLLOW` (`O_DIRECTORY` but for the last, `O_NONBLOCK` for the last so
-    a FIFO never blocks). A symbolic link anywhere refuses, a hard link is a regular file; no lexical or `realpath`
-    form of the path is used, so its length is never limited by `PATH_MAX`. `path` must have passed the lexical
-    checks of `_output_ref_problem` (relative, no `..`)."""
-    parts = PurePosixPath(path).parts
+    The arm directory is opened as given (it may itself be a link) and, with `key`, must be the snapshot's; `path`
+    (canonical, `path_problem`) is reached by `armfs.open_regular`: no link anywhere, only a regular file opened
+    for reading, never limited by `PATH_MAX`."""
     try:
-        dir_fd = os.open(arm, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    except OSError as exc:
-        return None, f"output_ref file {path!r} cannot be opened: the arm directory cannot be ({_errname(exc)})"
+        dir_fd = open_arm(arm, key)
+    except Unreadable as exc:
+        what = "was replaced since it was read" if exc.kind == "changed" else exc.reason()
+        return None, f"output_ref file {path!r} cannot be opened: the arm directory {what}"
     try:
-        for i, name in enumerate(parts):
-            last = i == len(parts) - 1
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_NONBLOCK if last else os.O_DIRECTORY)
-            try:
-                fd = os.open(name, flags, dir_fd=dir_fd)
-            except OSError as exc:
-                return None, _open_problem(path, name, dir_fd, exc)
-            if last:
-                try:
-                    regular = stat.S_ISREG(os.fstat(fd).st_mode)
-                except OSError:
-                    regular = False
-                if not regular:
-                    os.close(fd)
-                    return None, f"output_ref file {path!r} is not a regular file"
-                return fd, None
-            os.close(dir_fd)
-            dir_fd = fd
-        return None, f"output_ref file {path!r} is absent"            # no parts: refused lexically before
+        return open_regular(dir_fd, path), None
+    except Unreadable as exc:
+        if exc.kind == "link":
+            return None, exc.text(f"output_ref path {path!r}")
+        return None, exc.text(f"output_ref file {path!r}")
     finally:
         os.close(dir_fd)
 
 
-def _open_problem(path: str, name: str, dir_fd: int, exc: OSError) -> str:
-    """Why component `name` (under `dir_fd`) of output_ref `path` did not open: a symbolic link (`O_NOFOLLOW` gives
-    ELOOP for the last component and ENOTDIR with `O_DIRECTORY`), absent, or another error by its errno name."""
-    try:
-        link = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
-    except OSError:
-        link = False
-    if link or exc.errno == errno.ELOOP:
-        return f"output_ref path {path!r} contains a symbolic link ({name!r}; MM-1 allows none)"
-    if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-        return f"output_ref file {path!r} is absent"
-    return f"output_ref file {path!r} cannot be opened ({_errname(exc)})"
-
-
-def copy_output_ref(arm: Path, ref: dict, dst: Path, *, flag: str) -> None:
+def copy_output_ref(arm: Path, ref: dict, dst: Path, *, flag: str, key: tuple[int, int] | None = None) -> None:
     """Copy the `output_ref` file of `arm` to `dst` (collect, merge): the bytes come from the descriptor
     `open_output_ref` gives and are hashed while copied, so a file changed or swapped for a link after the line
-    checks is refused (Refused, EXT-ARM on `flag`; the caller removes its partial output), never copied. A failed
-    write of `dst` raises OSError."""
-    fd, why = open_output_ref(arm, ref["path"])
+    checks, or one that cannot be read, is refused (Refused, EXT-ARM on `flag`; the caller removes its partial
+    output), never copied. A failed write of `dst` raises OSError."""
+    fix = "do not change an arm while it is collected or merged"
+    fd, why = open_output_ref(arm, ref["path"], key)
     if fd is None:
-        raise Refused([Problem("EXT-ARM", flag, f"{arm}: {why} (changed after it was checked)",
-                               "do not change an arm while it is collected or merged")])
+        raise Refused([Problem("EXT-ARM", flag, f"{arm}: {why} (changed after it was checked)", fix)])
     try:
         with open(dst, "wb") as out:
             got = _sha256_fd(fd, out)
+    except Unreadable as exc:
+        dst.unlink(missing_ok=True)
+        what = "output_ref file " + repr(ref["path"])
+        raise Refused([Problem("EXT-ARM", flag, f"{arm}: {exc.text(what)}", fix)]) from None
     finally:
         os.close(fd)
     if got != ref["sha256"]:
         dst.unlink(missing_ok=True)
         raise Refused([Problem("EXT-ARM", flag, f"{arm}: output_ref file {ref['path']!r} differs from its sha256 "
-                               "(changed after it was checked)",
-                               "do not change an arm while it is collected or merged")])
+                               "(changed after it was checked)", fix)])
 
 
-def read_lines(arm: Path, *, seeds: list[int], score_range, error_classes) -> tuple[list[dict], list[str]]:
-    """Every line of `<arm>/items.jsonl` checked against the EXT-1 rules. Returns (records, problems); a
-    record keeps its `item_meta` (the caller drops it before the gate)."""
+def read_lines(arm: Path, *, seeds: list[int], score_range, error_classes,
+               snap: ArmSnapshot | None = None) -> tuple[list[dict], list[str]]:
+    """Every line of `<arm>/items.jsonl` (the snapshot's bytes: `snap`, else read now) checked against the EXT-1
+    rules. Returns (records, problems); a record keeps its `item_meta` (the caller drops it before the gate)."""
+    snap = _snapshot(arm, snap)
     path = Path(arm) / "items.jsonl"
-    state = _file_state(path)
-    if state == "missing":
-        return [], [f"{path} is missing (pass an arm directory, not its parent)"]
-    if state:
-        return [], [f"{path} cannot be read ({state})"]
+    why = snap.problem("items.jsonl")
+    if why:
+        return [], [why + (" (pass an arm directory, not its parent)" if why.endswith("is missing") else "")]
     lo, hi = (list(score_range) + [None, None])[:2]
     k = len(seeds)
     records: list[dict] = []
     bad: list[str] = []
     first: dict[tuple, int] = {}
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        text = snap.files["items.jsonl"].data.decode("utf-8")
+    except UnicodeDecodeError as exc:
         return [], [f"{path} cannot be read ({exc.__class__.__name__})"]
     for n, line in enumerate(text_lines(text), start=1):
         if not line.strip():
@@ -303,7 +274,7 @@ def read_lines(arm: Path, *, seeds: list[int], score_range, error_classes) -> tu
         sub = rec.get("sub_metrics")
         if sub is not None and not (isinstance(sub, dict) and all(_finite(v) for v in sub.values())):
             why.append("sub_metrics is not an object of finite numbers")
-        ref_bad = _output_ref_problem(Path(arm), rec.get("output_ref"))
+        ref_bad = _output_ref_problem(Path(arm), rec.get("output_ref"), snap.key)
         if ref_bad:
             why.append(ref_bad)
         meta = rec.get("item_meta")
@@ -332,7 +303,8 @@ def _source_meta_differs(src_meta: Any, meta: dict) -> bool:
 
 
 def provenance_problems(arm: Path, meta: dict, *, nel_benchmark: str | None, row: dict | None = None,
-                        item_rows: list[dict] | None = None) -> list[str]:
+                        item_rows: list[dict] | None = None, snap: ArmSnapshot | None = None,
+                        sources_root: Path | str | None = None) -> list[str]:
     """EXT-47 (MM-5, MM-11 merge provenance): a merged arm's `merge.json` against its sources. None to check
     when the arm has no merge.json (an arm written in one piece).
 
@@ -343,20 +315,25 @@ def provenance_problems(arm: Path, meta: dict, *, nel_benchmark: str | None, row
     and `<run_dir>/full_config.yaml` exist with the recorded SHA-256.
     A source that is gone cannot be checked and is refused (collect while the sources exist).
 
+    Sources (review of PR 2, A2): each `path` or `run_dir` is an absolute path in normal form at or below
+    `sources_root` (`ext-collect`: the host's output root, or `--sources-root`); it is reached from the root's
+    descriptor without following a link, and its files are read as an arm's (`armfs`): no FIFO, device or link is
+    ever opened. A source outside the root, or none configured, cannot be checked and is refused. A mismatch says
+    only that the file differs from the recorded hash, never the hash it has.
+
     EXT-52: when those checks pass, the arm's `items.jsonl` must be byte for byte the file the command writes from
     its sources: `merge_records` of the source arms (evaluator registry `row` for the line rules) for
     `ext_merge_eval`, `from_nel.convert_records` of the runs' `results.jsonl` (the registered `item_rows`) for
     `ext_from_nel`. An edited score, a dropped or reordered line is refused."""
-    path = Path(arm) / "merge.json"
-    state = _file_state(path, regular=False)
-    if state == "missing":
+    snap = _snapshot(arm, snap)
+    f = snap.files["merge.json"]
+    if f.problem == "missing":
         return []
-    if state:
-        return [f"merge.json cannot be read ({state}); provenance cannot be checked"]
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return [f"merge.json does not parse ({exc.__class__.__name__})"]
+    if f.problem:
+        return [f"merge.json {f.problem}; provenance cannot be checked"]
+    doc, bad = _json(f.data)
+    if bad:
+        return [f"merge.json does not parse ({bad})"]
     if not isinstance(doc, dict) or doc.get("schema") not in MERGE_SCHEMAS:
         got = doc.get("schema") if isinstance(doc, dict) else None
         return [f"merge.json schema is {got!r}, not one of {', '.join(MERGE_SCHEMAS)}{old_schema_note(got)}"]
@@ -366,62 +343,107 @@ def provenance_problems(arm: Path, meta: dict, *, nel_benchmark: str | None, row
     seeds = meta.get("eval_seeds")
     if not isinstance(seeds, list):
         return []                                          # read_meta reports the seeds
+    if sources_root is None:
+        return ["merge.json names sources but no sources root is configured; provenance cannot be checked"]
+    try:
+        root_fd = open_arm(sources_root)
+    except Unreadable as exc:
+        return [f"the sources root {sources_root} {exc.reason()}; provenance cannot be checked"]
     out: list[str] = []
 
-    def check_file(f: Any, want: Any, what: str) -> None:
+    def source_dir(i: int, key: str, p: Any) -> int | None:
+        rel = under_root(sources_root, p)
+        if rel is None:
+            out.append(f"merge.json sources[{i}] {key} {p!r} is not an absolute path in normal form under the "
+                       f"sources root {sources_root}; provenance cannot be checked")
+            return None
         try:
-            got = file_sha256(Path(f))
-        except (OSError, TypeError, ValueError):
-            out.append(f"merge.json source {what} {f} cannot be read; provenance cannot be checked")
-            return
-        if got != want:
-            out.append(f"merge.json source {what} {f} is {got}, not the recorded {want}")
+            return open_dir(root_fd, rel)
+        except Unreadable as exc:
+            out.append(f"merge.json sources[{i}] {key} {p!r} {exc.reason()}; provenance cannot be checked")
+            return None
 
-    if doc["schema"] == "gatedtrain.ext_merge_eval":
-        listed = [x for s in sources for x in (s.get("seeds") if isinstance(s.get("seeds"), list) else [None])]
-        if not (all(_int(x) for x in listed) and all(_int(x) for x in seeds) and len(set(listed)) == len(listed)
-                and sorted(listed) == sorted(seeds)):
-            out.append(f"merge.json sources cover seeds {listed}, not the arm's eval_seeds {seeds} once each")
-        for i, s in enumerate(sources):
-            src = s.get("path")
-            if not isinstance(src, str):
-                out.append(f"merge.json sources[{i}] has no path")
-                continue
-            check_file(Path(src) / "items.jsonl", s.get("items_sha256"), f"sources[{i}] items.jsonl")
-            check_file(Path(src) / "eval_meta.json", s.get("eval_meta_sha256"), f"sources[{i}] eval_meta.json")
-            try:
-                src_meta = json.loads((Path(src) / "eval_meta.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue                                   # reported by check_file
-            if _source_meta_differs(src_meta, meta):
-                out.append(f"merge.json sources[{i}] eval_meta.json differs from the arm's beyond eval_seeds")
-            elif not same_json(src_meta.get("eval_seeds"), s.get("seeds")):
-                out.append(f"merge.json sources[{i}] seeds {s.get('seeds')} are not its eval_seeds "
-                           f"{src_meta.get('eval_seeds')}")
-    else:
-        got = [(s.get("repeat"), s.get("seed")) for s in sources]
-        if not same_json([list(x) for x in got], [[r, x] for r, x in enumerate(seeds)]):
-            out.append(f"merge.json sources (repeat, seed) {got} are not the arm's eval_seeds {seeds} in order")
-        for i, s in enumerate(sources):
-            run = s.get("run_dir")
-            if not isinstance(run, str) or nel_benchmark is None:
-                out.append(f"merge.json sources[{i}] has no run_dir")
-                continue
-            check_file(Path(run) / nel_benchmark / "results.jsonl", s.get("results_sha256"),
-                       f"sources[{i}] results.jsonl")
-            check_file(Path(run) / "full_config.yaml", s.get("config_sha256"), f"sources[{i}] full_config.yaml")
+    def check(data: bytes | None, why: str | None, want: Any, what: str) -> None:
+        if why is not None:
+            out.append(f"merge.json source {what} {why}; provenance cannot be checked")
+        elif sha256(data) != want:
+            out.append(f"merge.json source {what} differs from the recorded hash")
+
+    derived: list = []
+    try:
+        if doc["schema"] == "gatedtrain.ext_merge_eval":
+            listed = [x for s in sources for x in (s.get("seeds") if isinstance(s.get("seeds"), list) else [None])]
+            if not (all(_int(x) for x in listed) and all(_int(x) for x in seeds) and len(set(listed)) == len(listed)
+                    and sorted(listed) == sorted(seeds)):
+                out.append(f"merge.json sources cover seeds {listed}, not the arm's eval_seeds {seeds} once each")
+            for i, s in enumerate(sources):
+                src = s.get("path")
+                if not isinstance(src, str):
+                    out.append(f"merge.json sources[{i}] has no path")
+                    continue
+                dfd = source_dir(i, "path", src)
+                if dfd is None:
+                    continue
+                try:
+                    src_snap = ArmSnapshot.read(src, dir_fd=dfd)
+                finally:
+                    os.close(dfd)
+                derived.append(src_snap)
+                for name, key in (("items.jsonl", "items_sha256"), ("eval_meta.json", "eval_meta_sha256")):
+                    sf = src_snap.files[name]
+                    check(sf.data, None if sf.problem is None else ("is missing" if sf.problem == "missing"
+                                                                     else sf.problem), s.get(key),
+                          f"sources[{i}] {name}")
+                if src_snap.files["eval_meta.json"].problem is not None:
+                    continue
+                src_meta, bad = _json(src_snap.files["eval_meta.json"].data)
+                if bad:
+                    out.append(f"merge.json sources[{i}] eval_meta.json does not parse ({bad})")
+                elif _source_meta_differs(src_meta, meta):
+                    out.append(f"merge.json sources[{i}] eval_meta.json differs from the arm's beyond eval_seeds")
+                elif not same_json(src_meta.get("eval_seeds"), s.get("seeds")):
+                    out.append(f"merge.json sources[{i}] seeds {s.get('seeds')} are not its eval_seeds "
+                               f"{src_meta.get('eval_seeds')}")
+        else:
+            got = [(s.get("repeat"), s.get("seed")) for s in sources]
+            if not same_json([list(x) for x in got], [[r, x] for r, x in enumerate(seeds)]):
+                out.append(f"merge.json sources (repeat, seed) {got} are not the arm's eval_seeds {seeds} in order")
+            for i, s in enumerate(sources):
+                run = s.get("run_dir")
+                if not isinstance(run, str) or nel_benchmark is None or path_problem(nel_benchmark):
+                    out.append(f"merge.json sources[{i}] has no run_dir")
+                    continue
+                dfd = source_dir(i, "run_dir", run)
+                if dfd is None:
+                    continue
+                try:
+                    files = {}
+                    for name, key in ((f"{nel_benchmark}/results.jsonl", "results_sha256"),
+                                      ("full_config.yaml", "config_sha256")):
+                        try:
+                            files[name] = read_file(dfd, name)
+                            check(files[name], None, s.get(key), f"sources[{i}] {name}")
+                        except Unreadable as exc:
+                            check(None, exc.reason(), s.get(key), f"sources[{i}] {name}")
+                    derived.append(files.get(f"{nel_benchmark}/results.jsonl"))
+                finally:
+                    os.close(dfd)
+    finally:
+        os.close(root_fd)
     if not out and row is not None:
-        out += _rederived_problems(Path(arm), doc, seeds, row=row, item_rows=item_rows)
+        out += _rederived_problems(snap, doc, seeds, derived, row=row, item_rows=item_rows)
     return out[:MAX_MESSAGES]
 
 
-def _rederived_problems(arm: Path, doc: dict, seeds: list, *, row: dict, item_rows: list[dict] | None) -> list[str]:
-    """EXT-52: the arm's items.jsonl against the one its sources give (sources already checked)."""
+def _rederived_problems(snap: ArmSnapshot, doc: dict, seeds: list, derived: list, *, row: dict,
+                        item_rows: list[dict] | None) -> list[str]:
+    """EXT-52: the arm's items.jsonl against the one its sources give (sources already checked and read:
+    `derived` holds the source arms' snapshots, or the runs' results.jsonl bytes)."""
     if doc["schema"] == "gatedtrain.ext_merge_eval":
         parts = []
-        for i, s in enumerate(doc["sources"]):
+        for i, (s, src_snap) in enumerate(zip(doc["sources"], derived)):
             recs, bad = read_lines(Path(s["path"]), seeds=list(s["seeds"]), score_range=row["score_range"],
-                                   error_classes=tuple(row["error_classes"]))
+                                   error_classes=tuple(row["error_classes"]), snap=src_snap)
             if bad:
                 return [f"merge.json sources[{i}] has bad lines ({bad[0]}); the arm cannot be re-derived"]
             parts.append((recs, list(s["seeds"])))
@@ -433,8 +455,12 @@ def _rederived_problems(arm: Path, doc: dict, seeds: list, *, row: dict, item_ro
         if not item_rows:
             return []                                      # the item set is refused elsewhere (EXT-5)
         runs = []
-        for i, s in enumerate(doc["sources"]):
-            recs, bad = _read_run_strict(Path(s["run_dir"]) / row["nel_benchmark"] / "results.jsonl")
+        for i, (s, data) in enumerate(zip(doc["sources"], derived)):
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return [f"merge.json sources[{i}] results.jsonl is not UTF-8; the arm cannot be re-derived"]
+            recs, bad = _read_run_strict(Path(s["run_dir"]) / row["nel_benchmark"] / "results.jsonl", text=text)
             if bad:
                 return [f"merge.json sources[{i}] results.jsonl has bad lines ({bad[0]}); the arm cannot be "
                         "re-derived"]
@@ -443,9 +469,8 @@ def _rederived_problems(arm: Path, doc: dict, seeds: list, *, row: dict, item_ro
         if bad:
             return [f"merge.json sources[{bad[0][0]}]: {bad[0][1]}; the arm cannot be re-derived"]
         want = items_text(records)
-    try:
-        got = (arm / "items.jsonl").read_bytes()
-    except OSError:
+    got = snap.files["items.jsonl"].data
+    if got is None:
         return []                                          # read_lines reports a missing items.jsonl
     if got != want.encode("utf-8"):
         return [f"items.jsonl is not the file {doc['schema']} writes from the sources in merge.json; the arm was "

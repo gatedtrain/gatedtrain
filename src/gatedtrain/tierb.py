@@ -376,20 +376,22 @@ def _run_seed_and_repeats(run: Path) -> tuple[int | None, int | None]:
     return seed, repeats
 
 
-def _read_run_strict(results: Path, limit: int = 5) -> tuple[dict[tuple[int, int], dict], list[str]]:
+def _read_run_strict(results: Path, limit: int = 5, *,
+                     text: str | None = None) -> tuple[dict[tuple[int, int], dict], list[str]]:
     """One run's records by (problem_idx, repeat), read with the strict per-line rule of `runner.read_arm_records`
     (`runner.results_lines`; R11A-28 extended to merge-eval). Unlike `gates.load_paired_records`, a line that does
     not parse, is not a JSON object or has no `problem_idx`, a `problem_idx` or `repeat` that is not an integer
     (design choice: nothing is coerced) and a second record for one (problem_idx, repeat) are reported, never
-    skipped or overwritten. Returns (records, messages); at most `limit` lines are named, then a count."""
+    skipped or overwritten. Returns (records, messages); at most `limit` lines are named, then a count. `text`, when
+    given, is the file's content already read (ext-collect reads provenance sources without following links)."""
     from .runner import results_lines
 
-    if not results.is_file():
+    if text is None and not results.is_file():
         return {}, []
     recs: dict[tuple[int, int], dict] = {}
     first_line: dict[tuple[int, int], int] = {}
     bad: list[str] = []
-    for n, rec in results_lines(results):
+    for n, rec in results_lines(results, text=text):
         if rec is None:
             bad.append(f"line {n} does not parse, is not a JSON object or has no `problem_idx` (R11A-28)")
             continue
