@@ -168,9 +168,9 @@ class InProcessTrust:
         return digest
 
     def claim_sealed_evaluation(self, candidate_sha256: str, registration_hash: str) -> dict:
-        """Claim the project's one sealed evaluation for this candidate. The claim is created once, complete, by a
-        hard link that fails when it exists (no half-written claim); the claim on record is returned, so the caller
-        sees an earlier claim for another candidate and refuses."""
+        """Claim the project's one sealed scoring for this candidate and registration. The claim is created once,
+        complete, by a hard link that fails when it exists (no half-written claim); the claim on record is returned,
+        so a caller that lost a race sees the other claim and refuses."""
         rel = self.SEALED_EVALUATION
         _refuse_links(self.project.root, rel)
         path = self.project.root / rel

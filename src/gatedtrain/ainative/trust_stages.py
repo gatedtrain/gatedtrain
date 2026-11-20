@@ -664,10 +664,11 @@ class EvaluateSealed:
     position in the backend's item order, counted by `_score_arm` for each seed, not a content hash). In step 1 the operator process can still read the sealed items; the
     guarantee is stated (`sealed_guarantee`), not enforced.
 
-    A project has one sealed evaluation: before scoring, `run` claims it in the trust store for the candidate's
-    model hash (and the registration). Scoring the same candidate again is allowed; another candidate is refused
-    (`AN-8`), because comparing several candidates on the sealed set and gating the best would select on the test
-    data without spending alpha."""
+    A project has one sealed scoring: before scoring, `run` claims it in the trust store for the candidate's model
+    reference hash and the registration, and once the claim exists every further scoring is refused (`AN-8`), for
+    another candidate and for the same reference alike (a reference need not change when its weights do), because
+    comparing several trainings on the sealed set and gating the best would select on the test data without
+    spending alpha. A done `evaluate_sealed` whose inputs are unchanged is still reused by the machine."""
 
     name = "evaluate_sealed"
     version = "1"
@@ -722,15 +723,24 @@ class EvaluateSealed:
                               f"the {arm} model names the generator {model.get('generator')!r}, not the registered "
                               f"{served[1]!r}", "both models must be served by the registered generator")
             models[arm] = model
-        # One sealed evaluation per project (05 §18.5: no repeated testing): the claim is made before any item is
-        # scored, so scoring several candidates and gating the best is refused. The same candidate may be scored
-        # again (its scores do not change); any later registration is an amendment after training, so post hoc.
-        claim = ctx.trust.claim_sealed_evaluation(cand_ref.sha256, reg["hash"])
-        if claim.get("candidate_model_sha256") != cand_ref.sha256:
+        # One sealed scoring per project (05 §18.5: no repeated testing). Once the claim exists nothing is scored
+        # again, for the same model reference either: a reference need not change when its weights do (a mutable
+        # checkpoint path), so rescoring it could pick the best of several trainings. The machine still returns the
+        # recorded scoring of a done stage whose inputs are unchanged, without calling `run`.
+        held = ctx.trust.sealed_evaluation()
+        if held is None:
+            claim = ctx.trust.claim_sealed_evaluation(cand_ref.sha256, reg["hash"])
+            fresh = claim.get("candidate_model_sha256") == cand_ref.sha256 and claim.get("registration_hash") == \
+                reg["hash"]
+        else:
+            claim, fresh = held, False
+        if not fresh:
+            same = claim.get("candidate_model_sha256") == cand_ref.sha256
             raise _refuse("AN-8", "inputs.candidate_model",
-                          f"the sealed set of this project was already used to evaluate another candidate "
-                          f"({claim.get('candidate_model_sha256')}); scoring a second one would select on the test "
-                          "data", SEALED_TEST_USED)
+                          "the sealed set of this project was already scored"
+                          + (" for this model reference; its weights may have changed since" if same else
+                             f" for another candidate ({claim.get('candidate_model_sha256')})")
+                          + "; a second scoring would select on the test data", SEALED_TEST_USED)
         out: dict[str, ArtifactRef] = {}
         for arm in ("baseline", "candidate"):
             ref = ctx.inputs[f"{arm}_model"]
@@ -897,20 +907,24 @@ REPORT_MD = "report.md"
 LIMIT_ALPHA_PER_PROJECT = ("the alpha is per project in step 1: a new project on the same data gets a fresh alpha "
                            "and the same sealed split, so its test would not be independent of this one (step 2 keys "
                            "the alpha by the sealed set)")
+LIMIT_MODEL_REFERENCE = ("a model reference must content-address its weights; step 1 does not check this, so after a "
+                         "retrain the gate records may describe weights the reference no longer points to")
 LIMIT_METRIC_CONFIRMATION = ("the metric confirmation is the decision flag metric_confirmed, set by whoever runs the "
                              "stages; step 1 has no separate channel that shows the sentence to the user")
 
 
 def known_limits(guarantee: str, attempts: list[dict]) -> list[dict]:
     """The report's known limits, from constants and records: the backend's guarantee, the per-project alpha, the
-    metric confirmation flag and the number of `evaluate_sealed` attempts in the attempt log (refused ones too)."""
+    metric confirmation flag, that model references must content-address their weights, and the number of
+    `evaluate_sealed` attempts in the attempt log (refused ones too)."""
     n = sum(1 for a in attempts if a.get("stage") == "evaluate_sealed" and a.get("event") == "start")
     return [{"id": "sealed_guarantee", "text": guarantee},
             {"id": "alpha_per_project", "text": LIMIT_ALPHA_PER_PROJECT},
             {"id": "metric_confirmation", "text": LIMIT_METRIC_CONFIRMATION},
+            {"id": "model_reference", "text": LIMIT_MODEL_REFERENCE},
             {"id": "sealed_evaluations", "attempts": n,
              "text": f"the sealed set was scored in {n} evaluate_sealed attempt{'' if n == 1 else 's'} (refused "
-                     "attempts included); one project allows one evaluated candidate"}]
+                     "attempts included); one project allows one scoring of the sealed set"}]
 
 
 def _round(x: Any) -> Any:

@@ -606,7 +606,8 @@ class ReportTest(GateBase):
         rep, md = self.reports(proj)
         limits = rep["known_limits"]
         self.assertEqual([x["id"] for x in limits],
-                         ["sealed_guarantee", "alpha_per_project", "metric_confirmation", "sealed_evaluations"])
+                         ["sealed_guarantee", "alpha_per_project", "metric_confirmation", "model_reference",
+                          "sealed_evaluations"])
         by_id = {x["id"]: x for x in limits}
         self.assertEqual(by_id["sealed_guarantee"]["text"], UNSEALED_GUARANTEE)
         self.assertEqual(by_id["sealed_guarantee"]["text"], rep["sealed_guarantee"])
@@ -615,6 +616,7 @@ class ReportTest(GateBase):
         self.assertIn("per project", by_id["alpha_per_project"]["text"])
         self.assertIn("same sealed split", by_id["alpha_per_project"]["text"])
         self.assertIn("metric_confirmed", by_id["metric_confirmation"]["text"])
+        self.assertIn("content-address", by_id["model_reference"]["text"])
         self.assertEqual(by_id["sealed_evaluations"]["attempts"], 1)
         self.assertIn("1 evaluate_sealed attempt", by_id["sealed_evaluations"]["text"])
         section = md.split("## Known limits\n", 1)[1]
@@ -992,12 +994,20 @@ class SealedOnceTest(GateBase):
         self.assertEqual(claim["registration_hash"], proj.read_artifact(self.reg_ref(proj))["hash"])
         self.assertTrue((proj.root / InProcessTrust.SEALED_EVALUATION).is_file())
 
-    def test_the_same_candidate_may_be_scored_again(self) -> None:
+    def test_a_second_scoring_of_the_same_candidate_is_refused_and_the_first_still_gates(self) -> None:
+        """Re-review of C1: a model reference need not change when its weights do, so once the sealed test is
+        claimed no new scoring runs, for the same reference either; the recorded scoring is still reused."""
         proj = self.make()
         self.upto_registration(proj)
         first = self.run_(proj, "evaluate_sealed").outputs
-        again = self.run_(proj, "evaluate_sealed", {"rerun": True, "again": 1})
-        self.assertFalse(again.reused)
+        with self.assertRaises(Refused) as cm:
+            self.run_(proj, "evaluate_sealed", {"rerun": True, "again": 1})
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field), ("AN-8", "inputs.candidate_model"))
+        self.assertIn("new sealed data", p.fix)
+        self.assertEqual(proj.read_attempts()[-1]["event"], "refused")
+        again = self.run_(proj, "evaluate_sealed")                          # the recorded scoring, not run again
+        self.assertTrue(again.reused)
         self.assertEqual(again.outputs["candidate_records"].sha256, first["candidate_records"].sha256)
         self.assertEqual(self.gate(proj), "PASS")
 
@@ -1032,6 +1042,62 @@ class SealedOnceTest(GateBase):
             self.run_(proj, "evaluate_sealed")
         self.assertEqual(proj.read_attempts()[-1]["event"], "failed")       # the claim was made before scoring
         self.assertEqual(status(proj, registry=self.registry())["evaluate_sealed"]["status"], "failed")
+
+
+MUTABLE_WEIGHTS: dict = {}
+
+
+def mutable_ref_train() -> type:
+    """A training stage whose model reference names a mutable checkpoint path: retraining overwrites the weights
+    and leaves the reference, and so its sha256, unchanged (re-review probe test_probe_mutable_ref.py)."""
+
+    class _Train(model_stage("train_x", 1.0, True)):
+        def run(self, ctx, decision):
+            MUTABLE_WEIGHTS["ckpt/latest"] = decision.get("rate", 1.0)
+            rec = {"schema": SCHEMA_MODEL_REF, "schema_version": 1, "generator": GENERATOR, "path": "ckpt/latest"}
+            return {"model": ctx.project.write_artifact(self.name, "model", rec, SCHEMA_MODEL_REF)}
+
+    return _Train
+
+
+class MutableReferenceTest(GateBase):
+    def registry(self) -> dict:
+        return {**super().registry(), "train_x": mutable_ref_train()}
+
+    def setUp(self) -> None:
+        super().setUp()
+        MUTABLE_WEIGHTS.clear()
+
+        def gen(model_ref, item, *, sampler, seed):
+            if "path" in model_ref:
+                rate = MUTABLE_WEIGHTS[model_ref["path"]]
+                return LABELS[item["input"]] if _share(item["input"]) < rate * 100 else "wrong"
+            return generate(model_ref, item, sampler=sampler, seed=seed)
+
+        TEST_GENERATORS[GENERATOR] = gen
+        trust_stages._reset_scenario_snapshot()
+
+    def mean(self, proj: Project, out: dict) -> float:
+        rec = proj.read_artifact(out["candidate_records"])
+        return sum(r["score"] for r in rec["records"]) / len(rec["records"])
+
+    def test_best_of_n_through_an_unchanged_reference_is_refused(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+        self.run_(proj, "train_x", {"rate": 0.55, "rerun": True})
+        first = self.run_(proj, "evaluate_sealed", {"rerun": True, "try": 0.55}).outputs
+        self.run_(proj, "train_x", {"rate": 0.9, "rerun": True})            # new weights, same reference sha
+        with self.assertRaises(Refused) as cm:
+            self.run_(proj, "evaluate_sealed", {"rerun": True, "try": 0.9})
+        self.assertEqual(cm.exception.problems[0].rule, "AN-8")
+        res = proj.read_artifact(self.run_(proj, "gate").outputs["gate_result"])
+        self.assertAlmostEqual(res["candidate_score"], self.mean(proj, first))   # the first scoring decides
+        starts = [a for a in proj.read_attempts() if a["stage"] == "evaluate_sealed" and a["event"] == "start"]
+        self.assertEqual(len(starts), 2)
+        rep = proj.read_artifact(self.run_(proj, "report").outputs["report"])
+        lim = next(x for x in rep["known_limits"] if x["id"] == "sealed_evaluations")
+        self.assertEqual(lim["attempts"], 2)
+        self.assertIn("one scoring", lim["text"])
 
 
 if __name__ == "__main__":

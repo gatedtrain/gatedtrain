@@ -83,9 +83,11 @@ gatedtrain project report ./proj
 
 `--pipeline` is the path of a pipeline YAML. `--gpu-hours` is recorded in
 `project.yaml` as the budget; step 1 enforces nothing. `run` of the `gate` stage exits 0 on PASS and 1 otherwise;
-a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. A project scores one
-candidate on its sealed items: `evaluate_sealed` may score the same candidate again but refuses another one. The
-gate spends the project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result
+a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. A project scores its sealed items once:
+after the first scoring `evaluate_sealed` refuses to score again, for the same model reference too (a rerun with
+unchanged inputs returns the recorded scores). A model reference must content-address its weights (for example
+carry their hash); step 1 does not check this, so a reference to a mutable checkpoint path lets the gate records
+describe weights the reference no longer points to after a retrain. The gate spends the project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result
 object per call.
 
 **Trust boundary in step 1.** Stages run in the operator's process. CLI outputs carry only hashes of the sealed
@@ -94,7 +96,7 @@ rewrite, as can the attempt log; the report's `sealed_guarantee` says so ("unsea
 can read the sealed items, and every stage can read and rewrite the trust records and the attempt log").
 Enforcement arrives with the step-2 keeper. In step 1 the alpha is per project: a new project on the same data
 would get a fresh alpha and the same sealed split, so a new test needs new sealed data. The report's known limits
-list these points, that the metric confirmation is the decision flag `metric_confirmed` set by whoever runs the
+list these points, the model-reference rule, that the metric confirmation is the decision flag `metric_confirmed` set by whoever runs the
 stages, and how many `evaluate_sealed` attempts the project made.
 
 `project create` copies the pipeline into `<root>/pipeline.yaml` and records its sha256; the project refuses a copy
