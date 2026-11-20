@@ -15,9 +15,10 @@ from gatedtrain.ainative.pipeline import load_pipeline, pipeline_problems
 from gatedtrain.ainative.project import Project, create_project
 from gatedtrain.ainative.stage import TRUST_STAGES, Proposal, stage_registry
 from gatedtrain.ainative.trust import InProcessTrust, SealedRef
-from gatedtrain.ainative.trust_stages import IntakeSeal, Preregister
+from gatedtrain.ainative import scorers
+from gatedtrain.ainative.trust_stages import SCHEMA_DEPLOYMENT, IntakeSeal, Preregister
 from gatedtrain.errors import Refused
-from gatedtrain.registration import check_contents
+from gatedtrain.registration import check_contents, resolved_evaluator_hash
 
 MiB = 1024 * 1024
 SCHEMA_MODEL = "gatedtrain.ainative.fake_model"
@@ -37,6 +38,31 @@ class FakeTrain:
 
     def run(self, ctx, decision):
         return {"model": ctx.project.write_artifact(self.name, "model", {"w": 1}, SCHEMA_MODEL)}
+
+    def check(self, ctx, outputs):
+        return []
+
+
+DEPLOY = {"schema": SCHEMA_DEPLOYMENT, "schema_version": 1,
+          "sampler": {"name": "registered-sampler", "temperature": 0.9, "max_new_tokens": 32}, "eval_seeds": [11, 12]}
+
+
+class ChooseDeployment:
+    """Stands in for the pluggable stage (choose_task_and_base) that produces the deployment record."""
+    name = "choose_x"
+    version = "1"
+    inputs: dict = {}
+    outputs = {"deployment": SCHEMA_DEPLOYMENT}
+    needs: frozenset = frozenset()
+    params: frozenset = frozenset()
+    trains = False
+    record = DEPLOY
+
+    def plan(self, ctx):
+        return Proposal(self.name, "choose", {}, {})
+
+    def run(self, ctx, decision):
+        return {"deployment": ctx.project.write_artifact(self.name, "deployment", self.record, SCHEMA_DEPLOYMENT)}
 
     def check(self, ctx, outputs):
         return []
@@ -67,8 +93,9 @@ class Base(unittest.TestCase):
         d.write_bytes(data)
         spec = {"name": "t", "training_stages": ["train_x"], "stages": [
             {"name": "intake_seal", "stage": "intake_seal"},
+            {"name": "choose_x", "stage": "choose_x"},
             {"name": "preregister", "stage": "preregister",
-             "inputs": {"sealed_summary": "intake_seal.sealed_summary"}},
+             "inputs": {"sealed_summary": "intake_seal.sealed_summary", "deployment": "choose_x.deployment"}},
             {"name": "train_x", "stage": "train_x"},
             {"name": "evaluate_sealed", "stage": "evaluate_sealed"},
             {"name": "gate", "stage": "gate"},
@@ -79,7 +106,7 @@ class Base(unittest.TestCase):
 
     @staticmethod
     def registry() -> dict:
-        return {**stage_registry(), "train_x": FakeTrain}
+        return {**stage_registry(), "train_x": FakeTrain, "choose_x": ChooseDeployment}
 
     def run_(self, project: Project, ref: str, decision: dict | None = None):
         return run_stage(project, ref, decision or {}, registry=self.registry())
@@ -276,6 +303,7 @@ class PreregisterTest(Base):
     def intake(self, n: int = 400, **kw) -> Project:
         proj = self.make(jsonl(rows(n)), **kw)
         self.run_(proj, "intake_seal")
+        self.run_(proj, "choose_x")
         return proj
 
     def test_plan_asks_for_the_metric_in_one_plain_sentence(self) -> None:
@@ -316,6 +344,14 @@ class PreregisterTest(Base):
         self.assertEqual(full["clause"]["alpha"], 0.05)
         self.assertEqual(full["sigma_pilot"]["sigma"], 0.5)
         self.assertNotIn("post_hoc", full)
+        self.assertEqual(full["sampler"], DEPLOY["sampler"])             # the registered sampler is the deployment's
+        self.assertEqual(full["clause"]["eval_seeds"], [11, 12])
+        self.assertEqual(full["clause"]["samples_per_item"], 2)
+        ev = full["evaluators"][0]
+        self.assertEqual(ev["id"], scorers.EVALUATOR_ID)
+        self.assertEqual(ev["manifest_hash"], resolved_evaluator_hash({"id": scorers.EVALUATOR_ID}))
+        self.assertEqual(ev["manifest_hash"], scorers.manifest_hash())
+        self.assertEqual(check_contents(full, evaluator_id=scorers.EVALUATOR_ID), [])
 
     def test_user_may_change_the_margin_and_the_registration_still_passes(self) -> None:
         proj = self.intake()
@@ -368,18 +404,109 @@ class PreregisterTest(Base):
                                                                   "rerun": True}).outputs["registration"])
         self.assertTrue(back["post_hoc"])                   # going back to the old values does not undo it
 
+    def test_registration_follows_the_deployment_record(self) -> None:
+        proj = self.make(jsonl(rows(400)), name="other")
+        self.run_(proj, "intake_seal")
+        other = {**DEPLOY, "sampler": {"name": "s2", "temperature": 0.5, "max_new_tokens": 8}, "eval_seeds": [3]}
+        reg = {**self.registry(), "choose_x": type("C", (ChooseDeployment,), {"record": other})}
+        run_stage(proj, "choose_x", {}, registry=reg)
+        out = run_stage(proj, "preregister", {"metric_confirmed": True}, registry=reg).outputs
+        full = InProcessTrust(proj).registration(proj.read_artifact(out["registration"])["hash"])
+        self.assertEqual(full["sampler"], other["sampler"])
+        self.assertEqual(full["clause"]["eval_seeds"], [3])
+
+    def test_bad_deployment_is_refused(self) -> None:
+        bads = [{**DEPLOY, "sampler": {"name": "s", "temperature": 0, "max_new_tokens": 8}},
+                {**DEPLOY, "eval_seeds": []}, {**DEPLOY, "eval_seeds": [1, 1]},
+                {k: v for k, v in DEPLOY.items() if k != "sampler"}]
+        for i, rec in enumerate(bads):
+            proj = self.make(jsonl(rows(400)), name=f"bad{i}")
+            self.run_(proj, "intake_seal")
+            reg = {**self.registry(), "choose_x": type("C", (ChooseDeployment,), {"record": rec})}
+            run_stage(proj, "choose_x", {}, registry=reg)
+            with self.assertRaises(Refused):
+                run_stage(proj, "preregister", {"metric_confirmed": True}, registry=reg)
+            self.assertFalse((proj.root / "trust" / "registrations").exists())
+
+    def test_deployment_input_is_required(self) -> None:
+        self.assertEqual(Preregister.inputs, {"sealed_summary": "gatedtrain.ainative.sealed_summary",
+                                              "deployment": SCHEMA_DEPLOYMENT})
+
+    def test_training_start_is_logged_and_read_from_the_log_not_the_spec(self) -> None:
+        proj = self.intake()
+        self.run_(proj, "preregister", {"metric_confirmed": True})
+        self.run_(proj, "train_x")
+        starts = {r["stage"]: r["trains"] for r in proj.read_attempts() if r["event"] == "start"}
+        self.assertEqual(starts, {"intake_seal": False, "choose_x": False, "preregister": False, "train_x": True})
+        # Renaming the training stage in the pipeline spec must not hide that it ran.
+        path = Path(proj.pipeline)
+        spec = yaml.safe_load(path.read_text())
+        spec["training_stages"] = ["train_y"]
+        for st in spec["stages"]:
+            if st["name"] == "train_x":
+                st["name"] = "train_y"
+        path.write_text(yaml.safe_dump(spec))
+        out = self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.3, "rerun": True}).outputs
+        self.assertTrue(proj.read_artifact(out["registration"])["post_hoc"])
+
+    def test_post_hoc_stickiness_reads_the_trust_store(self) -> None:
+        proj = self.intake()
+        self.run_(proj, "preregister", {"metric_confirmed": True})
+        self.run_(proj, "train_x")
+        second = proj.read_artifact(self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.03,
+                                                                    "rerun": True}).outputs["registration"])
+        # An edited output record cannot clear the mark.
+        edited = dict(second, post_hoc=False)
+        proj.write_artifact("preregister", "registration", edited, "gatedtrain.ainative.registration")
+        with self.assertRaises(Refused):                    # the hash chain refuses the edited record
+            self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.03, "note": "x", "rerun": True})
+
     def test_check_flags_a_registration_that_no_longer_matches(self) -> None:
         proj = self.intake()
         out = self.run_(proj, "preregister", {"metric_confirmed": True}).outputs
         from gatedtrain.ainative.stage import StageContext
         from gatedtrain.ainative.trust import FixedAlphaLedger
-        inputs = {"sealed_summary": self.run_(proj, "intake_seal").outputs["sealed_summary"]}
+        inputs = {"sealed_summary": self.run_(proj, "intake_seal").outputs["sealed_summary"],
+                  "deployment": self.run_(proj, "choose_x").outputs["deployment"]}
         ctx = StageContext(proj, inputs, {}, InProcessTrust(proj), FixedAlphaLedger(proj))
         self.assertEqual(Preregister().check(ctx, out), [])
         reg = proj.read_artifact(out["registration"])
         bad = dict(reg, item_set_hash="sha256:" + "0" * 64)
         ref = proj.write_artifact("preregister", "registration", bad, out["registration"].schema)
         self.assertTrue(Preregister().check(ctx, {"registration": ref}))
+
+    def test_check_flags_an_unresolvable_evaluator_hash(self) -> None:
+        proj = self.intake()
+        out = self.run_(proj, "preregister", {"metric_confirmed": True}).outputs
+        from gatedtrain.ainative.stage import StageContext
+        from gatedtrain.ainative.trust import FixedAlphaLedger
+        trust = InProcessTrust(proj)
+        full = trust.registration(proj.read_artifact(out["registration"])["hash"])
+        full["evaluators"][0]["manifest_hash"] = "sha256:" + "1" * 64
+        digest = trust.register(full)
+        out_rec = dict(proj.read_artifact(out["registration"]), hash=digest)
+        ref = proj.write_artifact("preregister", "registration", out_rec, "gatedtrain.ainative.registration")
+        ins = {"sealed_summary": self.run_(proj, "intake_seal").outputs["sealed_summary"],
+               "deployment": self.run_(proj, "choose_x").outputs["deployment"]}
+        ctx = StageContext(proj, ins, {}, trust, FixedAlphaLedger(proj))
+        self.assertTrue(any("evaluator" in p.field for p in Preregister().check(ctx, {"registration": ref})))
+
+
+class ScorerTest(unittest.TestCase):
+    def test_exact_match(self) -> None:
+        em = scorers.exact_match
+        self.assertEqual(em("a", "a"), 1.0)
+        self.assertEqual(em("a", "b"), 0.0)
+        self.assertEqual(em({"x": 1, "y": [2]}, {"y": [2], "x": 1}), 1.0)
+        self.assertEqual(em(1, "1"), 0.0)
+        self.assertEqual(em(float("nan"), 1), 0.0)
+
+    def test_evaluator_id_resolves_to_a_hash_bound_to_the_scorer_source(self) -> None:
+        h = resolved_evaluator_hash({"id": scorers.EVALUATOR_ID})
+        self.assertEqual(h, scorers.manifest_hash())
+        self.assertRegex(h, r"^sha256:[0-9a-f]{64}$")
+        from gatedtrain.canonical import file_sha256
+        self.assertIn(file_sha256(Path(scorers.__file__)), scorers.manifest_document()["code"].values())
 
 
 if __name__ == "__main__":

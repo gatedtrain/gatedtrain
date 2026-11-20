@@ -147,6 +147,10 @@ def resolved_evaluator_hash(evaluator: dict) -> str | None:
 
         scorer = evaluator.get("scorer")
         return evaluator_identity_hash(scorer if isinstance(scorer, str) else None)
+    from .ainative import scorers as ainative_scorers
+
+    if evaluator.get("id") == ainative_scorers.EVALUATOR_ID:
+        return ainative_scorers.manifest_hash()
     from .ext.registry import EVALUATOR_ROWS, evaluator_identity_hash as ext_identity_hash
 
     if evaluator.get("id") in EVALUATOR_ROWS:

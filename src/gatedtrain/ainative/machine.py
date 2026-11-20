@@ -3,7 +3,8 @@
 Runs a project through its validated pipeline. State lives only in the project's artifacts and `attempts.jsonl`
 (`status` is derived from them), so a new process after a crash sees the same status.
 
-Attempt lines: `{stage, attempt, key, event, utc}` with `event` one of `start`, `done` (also lists the outputs),
+Attempt lines: `{stage, attempt, key, event, utc}` with `event` one of `start` (also `trains`: whether the stage trains, resolved at run time),
+`done` (also lists the outputs),
 `failed` (also names the error) and `stale` (an audit note that a rerun of an earlier stage invalidated this one).
 A `done` line records the key parts (`stage_type`, `version`, `params_sha256`, `input_sha256s`, `decision_sha256`).
 Staleness is derived from those parts, never from `stale` lines: a done stage is `stale` when its recorded type,
@@ -28,7 +29,7 @@ from typing import Any
 
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
-from .pipeline import PipelineSpec, StageRef, load_pipeline, pipeline_problems
+from .pipeline import PipelineSpec, StageRef, _is_training, load_pipeline, pipeline_problems
 from .project import ArtifactRef, Project, _utc_now
 from .stage import Proposal, StageContext, stage_registry
 from .trust import AlphaLedger, FixedAlphaLedger, InProcessTrust, TrustBackend
@@ -239,7 +240,9 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
                 _event(project, later.name, ls["attempts"], ls["key"], "stale", cause=sref.name)
 
     attempt = cur["attempts"] + 1
-    _event(project, sref.name, attempt, key, "start")
+    # Resolved now, from the registry class and the spec, and recorded: later readers (preregister's post hoc test)
+    # trust the log, not the pipeline file, which can be edited afterwards.
+    _event(project, sref.name, attempt, key, "start", trains=_is_training(spec, sref, cls))
     ctx = _context(project, sref, inputs, trust, ledger)
     try:
         outputs = stage.run(ctx, decision)

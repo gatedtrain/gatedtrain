@@ -32,6 +32,7 @@ ESTIMATORS = ("mean", "ratio_of_sums")
 # writes a numerator and denominator, so neither declares `ratio_of_sums`.
 EVALUATORS: dict[str, dict[str, Any]] = {
     "gsm8k.nemo_evaluator@0.1": {"direction": "higher_is_better", "score_range": (0.0, 1.0), "estimators": ("mean",)},
+    "exact_match.ainative@0.1": {"direction": "higher_is_better", "score_range": (0.0, 1.0), "estimators": ("mean",)},
     "addition_em.cpu_stub@0.1": {"direction": "higher_is_better", "score_range": (0.0, 1.0), "estimators": ("mean",)},
 }
 

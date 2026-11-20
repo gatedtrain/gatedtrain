@@ -10,6 +10,11 @@ confirms it in one plain sentence (`decision["metric_confirmed"]` must be true),
 `registration.check_contents`. A later run with different values after a training stage ran amends the
 registration and marks it `post_hoc` (an output field the report reads).
 
+`preregister` reads the deployment record (`gatedtrain.ainative.deployment`: `{"sampler": {...}, "eval_seeds": [...]}`)
+that a pluggable stage before it produces, and copies the sampler and the evaluation seeds into the registration.
+`evaluate_sealed` must use exactly the registered sampler and eval_seeds and score only with
+`scorers.exact_match`; the registered evaluator is `scorers.EVALUATOR_ID` with the hash of the scorer's source.
+
 Both stages take no pipeline params: their behaviour comes from the project's data, the user's decision and the
 registration, never from pipeline configuration.
 """
@@ -24,7 +29,8 @@ from typing import Any
 from .. import ANALYSIS_CODE_VERSION, gates
 from ..canonical import canonical_json, file_sha256, sha256_bytes
 from ..errors import Problem, Refused
-from ..registration import check_contents
+from ..registration import check_contents, resolved_evaluator_hash
+from . import scorers
 from .project import ArtifactRef, Project, _utc_now
 from .stage import Proposal, StageContext
 from .trust import SealedRef
@@ -34,6 +40,7 @@ SCHEMA_TRAIN_PART = "gatedtrain.ainative.train_part"
 SCHEMA_SEALED_SUMMARY = "gatedtrain.ainative.sealed_summary"
 SCHEMA_POWER = "gatedtrain.ainative.power"
 SCHEMA_REGISTRATION = "gatedtrain.ainative.registration"
+SCHEMA_DEPLOYMENT = "gatedtrain.ainative.deployment"
 
 MAX_DATA_BYTES = 64 * 1024 * 1024
 DEFAULT_MDE = 0.10
@@ -260,17 +267,11 @@ class IntakeSeal:
 # preregister
 # ---------------------------------------------------------------------------
 
-_EXACT_CODE_SHA256 = sha256_bytes(canonical_json(
-    {"scorer": "exact_match", "version": 1, "rule": "canonical JSON of the response equals canonical JSON of the label"}))
-
-# The scorer library of step 1. Each scorer names the evaluator that registers it, its direction and the hash of its
-# code (the registered identity). The training reward may differ from the deciding scorer.
+# The scorer library of step 1. Each scorer names the evaluator id that registers it and its direction; the evaluator's
+# manifest hash comes from the scorer's source (`scorers.manifest_hash`). The training reward may differ.
 SCORERS: dict[str, dict] = {
-    "exact_match": {"evaluator": "addition_em.cpu_stub@0.1", "direction": "higher_is_better",
-                    "what": "the share of items whose answer matches yours exactly", "code_sha256": _EXACT_CODE_SHA256,
-                    "manifest_hash": sha256_bytes(canonical_json(
-                        {"evaluator": "addition_em.cpu_stub@0.1", "scorer": "exact_match",
-                         "code_sha256": _EXACT_CODE_SHA256}))},
+    "exact_match": {"evaluator": scorers.EVALUATOR_ID, "direction": scorers.DIRECTION,
+                    "what": "the share of items whose answer matches yours exactly"},
 }
 DEFAULT_SCORER = "exact_match"
 MAX_MARGIN = 0.5
@@ -315,7 +316,16 @@ def _sentence(v: dict, n_sealed: int) -> str:
             f"{points} points, tested at the {v['alpha']:g} significance level on {n_sealed} sealed items.")
 
 
-def _registration(v: dict, item_set_hash: str) -> dict:
+def _deployment(ctx: StageContext) -> dict:
+    dep = ctx.project.read_artifact(ctx.inputs["deployment"])
+    seeds = dep.get("eval_seeds") if isinstance(dep, dict) else None
+    if not (isinstance(dep, dict) and isinstance(dep.get("sampler"), dict) and isinstance(seeds, list) and seeds):
+        raise _refuse7("inputs.deployment", "the deployment record has no sampler mapping and non-empty eval_seeds",
+                       "rerun the stage that produces the deployment record")
+    return {"sampler": dep["sampler"], "eval_seeds": seeds}
+
+
+def _registration(v: dict, item_set_hash: str, dep: dict) -> dict:
     row = SCORERS[v["scorer"]]
     return {
         "registration_version": 1,
@@ -325,14 +335,15 @@ def _registration(v: dict, item_set_hash: str) -> dict:
         "gate": "quality_gate",
         "clause": {"type": "superiority", "metric": v["scorer"], "direction": v["direction"], "margin": v["margin"],
                    "alpha": v["alpha"], "power": DEFAULT_POWER, "planning_effect": v["margin"] + DEFAULT_MDE,
-                   "sigma_plan": "fixed", "unit": "item", "samples_per_item": 1, "eval_seeds": [0],
+                   "sigma_plan": "fixed", "unit": "item", "samples_per_item": len(dep["eval_seeds"]),
+                   "eval_seeds": list(dep["eval_seeds"]),
                    "interval": "cluster_bootstrap", "blocking": True},
         "margin_justification": f"Margin {v['margin']:g} (fraction of the {v['scorer']} score) as confirmed by the "
                                 "user before any training.",
         "sigma_pilot": {"sigma": PILOT_SIGMA, "source": "the maximum SD of a 0/1 score (exact match)"},
         "eval_distribution": {"item_set_hash": item_set_hash, "env_version": None, "env_params_version": None},
-        "sampler": {"name": "deployment", "temperature": 0.7, "max_new_tokens": 64},
-        "evaluators": [{"id": row["evaluator"], "manifest_hash": row["manifest_hash"]}],
+        "sampler": dict(dep["sampler"]),
+        "evaluators": [{"id": row["evaluator"], "manifest_hash": scorers.manifest_hash()}],
         "multiplicity": {"plan": "single_gate", "family": None},
         "analysis_code_version": ANALYSIS_CODE_VERSION,
         "bootstrap": {"replicates": 10000, "seed": int(item_set_hash.removeprefix("sha256:")[:8], 16)},
@@ -343,15 +354,15 @@ _AMEND_KEYS = ("amends", "created_at", "post_hoc")
 
 
 def _training_ran(project: Project) -> bool:
-    """True when any attempt of a training stage is on record (a started stage may already have trained)."""
-    from .machine import _load_spec
-    from .pipeline import _is_training
-    from .stage import stage_registry
-
-    spec = _load_spec(project)
-    registry = stage_registry()
-    trains = {s.name: _is_training(spec, s, registry.get(s.stage)) for s in spec.stages}
-    return any(trains.get(row.get("stage"), False) for row in project.read_attempts())
+    """True when the attempt log shows a stage that trains starting after the first `preregister` run was done.
+    Reads only the log (`start` rows carry `trains`, resolved at run time), never the editable pipeline file."""
+    done = False
+    for row in project.read_attempts():
+        if row.get("event") == "done" and row.get("stage_type") == "preregister":
+            done = True
+        elif done and row.get("event") == "start" and row.get("trains") is True:
+            return True
+    return False
 
 
 def _prior(ctx: StageContext) -> tuple[dict, dict] | None:
@@ -373,7 +384,7 @@ def _prior(ctx: StageContext) -> tuple[dict, dict] | None:
 class Preregister:
     name = "preregister"
     version = "1"
-    inputs = {"sealed_summary": SCHEMA_SEALED_SUMMARY}
+    inputs = {"sealed_summary": SCHEMA_SEALED_SUMMARY, "deployment": SCHEMA_DEPLOYMENT}
     outputs = {"registration": SCHEMA_REGISTRATION}
     needs = frozenset({"user"})
     params: frozenset[str] = frozenset()
@@ -394,7 +405,7 @@ class Preregister:
                            "they agree (they may change scorer or margin first)")
         v = _values(ctx, decision)
         item_hash = _sealed_summary(ctx)["manifest_sha256"]
-        base = _registration(v, item_hash)
+        base = _registration(v, item_hash, _deployment(ctx))
         problems = check_contents(base)
         if problems:
             raise Refused(problems)
@@ -403,7 +414,7 @@ class Preregister:
         if prior is not None:
             prior_out, prior_full = prior
             changed = {k: x for k, x in prior_full.items() if k not in _AMEND_KEYS} != base
-            if prior_out.get("post_hoc") is True or (changed and _training_ran(ctx.project)):
+            if prior_full.get("post_hoc") is True or (changed and _training_ran(ctx.project)):
                 post_hoc, amends = True, prior_out["hash"]
                 final = {**base, "post_hoc": True, "amends": amends, "created_at": _utc_now()}
                 problems = check_contents(final)
@@ -432,6 +443,11 @@ class Preregister:
                 bad(f"registration.{key}", f"the output record and the registration disagree on {key}")
         if clause.get("metric") != out.get("scorer"):
             bad("registration.scorer", "the output record and the registration disagree on the scorer")
+        evs = full.get("evaluators")
+        ev = evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict) else {}
+        if ev.get("id") != scorers.EVALUATOR_ID or ev.get("manifest_hash") != resolved_evaluator_hash(ev):
+            bad("registration.evaluators[0].manifest_hash",
+                "the registered evaluator hash is not the one the library resolves for the scorer")
         if bool(full.get("post_hoc", False)) != out.get("post_hoc"):
             bad("registration.post_hoc", "the output record and the registration disagree on post_hoc")
         return problems
