@@ -326,9 +326,38 @@ class ChainTests(Base):
         _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10, c20])
         self.assertEqual(self.rules(probs), ["EXT-RES-2"])
 
-    def test_restore_of_older_cut_refuses_without_writer_info(self):
-        c10, c20, c30 = self.make_cut(10), self.make_cut(20), self.make_cut(30)
-        _, probs = self.chain([rec(1), rec(2, self.rs(c20)), rec(3, self.rs(c10), "ok")], [c10, c20, c30])
+    def test_older_cut_restore_when_attempt_one_wrote_newer_refuses(self):
+        # The case a step-only rule cannot catch: attempt 1 wrote 10 and 20, attempt 2 restores 10 and is final.
+        c10, c20 = self.make_cut(10, 1), self.make_cut(20, 1)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10, c20])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_missing_attempt_in_resumed_run_refuses(self):
+        c10 = self.make_cut(10)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+        self.assertIn("does not record the attempt that wrote it", probs[0].message)
+
+    def test_non_positive_or_bool_attempt_refuses(self):
+        for bad in (0, -1, True, "1"):
+            c10 = self.make_cut(10, bad)
+            _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10])
+            self.assertEqual(self.rules(probs), ["EXT-RES-2"], bad)
+
+    def test_single_attempt_may_omit_attempt(self):
+        c10 = self.make_cut(10)
+        segs, probs = self.chain([rec(1, None, "ok")], [c10])
+        self.assertEqual((probs, len(segs)), ([], 1))
+
+    def test_cut_attributed_to_nonexistent_attempt_refuses(self):
+        c10 = self.make_cut(10, 7)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+
+    def test_cut_step_not_above_writers_branch_step_refuses(self):
+        c10, c20 = self.make_cut(10, 1), self.make_cut(20, 2)
+        c5 = self.make_cut(5, 3)
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10)), rec(3, self.rs(c20), "ok")], [c5, c10, c20])
         self.assertEqual(self.rules(probs), ["EXT-RES-2"])
 
     def test_restore_of_uncommitted_cut_refuses(self):

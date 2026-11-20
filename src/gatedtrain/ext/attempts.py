@@ -21,14 +21,14 @@ whose `end` line has status "ok". Every other non-empty attempt has no `end` lin
 
 Segment rule (design 5.2, 05 12.4; linear chains only). Empty attempts are skipped. The first non-empty attempt
 has `restore` null. Attempt k>1 restores the newest committed cut written by attempts 1..k-1 (EXT-RES-2). A cut
-is committed when it is in the `cuts` list ext-collect passes in; its writer is the integer `attempt` of its
-`cut.json` when every committed cut has one. Without writer information the check is weaker: the named cut must
-be committed and no older than the previous attempt's restore (a restore of an older cut is a rollback), and a
-null restore is accepted. The restore's `last_step_included` and `cut_json_sha256` must match the cut and its
-`cut.json` bytes (read without following links). A repaired restore is checked the same way (EXT-RES-7 adds its
-own validity checks). A later attempt with no earlier cut restores nothing and starts at branch step 0. A
-non-final segment ends at the next attempt's branch step; the final one at `max_steps`. A record of attempt A is
-kept iff `branch_step_A < step <= end_step_A` (EXT-RES-4)."""
+is committed when it is in the `cuts` list ext-collect passes in. With more than one non-empty attempt, every
+committed cut's `cut.json` must carry a positive integer `attempt` (its writer), naming one of the non-empty
+attempts, with a step above that writer's branch step; otherwise the chain refuses (there is no step-based
+fallback). A single-attempt run may omit the field. The restore's `last_step_included` and `cut_json_sha256` must
+match the cut and its `cut.json` bytes (read without following links). A repaired restore is checked the same way
+(EXT-RES-7 adds its own validity checks). A later attempt with no earlier cut restores nothing and starts at
+branch step 0. A non-final segment ends at the next attempt's branch step; the final one at `max_steps`. A record
+of attempt A is kept iff `branch_step_A < step <= end_step_A` (EXT-RES-4)."""
 
 from __future__ import annotations
 
@@ -302,10 +302,24 @@ def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts
         if step not in info:
             sha, doc = _read_cut(Path(path))
             info[step] = (Path(path), sha, doc)
-    writer = {st: i[2].get("attempt") if i[2] else None for st, i in info.items()}
-    use_writer = bool(info) and all(isinstance(w, int) and not isinstance(w, bool) for w in writer.values())
-
     ne = [r for _, r in aligned if r is not None]
+    writer: dict[int, int] = {}
+    if len(ne) > 1:
+        known = {r.attempt for r in ne}
+        for st in sorted(info):
+            w = info[st][2].get("attempt") if info[st][2] else None
+            if not isinstance(w, int) or isinstance(w, bool) or w < 1:
+                problems.append(Problem("EXT-RES-2", f"cuts/{info[st][0].name}",
+                                        f"cut {info[st][0].name} does not record the attempt that wrote it; a "
+                                        "resumed run's cuts must", "write the integer `attempt` into every cut.json"))
+            elif w not in known:
+                problems.append(Problem("EXT-RES-2", f"cuts/{info[st][0].name}",
+                                        f"cut {info[st][0].name} records attempt {w}, which is not one of the run's "
+                                        "non-empty attempts", "collect the run's own cuts"))
+            else:
+                writer[st] = w
+        if problems:
+            return [], problems
     segs: list[Segment] = []
     steps: list[int] = []                 # branch step of each non-empty attempt (0 for the first)
     for idx, r in enumerate(ne):
@@ -316,16 +330,12 @@ def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts
             steps.append(0)
             segs.append(Segment(r.attempt, f"{run_id}.{r.attempt}", None, None, max_steps, None))
             continue
-        prev_step = steps[-1]
-        if use_writer:
-            earlier = {e.attempt for e in ne[:idx]}
-            cand = [st for st, w in writer.items() if w in earlier]
-            expected = max(cand) if cand else None
-        else:
-            expected = None
+        earlier = {e.attempt for e in ne[:idx]}
+        cand = [st for st, w in writer.items() if w in earlier]
+        expected = max(cand) if cand else None
         branch = 0
         if rs is None:
-            if use_writer and expected is not None:
+            if expected is not None:
                 p2(r.attempt, f"the attempt restores no cut although checkpoint-{expected} was committed")
         else:
             step = rs.get("last_step_included")
@@ -340,16 +350,19 @@ def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts
                     p2(r.attempt, f"cut_json_sha256 of {name} does not match its cut.json")
                 if "last_step_included" in doc and doc["last_step_included"] != step:
                     p2(r.attempt, f"last_step_included {step} of {name} does not match its cut.json")
-                if use_writer and step != expected:
+                if step != expected:
                     p2(r.attempt, f"{name} is not the newest committed cut of the earlier attempts "
                                   f"(checkpoint-{expected})")
-                elif not use_writer and step < prev_step:
-                    p2(r.attempt, f"{name} is older than the previous attempt's restore (checkpoint-{prev_step})")
         steps.append(branch)
         prev = segs[-1]
         segs[-1] = Segment(prev.attempt, prev.attempt_id, prev.parent, prev.branch_step, branch, prev.restore_cut)
         segs.append(Segment(r.attempt, f"{run_id}.{r.attempt}", prev.attempt, branch, max_steps,
                             rs.get("cut") if rs else None))
+    by_attempt = {sg.attempt: sg for sg in segs}
+    for st, w in sorted(writer.items()):
+        if st <= (by_attempt[w].branch_step or 0):
+            p2(w, f"{info[st][0].name} is recorded as written by attempt {w} but its step is not above that "
+                  f"attempt's branch step {by_attempt[w].branch_step or 0}")
     return segs, problems
 
 
