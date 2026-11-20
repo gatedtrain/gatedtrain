@@ -92,7 +92,8 @@ class TestOutputRefNoLink(OutputRefCase):
         (self.arm / "out" / "a.txt").write_bytes(b"output")
         os.link(self.arm / "out" / "a.txt", self.arm / "hard.txt")
         self.assertIsNone(self.problem("out/a.txt", sha(b"output")))
-        self.assertIsNone(self.problem("./out//a.txt", sha(b"output")))
+        self.assertEqual(self.problem("./out//a.txt", sha(b"output")),
+                         "output_ref path './out//a.txt' is not in canonical form (no `.` or empty component)")
         self.assertIsNone(self.problem("hard.txt", sha(b"output")), "a hard link is a regular file (MM-1)")
 
     def test_symbolic_links_refused(self):
@@ -160,7 +161,7 @@ class TestOutputRefNoLink(OutputRefCase):
         (self.arm / "out" / "a.txt").write_bytes(b"x")
         self.assertEqual(self.problem("out/a.txt", sha(b"y")), "output_ref file 'out/a.txt' differs from its sha256")
         missing = self.tmp / "no-arm"
-        self.assertIn("the arm directory cannot be (ENOENT)", self.problem("f", arm=missing))
+        self.assertIn("the arm directory is absent", self.problem("f", arm=missing))
 
     @unittest.skipIf(os.geteuid() == 0, "root opens a 0000 file")
     def test_unreadable_file(self):
@@ -182,7 +183,7 @@ class TestOutputRefNoLink(OutputRefCase):
         self.assertTrue(why and why[0].endswith("items.jsonl cannot be read (ENAMETOOLONG)"), why)
         self.assertEqual(arm_mod.provenance_problems(Path(arm), {"eval_seeds": [1]}, nel_benchmark=None),
                          ["merge.json cannot be read (ENAMETOOLONG); provenance cannot be checked"])
-        self.assertIn("the arm directory cannot be (ENAMETOOLONG)", self.problem("x", arm=arm))
+        self.assertIn("the arm directory cannot be opened (ENAMETOOLONG)", self.problem("x", arm=arm))
 
 
 class TestCopyChecked(OutputRefCase):
@@ -255,11 +256,11 @@ class TestMergeCopiesCheckedBytes(unittest.TestCase):
         runs = self.arms("swap")
         real = arm_mod.copy_output_ref
 
-        def swap_then_copy(arm, ref, dst, *, flag):
+        def swap_then_copy(arm, ref, dst, *, flag, key=None):
             p = Path(arm) / ref["path"]
             p.unlink()
             p.symlink_to(secret)
-            return real(arm, ref, dst, flag=flag)
+            return real(arm, ref, dst, flag=flag, key=key)
 
         out = self.tmp / "swap" / "out"
         with mock.patch.object(merge_mod, "copy_output_ref", swap_then_copy):

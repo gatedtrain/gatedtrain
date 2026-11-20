@@ -237,7 +237,8 @@ class TestRoundTripEqualsTierB(unittest.TestCase):
         for arm, ckpt in (("baseline", sc.base), ("candidate", sc.final_cut)):
             p = convert(sc, arms[arm], runs[arm], checkpoint=ckpt)
             self.assertEqual(p.returncode, EXIT_OK, describe(p))
-        ext_proc = sc.collect(tmp / "runs-ext", baseline=arms["baseline"], candidate=arms["candidate"])
+        ext_proc = sc.collect(tmp / "runs-ext", baseline=arms["baseline"], candidate=arms["candidate"],
+                              sources_root=tmp)
         self.assertEqual(ext_proc.returncode, EXIT_OK, describe(ext_proc))
         ext_rep = load_report(parse_run_dir(ext_proc.stdout))
         for k in self.KEYS:

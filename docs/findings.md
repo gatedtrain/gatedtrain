@@ -579,8 +579,56 @@ fix; the reproductions are now tests (`tests/test_path_review.py`, tests/README.
   had a regular file in the middle, so a 3.12-style loop (stop and keep the rest), an undetected loop (a hang) and
   catching only `FileNotFoundError` and `PermissionError` (ENOTDIR) survived. `test_fixed_values` pins values that
   3.12 and 3.13 both give (`loop1/x`, `loop1/../a`, `a/f/x`, `a/f/..`, ...), and a `SIGALRM` watchdog fails a test
-  that does not end in 30 s. The review's mutants M1a, M1b and M2b are killed on 3.12 and 3.13.
+  that does not end in 30 s. The review's mutants (edits of `paths.realpath`) are killed on 3.12 and 3.13: M1a
+  drops the loop check (resolution never ends), M1b stops at a loop and keeps the rest (3.12's behaviour), M2b
+  catches only `FileNotFoundError` and `PermissionError` (ENOTDIR below a regular file raises).
 - **T3.** A loop as an `output_ref` component is a case of `test_path_review` (refused as a symbolic link).
 - **T4.** A loop and an unreadable link (`/proc/1/root`) at the launch record's `output_dir` against `--stage-out`,
   the SDK's `bound_mounts` and the diffusers family's mount checks give a mismatch or no binding, never a traceback.
-- **T5.** Not addressed in this change.
+- **T5.** `test_paths.test_unreadable_link_is_kept` skips where `/proc/1/root` is readable (as root); accepted.
+
+## Review of PR 2 (2026-11-19)
+
+Four reviews and a verifier of the change above (gatedtrain PR 2) found that the arm's own files and the provenance
+sources were still read by path. Each finding was reproduced before the fix and is now a test
+(`tests/test_arm_reads.py`, `test_r18_clauses.CollectTwoClauses`, tests/README.md section 11.34).
+
+- **A1 (blocking).** `ext-collect` copied `items.jsonl`, `eval_meta.json` and `merge.json` into the run by path
+  (`is_file`, `shutil.copyfile`, following links) after checking them, so a container still writing its arm could
+  swap one for a link to a host file between the checks and the copy, and the run's `items.jsonl` could differ
+  from the records gated. New module `ext/armfs.py`: `ArmSnapshot.read` opens the arm directory once and reads the
+  three files once each (without following links, at most 1 GiB) with their SHA-256; `read_meta`, `read_lines`,
+  `provenance_problems` and the EXT-52 re-derivation parse those bytes, and `ext-collect` writes them into the run.
+- **A2.** `provenance_problems` hashed any host path named in `merge.json` (`sources[].path`, `run_dir`), printed
+  the hash (an oracle for host files) and blocked on a FIFO. Sources must now be absolute paths in normal form
+  under the sources root (the host's output root, or the new `ext-collect --sources-root`; MULTIMODAL-SPEC MM-5),
+  are reached from the root's descriptor without following links and read as arm files; a mismatch says
+  `differs from the recorded hash`, and a source outside the root is refused (`provenance cannot be checked`).
+  `ext-merge-eval` and `ext-from-nel` record `os.path.abspath` of a source (normal form).
+- **A3.** `read_meta` followed links and echoed the content of the file it read (unknown keys, the schema value);
+  a stat-then-read race and a FIFO hang remained. A link is now refused before anything is read, so only the arm's
+  own regular file is ever parsed.
+- **A4.** The output walk opened the last component before checking its type (a device node opened by the
+  collecting user). Every component is now opened with `O_PATH` (intermediates `O_PATH | O_DIRECTORY |
+  O_NOFOLLOW`); only a regular file is reopened for reading (`/proc/self/fd`, `O_NOCTTY`) and must be the same
+  inode. Without `O_PATH` (macOS): `fstatat` without following, then `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`.
+- **A5.** `ext-merge-eval` told outputs apart by the raw path string (`outputs/x.txt` and `outputs/./x.txt`, the
+  second overwrote the first) and hashed its sources by path after the checks. Output paths must be canonical
+  (`output_ref path '<p>' is not in canonical form (no `.` or empty component)`), and `merge.json` records the
+  hashes of the bytes merged.
+- **A6.** A NUL or a lone surrogate in an output path raised `ValueError` or `UnicodeEncodeError`; now `contains a
+  NUL character` or `is not valid UTF-8`.
+- **B1.** An intermediate directory with mode 0o111 (search only) was refused (EACCES); `O_PATH` walks it.
+- **B2.** tests/README.md EXT-45 now says any link is refused.
+- **B3.** A read error of an output during the copy was reported as a failed write of `--runs-root`; it is an
+  `EXT-ARM` refusal now.
+- **B4.** The duplicate-arm key is the opened directory's identity from the snapshot; an arm that does not open
+  is reported once (by its files), with the errno name.
+- **C1, C2.** The S4 test now includes an alias past `PATH_MAX` (a working directory deeper than `PATH_MAX`, `arm`
+  and `lnk` to one arm) that a resolved path string misses, and both collect copy sites have swap tests; mutants
+  keying arms by `paths.resolve`, copying outputs or arm files by path, hashing merge sources by path or ignoring
+  the sources root are killed.
+- **C3.** `_ext.container_user()` raises AssertionError instead of SkipTest under
+  `GATEDTRAIN_REQUIRE_CONTAINER_USER=1`, which CI sets (and prints `id`), so a runner user that cannot launch a
+  container fails the launch tests instead of skipping 176 of them.
+- **D1, D2.** The mutant ids and T5 above are defined; README "Changes since 0.3.0" states the breaking changes.

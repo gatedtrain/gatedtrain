@@ -35,6 +35,7 @@ from ..canonical import (canonical_json, entries_hash, file_sha256, manifest_ent
                          text_lines, write_canonical)
 from ..errors import Problem, Refused
 from . import registry
+from .armfs import ArmSnapshot
 from ..gates import _cluster_value_ok as cluster_value_ok
 from .arm import copy_output_ref, gate_record, meta_differences, provenance_problems, read_lines, read_meta
 from .launch import first_start, gpu_seconds, gpu_step_log_problem, record_problems
@@ -219,9 +220,10 @@ def _paths(x) -> list[Path]:
 
 def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Path, smoke_record: Path,
             eval_baseline: Path | list[Path], eval_candidate: Path | list[Path],
-            runs_root: Path) -> tuple[Path, dict[str, Any], str]:
+            runs_root: Path, sources_root: Path | None = None) -> tuple[Path, dict[str, Any], str]:
     """Recorded external outputs to a run directory (EXT-2). Refuses before writing (EXT-34). With several clauses
-    (R18-1), `eval_baseline` and `eval_candidate` list one arm per clause, in clause order."""
+    (R18-1), `eval_baseline` and `eval_candidate` list one arm per clause, in clause order. A merged arm's sources
+    (MM-5) must lie under `sources_root`, by default the host's output root (EXT-63)."""
     from ..registration import item_set_field, item_set_hash
     from ..runner import _new_run_dir, check_pins
     from ..spec import load_spec
@@ -488,6 +490,13 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
     evaluated = {"baseline": base if base_model is not None else None,
                  "candidate": cuts[-1]["path"] if cuts else None}
     arms_by_clause: list[dict[str, dict]] = []
+    if sources_root is None:                             # MM-5: provenance sources lie under the output root
+        from .launch import host_config
+
+        try:
+            sources_root = Path(host_config().output_root)
+        except Refused:
+            sources_root = None                          # refused with the launch record (EXT-HOST)
     for ci, (clause, ev) in enumerate(zip(wf.clauses, evaluators)):
         c_row = rows[ev]
         seeds = list(clause["eval_seeds"])
@@ -501,7 +510,8 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
         arms: dict[str, dict] = {}
         for arm, path, flag in (("baseline", eval_baseline[ci], "--eval-baseline"),
                                 ("candidate", eval_candidate[ci], "--eval-candidate")):
-            meta, why = read_meta(path)
+            snap = ArmSnapshot.read(path)               # read once; checked and copied from these bytes
+            meta, why = read_meta(path, snap)
             want = dict(expected)
             if c_row.get("normalizer"):                 # EXT-109: the normalizer of the cut the arm must evaluate
                 try:
@@ -511,13 +521,14 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
             if meta is not None:
                 why += meta_differences(meta, want)
                 why += provenance_problems(path, meta, nel_benchmark=c_row.get("nel_benchmark"), row=c_row,
-                                           item_rows=item_rows)                                 # EXT-47, EXT-52
+                                           item_rows=item_rows, snap=snap,
+                                           sources_root=sources_root)                           # EXT-47, EXT-52
                 ck = meta.get("checkpoint")
                 bmh = ck.get("base_model_hash") if isinstance(ck, dict) else None
                 if bmh is not None and base_model is not None and bmh != base_model:
                     why.append(f"eval_meta.json checkpoint.base_model_hash is {bmh!r}, not the spec's base {base_model}")
             recs, line_bad = read_lines(path, seeds=seeds, score_range=c_row["score_range"],
-                                        error_classes=tuple(c_row["error_classes"]))
+                                        error_classes=tuple(c_row["error_classes"]), snap=snap)
             why += line_bad
             if meta is not None and recs and hasattr(ad, "arm_problems"):  # EXT-155: outputs name the registered items
                 arm_kw = ({"items_dir": items_dir, "model_dir": evaluated[arm]}              # EXT-194, EXT-197
@@ -530,20 +541,16 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
                 problems.append(Problem("EXT-ARM", flag, f"{path}: {msg}",
                                         "pass an arm directory (items.jsonl and eval_meta.json) of this evaluator and "
                                         "registration; merge single-seed runs with `gatedtrain ext-merge-eval`"))
-            arms[arm] = {"path": path, "meta": meta, "records": recs}
+            arms[arm] = {"path": path, "meta": meta, "records": recs, "snap": snap}
         arms_by_clause.append(arms)
     arms = arms_by_clause[0]
     if multi:
         seen_paths: dict[tuple[int, int], str] = {}
         for ci, pair in enumerate(arms_by_clause):
             for arm, info in pair.items():
-                try:                                       # the directory itself, whatever path names it (S4)
-                    st = Path(info["path"]).stat()
-                except OSError as exc:
-                    problems.append(Problem("EXT-ARM", f"--eval-{arm}", f"{info['path']} cannot be inspected "
-                                            f"({exc.__class__.__name__})", "pass an arm directory"))
-                    continue
-                key = (st.st_dev, st.st_ino)
+                key = info["snap"].key                     # the directory itself, whatever path names it (S4)
+                if key is None:
+                    continue                               # it did not open: refused with its files (read_meta)
                 if key in seen_paths:
                     problems.append(Problem("EXT-ARM", f"--eval-{arm}", f"{info['path']} is passed twice "
                                             f"({seen_paths[key]} and {arm} of clause {ci})",
@@ -639,14 +646,15 @@ def _write_run(run_dir: Path, *, wf, ad, adapter: str, row: dict, evaluator: str
     for arm, info in arms.items():
         dst = run_dir / "eval" / arm
         dst.mkdir(parents=True)
-        for name in ("items.jsonl", "eval_meta.json", "merge.json"):
-            if (info["path"] / name).is_file():
-                shutil.copyfile(info["path"] / name, dst / name)
+        for name, f in info["snap"].files.items():     # the bytes that were checked, never re-read (A1)
+            if f.data is not None:
+                (dst / name).write_bytes(f.data)
         for rec in info["records"]:                      # referenced outputs stay resolvable inside the run
             ref = rec.get("output_ref")
             if ref:
                 (dst / ref["path"]).parent.mkdir(parents=True, exist_ok=True)
-                copy_output_ref(info["path"], ref, dst / ref["path"], flag=f"--eval-{arm}")   # MM-1
+                copy_output_ref(info["path"], ref, dst / ref["path"], flag=f"--eval-{arm}",
+                                key=info["snap"].key)                              # MM-1
     (run_dir / "records").mkdir()
     shutil.copyfile(launch_record, run_dir / "records" / "launch.json")
     shutil.copyfile(smoke_record, run_dir / "records" / "smoke.json")
@@ -736,14 +744,15 @@ def _write_run_multi(run_dir: Path, *, wf, ad, adapter: str, reg: dict, items_di
         for arm, info in pair.items():
             dst = run_dir / "eval" / arm / clause["name"]
             dst.mkdir(parents=True)
-            for name in ("items.jsonl", "eval_meta.json", "merge.json"):
-                if (info["path"] / name).is_file():
-                    shutil.copyfile(info["path"] / name, dst / name)
+            for name, f in info["snap"].files.items():  # the bytes that were checked, never re-read (A1)
+                if f.data is not None:
+                    (dst / name).write_bytes(f.data)
             for rec in info["records"]:                  # referenced outputs stay resolvable inside the run
                 ref = rec.get("output_ref")
                 if ref:
                     (dst / ref["path"]).parent.mkdir(parents=True, exist_ok=True)
-                    copy_output_ref(info["path"], ref, dst / ref["path"], flag=f"--eval-{arm}")   # MM-1
+                    copy_output_ref(info["path"], ref, dst / ref["path"], flag=f"--eval-{arm}",
+                                        key=info["snap"].key)                              # MM-1
     (run_dir / "records").mkdir()
     shutil.copyfile(launch_record, run_dir / "records" / "launch.json")
     shutil.copyfile(smoke_record, run_dir / "records" / "smoke.json")

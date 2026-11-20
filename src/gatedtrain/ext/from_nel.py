@@ -206,7 +206,7 @@ def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, c
         write_canonical(tmp / "eval_meta.json", meta)
         write_canonical(tmp / "merge.json", {
             "schema": FROM_NEL_SCHEMA, "schema_version": "1.0", "tags": list(TAGS),
-            "sources": [{"repeat": r, "seed": seeds[r], "run_dir": str(info["run"].absolute()),
+            "sources": [{"repeat": r, "seed": seeds[r], "run_dir": os.path.abspath(info["run"]),
                          "results_sha256": file_sha256(info["results"]), "config_sha256": file_sha256(info["config"]),
                          "service_model": info["service_model"]}
                         for r, info in enumerate(per_run)],

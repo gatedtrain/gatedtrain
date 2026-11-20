@@ -351,7 +351,7 @@ class TestMerge(ExtCase):
         self.assertEqual(by_seed[(11,)]["items_sha256"], file_sha256(r11 / "items.jsonl"))
         self.assertEqual(by_seed[(12,)]["eval_meta_sha256"], file_sha256(r12 / "eval_meta.json"))
         # the merged arm is a valid ext-collect arm
-        rep = self.gate(self.sc.collect(self.runs(), baseline=out), "PASS", EXIT_OK)
+        rep = self.gate(self.sc.collect(self.runs(), baseline=out, sources_root=self.tmp), "PASS", EXIT_OK)
         self.assertEqual(rep["n_items"], 30)
 
     def test_multi_seed_run_alone(self):
