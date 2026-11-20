@@ -10,7 +10,7 @@ from pathlib import Path
 
 from gatedtrain.errors import Problem, Refused
 from gatedtrain.ext.attempts import (AttemptRecord, GuardAttempt, Segment, align, guard_attempts, read_attempts,
-                                     segment_chain, split_steps)
+                                     segment_chain, split_steps, is_new_layout)
 
 LABEL = "run-a"
 
@@ -59,6 +59,28 @@ class ReadTests(Base):
         recs = read_attempts(self.dir)
         self.assertEqual(recs, [AttemptRecord(1, "2026-11-20T10:00:05Z", None, None, False),
                                 AttemptRecord(2, "2026-11-20T11:00:05Z", restore(10, True), "ok", True)])
+
+    def test_header_is_skipped_and_marks_the_new_layout(self):
+        header = {"schema": "gatedtrain.ext.attempts", "version": 1}
+        self.write_attempts([header, start(1, "2026-11-20T10:00:05Z")])
+        self.assertTrue(is_new_layout(self.dir))
+        self.assertEqual(len(read_attempts(self.dir)), 1)
+
+    def test_other_first_lines_are_the_old_layout(self):
+        self.assertFalse(is_new_layout(self.dir))                         # no file
+        for rows in ([{"attempt": 1, "started_at": "2026-11-11T09:30:00Z", "argv": []}],
+                     [start(1, "2026-11-20T10:00:05Z")]):
+            self.write_attempts(rows)
+            self.assertFalse(is_new_layout(self.dir))
+        (self.dir / "attempts.jsonl").write_text("not json\n", encoding="utf-8")
+        self.assertFalse(is_new_layout(self.dir))
+
+    def test_unknown_header_version_refuses(self):
+        for v in (2, "1", True, None):
+            self.write_attempts([{"schema": "gatedtrain.ext.attempts", "version": v}, start(1, "2026-11-20T10:00:05Z")])
+            with self.assertRaises(Refused) as cm:
+                read_attempts(self.dir)
+            self.assertEqual(cm.exception.problems[0].rule, "EXT-RES-1")
 
     def test_symlinked_attempts_refuses(self):
         real = self.dir / "real.jsonl"

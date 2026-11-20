@@ -286,7 +286,7 @@ def _resume_lines(rep: dict[str, Any]) -> list[str]:
     if "attempts" not in rep:
         return []
     lines = [f"attempts: {rep['attempts']}", f"restored_at: {rep['restored_at']}",
-             f"steps_redone: {rep['steps_redone']}"]
+             f"steps_redone: {'unknown' if rep['steps_redone'] is None else rep['steps_redone']}"]
     return lines + ([RESUMED_SENTENCE] if rep["attempts"] > 1 else [])
 
 

@@ -1,9 +1,9 @@
 """`gatedtrain ext-collect` of a resumed run: the segment chain, the ledger and the report (tests/README.md section
 11.35: EXT-RES-1 to EXT-RES-5; design 05 section 12.4, decisions/RESUMABLE-RUNS-DESIGN.md sections 5.2 to 5.5).
 
-The fixture is the synthetic adapter's run with `attempts.jsonl` (the new layout), `cut.json` in every cut and a
-`samples.jsonl` whose lines carry the attempt that logged them. A run directory without `attempts.jsonl` is the old
-layout and collects as before (attempt_id "0").
+The fixture is the synthetic adapter's run with `attempts.jsonl` that starts with the header line (the new layout), `cut.json` in every cut and a
+`samples.jsonl` whose lines carry the attempt that logged them. An `attempts.jsonl` without that header (the
+launchers' older formats) or none is the old layout and collects as before (attempt_id "0").
 """
 
 from __future__ import annotations
@@ -18,9 +18,10 @@ from unittest import mock
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from _ext import ExtScenario, guard_log
+from _ext import ExtScenario, guard_log, shuffle_args, train_row_count
 from _support import EXIT_OK, EXIT_REFUSED, describe, file_sha256, load_report, parse_run_dir, run_cli
 
+HEADER = {"schema": "gatedtrain.ext.attempts", "version": 1}
 SENTENCE = "resumed run: not bit-identical to an uninterrupted run"
 
 # Three attempts over 12 steps, cuts at 4 (attempt 1), 8 (attempt 2) and 12 (attempt 3):
@@ -64,6 +65,7 @@ def three_attempts(sc: ExtScenario, *, restore_step: dict[int, int] | None = Non
         return {"cut": f"checkpoint-{step}", "last_step_included": step, "cut_json_sha256": shas[step],
                 "repaired": False}
     rows = [
+        HEADER,
         {"event": "start", "attempt": 1, "utc": "2026-11-11T09:00:05Z", "restore": None},
         {"event": "start", "attempt": 2, "utc": "2026-11-11T09:12:05Z", "restore": restore(restore_step[2])},
         {"event": "start", "attempt": 3, "utc": "2026-11-11T09:32:05Z", "restore": restore(restore_step[3])},
@@ -87,7 +89,7 @@ def one_attempt(sc: ExtScenario) -> None:
     out = sc.stage_out
     for step in (5, 10):
         write_cut_json(out / f"checkpoint-{step}", step, 1)
-    rows = [{"event": "start", "attempt": 1, "utc": "2026-11-11T09:00:05Z", "restore": None},
+    rows = [HEADER, {"event": "start", "attempt": 1, "utc": "2026-11-11T09:00:05Z", "restore": None},
             {"event": "end", "attempt": 1, "utc": "2026-11-11T10:00:00Z", "status": "ok"}]
     (out / "attempts.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     write_samples(out, {1: range(1, 11)})
@@ -141,6 +143,13 @@ class TestThreeAttempts(Case):
         self.assertEqual(ids, {f"{d.name}.{a}" for a in (1, 2, 3)})
         for r in rows:
             self.assertEqual(r["attempt_id"], f"{d.name}.{r['controller_epoch']}")
+
+    def test_parent_ref(self):
+        d = self.run_dir()
+        for r in ledger(d):
+            a = r["controller_epoch"]
+            want = None if a == 1 else {"kind": "attempt", "id": f"{d.name}.{a - 1}:{ {2: 4, 3: 8}[a] }"}
+            self.assertEqual(r["parent_ref"], want)
 
     def test_orphaned_rows(self):
         d = self.run_dir()
@@ -236,7 +245,26 @@ class TestOneAttempt(Case):
 class TestOldLayout(Case):
     def test_no_attempts_file_is_the_old_layout(self):
         sc = self.scenario()
-        self.assertFalse((sc.stage_out / "attempts.jsonl").exists())
+        (sc.stage_out / "attempts.jsonl").unlink()
+        self.assert_old(sc)
+
+    def test_launcher_attempts_file_is_the_old_layout(self):
+        """TRL, SB3, LeRobot, ddpo, flow-grpo and whisper launchers: {attempt, started_at, argv}."""
+        sc = self.scenario()
+        (sc.stage_out / "attempts.jsonl").write_text(
+            json.dumps({"attempt": 1, "started_at": "2026-11-11T09:30:00Z", "argv": ["train.py"]}) + "\n",
+            encoding="utf-8")
+        self.assert_old(sc)
+
+    def test_nemo_hook_attempts_file_is_the_old_layout(self):
+        """NeMo RL cad, clevr and agentic hooks: start and end lines without a header or an end status."""
+        sc = self.scenario()
+        rows = [{"event": "start", "attempt": 1, "utc": "2026-11-11T09:30:05Z", "pid": 1, "stage": "x"},
+                {"event": "end", "attempt": 1, "utc": "2026-11-11T09:59:00Z", "pid": 1, "stage": "x"}]
+        (sc.stage_out / "attempts.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        self.assert_old(sc)
+
+    def assert_old(self, sc):
         proc = sc.collect(self.runs())
         self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
         d = parse_run_dir(proc.stdout)
@@ -305,6 +333,199 @@ class TestRefusals(Case):
         three_attempts(sc)
         write_samples(sc.stage_out, {1: range(1, 7), 3: range(9, 13)})      # attempt 2's records are gone
         self.refused(sc.collect(self.runs()), "EXT-RES-4")
+
+
+    def test_missing_attempt_in_the_records_refuses_before_the_run_directory(self):
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        write_samples(sc.stage_out, {1: range(1, 7), 3: range(9, 13)})
+        runs = self.runs()
+        self.refused(sc.collect(runs), "EXT-RES-4")
+        self.assertFalse(runs.exists() and any(runs.iterdir()), "no run directory exists after the refusal")
+
+    def test_unknown_header_version_refuses(self):
+        sc = self.scenario()
+        one_attempt(sc)
+        lines = (sc.stage_out / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+        lines[0] = json.dumps({"schema": "gatedtrain.ext.attempts", "version": 2})
+        (sc.stage_out / "attempts.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.refused(sc.collect(self.runs()), "EXT-RES-1")
+
+
+def set_max_steps(sc: ExtScenario, value) -> None:
+    path = sc.stage_out / "run_args.json"
+    args = json.loads(path.read_text(encoding="utf-8"))
+    if value is None:
+        args.pop("max_steps")
+    else:
+        args["max_steps"] = value
+    path.write_text(json.dumps(args, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def extend_samples(sc: ExtScenario, steps, attempt: int) -> None:
+    per_step, per_epoch = 4, train_row_count(sc.train) // 4
+    with (sc.stage_out / "samples.jsonl").open("a", encoding="utf-8") as f:
+        for s in steps:
+            for pos in range(per_step):
+                f.write(json.dumps({"step": s, "position": pos, "row": ((s - 1) % per_epoch) * per_step + pos,
+                                    "attempt": attempt}, sort_keys=True) + "\n")
+
+
+class TestFinalAttemptEnd(Case):
+    """The final attempt ends at run_args.json `max_steps` when it is an integer (design 5.2). The synthetic adapter's
+    own EXT-68 check wants the last cut at max_steps, so these runs use a wrapper without that check."""
+
+    def collect(self, sc):
+        from gatedtrain.ext import collect as mod
+        from gatedtrain.ext import registry
+
+        class NoStepCheck(Wrapped):
+            def checks(self, **kw):
+                return []
+
+        real = registry.adapter
+        with mock.patch.dict("os.environ", sc.env()), \
+                mock.patch.object(mod.registry, "adapter", lambda name: NoStepCheck(real(name))):
+            return mod.collect(sc.paths["spec"], adapter="synthetic", stage_out=sc.stage_out, launch_record=sc.launch,
+                               smoke_record=sc.smoke, eval_baseline=sc.baseline, eval_candidate=sc.candidate,
+                               runs_root=self.runs())
+
+    def test_records_after_the_last_cut_are_kept_up_to_max_steps(self):
+        sc = self.scenario()
+        one_attempt(sc)
+        set_max_steps(sc, 12)
+        extend_samples(sc, (11, 12), 1)
+        run_dir, _, _ = self.collect(sc)
+        rows = ledger(run_dir)
+        self.assertEqual(sorted({r["step"] for r in rows if r["status"] == "kept"}), list(range(1, 13)))
+
+    def test_without_max_steps_later_records_are_ignored(self):
+        sc = self.scenario()
+        one_attempt(sc)
+        set_max_steps(sc, None)
+        extend_samples(sc, (11, 12), 1)
+        run_dir, _, _ = self.collect(sc)
+        self.assertEqual(sorted({r["step"] for r in ledger(run_dir)}), list(range(1, 11)))
+
+    def test_records_beyond_max_steps_refuse(self):
+        from gatedtrain.errors import Refused
+
+        sc = self.scenario()
+        one_attempt(sc)
+        set_max_steps(sc, 11)
+        extend_samples(sc, (11, 12), 1)
+        with self.assertRaises(Refused) as cm:
+            self.collect(sc)
+        self.assertEqual({p.rule for p in cm.exception.problems}, {"EXT-RES-4"})
+        self.assertIn("beyond max_steps 11", " ".join(p.message for p in cm.exception.problems))
+
+
+class TestStagePrecisionOnAResumedRun(Case):
+    def test_stage_fallback_still_counts_redone_steps(self):
+        sc = self.scenario(stage_steps=STEPS, args_mutate=shuffle_args)
+        three_attempts(sc)
+        proc = sc.collect(self.runs())
+        self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
+        rep = load_report(parse_run_dir(proc.stdout))
+        self.assertEqual((rep["consumption_precision"], rep["attempts"], rep["steps_redone"]), ("stage", 3, 3))
+
+    def test_stage_fallback_missing_attempt_records_refuses(self):
+        sc = self.scenario(stage_steps=STEPS, args_mutate=shuffle_args)
+        three_attempts(sc)
+        write_samples(sc.stage_out, {1: range(1, 7), 3: range(9, 13)})
+        self.refused(sc.collect(self.runs()), "EXT-RES-4")
+
+    def test_stage_fallback_without_samples_refuses(self):
+        sc = self.scenario(stage_steps=STEPS, args_mutate=shuffle_args)
+        three_attempts(sc)
+        (sc.stage_out / "samples.jsonl").unlink()
+        self.refused(sc.collect(self.runs()), "EXT-RES-4")
+
+
+class Wrapped:
+    """The synthetic adapter (chain-aware) whose consumption result `edit` changes."""
+    edit = staticmethod(lambda cons: cons)
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def consumption(self, stage_out, data, cuts, *, run_id="", chain=None):
+        return type(self).edit(dict(self._inner.consumption(stage_out, data, cuts, run_id=run_id, chain=chain)))
+
+
+class TestAdapterResults(Case):
+    def collect(self, sc, edit):
+        from gatedtrain.ext import collect as mod
+        from gatedtrain.ext import registry
+
+        real = registry.adapter
+        cls = type("W", (Wrapped,), {"edit": staticmethod(edit)})
+        with mock.patch.dict("os.environ", sc.env()), \
+                mock.patch.object(mod.registry, "adapter", lambda name: cls(real(name))):
+            return mod.collect(sc.paths["spec"], adapter="synthetic", stage_out=sc.stage_out, launch_record=sc.launch,
+                               smoke_record=sc.smoke, eval_baseline=sc.baseline, eval_candidate=sc.candidate,
+                               runs_root=self.runs())
+
+    def test_collector_stamps_status_and_parent(self):
+        def edit(cons):
+            cons["rows"] = [{k: v for k, v in r.items() if k not in ("status", "controller_epoch")}
+                            for r in cons["rows"]]
+            cons["orphaned"] = [{k: v for k, v in r.items() if k not in ("status", "controller_epoch")}
+                                for r in cons["orphaned"]]
+            return cons
+
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        run_dir, report, _ = self.collect(sc, edit)
+        rows = ledger(run_dir)
+        self.assertEqual({(r["status"] is None) for r in rows}, {False})
+        self.assertEqual({r["status"] for r in rows if (r["controller_epoch"], r["step"]) in ORPHANED
+                          and r["attempt_id"].endswith(f".{r['controller_epoch']}")} - {"kept"}, {"orphaned"})
+        for r in rows:
+            a = r["controller_epoch"]
+            want = None if a == 1 else {"kind": "attempt", "id": f"{run_dir.name}.{a - 1}:{ {2: 4, 3: 8}[a] }"}
+            self.assertEqual(r["parent_ref"], want)
+
+    def test_row_naming_no_segment_refuses(self):
+        from gatedtrain.errors import Refused
+
+        def edit(cons):
+            cons["orphaned"] = [{**r, "attempt_id": "elsewhere.9"} for r in cons["orphaned"]]
+            return cons
+
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        with self.assertRaises(Refused) as cm:
+            self.collect(sc, edit)
+        self.assertEqual({p.rule for p in cm.exception.problems}, {"EXT-RES-4"})
+
+    def test_epoch_not_of_the_segment_refuses(self):
+        from gatedtrain.errors import Refused
+
+        def edit(cons):
+            cons["rows"] = [{**r, "controller_epoch": 3} for r in cons["rows"]]
+            return cons
+
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        with self.assertRaises(Refused) as cm:
+            self.collect(sc, edit)
+        self.assertEqual({p.rule for p in cm.exception.problems}, {"EXT-RES-4"})
+
+    def test_no_orphaned_list_on_a_multi_attempt_chain_is_unknown_not_zero(self):
+        def edit(cons):
+            cons.pop("orphaned")
+            cons.pop("steps_redone", None)
+            return cons
+
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        run_dir, report, text = self.collect(sc, edit)
+        self.assertIsNone(report["steps_redone"])
+        self.assertIn("steps_redone: unknown", text.splitlines())
 
 
 class NoChain:

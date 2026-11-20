@@ -200,6 +200,32 @@ def read_samples(path: Path) -> tuple[dict[int, set[int]] | None, str | None]:
     return (None, why) if records is None else (logged_rows(records), None)
 
 
+def split_records(stage_out: Path, chain: list) -> tuple[list[dict] | None, list[dict], list[Problem]]:
+    """(kept, orphaned, problems) of samples.jsonl for a chain (EXT-RES-4); kept is None when there is no
+    samples.jsonl and the chain has one segment (nothing to split). With more than one segment the records must
+    exist and split cleanly. Without an integer `max_steps` in run_args.json the last cut bounds the run, so
+    records beyond the final segment's end are ignored, as on the old path."""
+    from ..ext.attempts import split_steps
+
+    samples = Path(stage_out) / SAMPLES
+    if not (samples.exists() or samples.is_symlink()):
+        if len(chain) > 1:
+            return None, [], [Problem("EXT-RES-4", SAMPLES, f"{SAMPLES} is missing, so the records of the attempts "
+                                      "cannot be split into kept and orphaned",
+                                      "collect a resumed run with the records of every attempt")]
+        return None, [], []
+    records, why = read_sample_records(samples)
+    if records is None:
+        return None, [], [Problem("EXT-RES-4", SAMPLES, why, "collect a resumed run with the records of every "
+                                  "attempt")]
+    args, _ = read_run_args(stage_out)
+    declared = args.get("max_steps") if args else None
+    if not (isinstance(declared, int) and not isinstance(declared, bool)):
+        records = [d for d in records if d["step"] <= chain[-1].end_step]
+    kept, orphaned, problems = split_steps(chain, records)
+    return kept, orphaned, problems
+
+
 class SyntheticAdapter:
     """The MM-12 interface over the run layout of the module docstring."""
 
@@ -280,6 +306,10 @@ class SyntheticAdapter:
 
     # --- consumption (MM-22, MM-23) ---
 
+    def chain_problems(self, stage_out: Path, data: Path, cuts: list, chain: list) -> list[Problem]:
+        """EXT-RES-4 before anything is written: the records of a resumed run split into kept and orphaned."""
+        return split_records(stage_out, chain)[2]
+
     def consumption(self, stage_out: Path, data: Path, cuts: list, *, run_id: str = "",
                     attempt_id: str = "0", chain: list | None = None) -> dict[str, Any]:
         """The ledger rows of the run. With `chain` (the segments of a resumed run, `gatedtrain.ext.attempts`) the
@@ -288,9 +318,21 @@ class SyntheticAdapter:
         ones, each with its segment's `attempt_id` and `controller_epoch` (EXT-RES-1, EXT-RES-5)."""
         from ..ledger import LEDGER_DERIVATION, WRITER_ID, check_precision, shard_table, step_shards
 
+        split = None                                  # (kept, orphaned) of a chain, before any precision fallback
+        if chain is not None and len(chain) > 1:      # I2: record presence and gaps are checked at every precision
+            kept, orphaned, problems = split_records(stage_out, chain)
+            if problems:
+                raise Refused(problems)
+            split = (kept, orphaned)
+
         def stage(why: str) -> dict[str, Any]:
-            return {"precision": "stage", "rows": [], "orphaned": [], "derivation": None,
-                    "reason": f"{why}; the row order is not shown, so every cut possibly consumed every shard (MM-23)"}
+            out = {"precision": "stage", "rows": [], "derivation": None,
+                   "reason": f"{why}; the row order is not shown, so every cut possibly consumed every shard (MM-23)"}
+            if chain is not None:
+                out["orphaned"] = []
+                if split is not None:
+                    out["steps_redone"] = len({(d["attempt"], d["step"]) for d in split[1]})
+            return out
 
         args, why = read_run_args(stage_out)
         if args is None:
@@ -306,7 +348,7 @@ class SyntheticAdapter:
                          f"concatenated in file-name order ({actual}), so its row numbers are not this snapshot's")
         if not cuts:
             return stage("no complete cut")
-        last = max(step for step, _ in cuts)
+        last = chain[-1].end_step if chain is not None else max(step for step, _ in cuts)
         table = shard_table(data)
         try:
             mapping = step_shards([(s, per_step) for s in range(1, last + 1)], table)
@@ -316,22 +358,18 @@ class SyntheticAdapter:
         kept_steps: dict[int, Any] = {}               # step -> the segment that keeps it
         orphan_steps: set[tuple[int, int]] = set()     # (attempt, step)
         if chain is not None:
-            from ..ext.attempts import split_steps
-
             by_attempt = {sg.attempt: sg for sg in chain}
-            records = None
-            if samples.exists() or samples.is_symlink():
-                records, why = read_sample_records(samples)
-                if records is None:
-                    return stage(f"{why}, so the reconstructed rows cannot be cross-checked")
-            elif len(chain) > 1:
-                raise Refused([Problem("EXT-RES-4", SAMPLES, f"{SAMPLES} is missing, so the records of the attempts "
-                                       "cannot be split into kept and orphaned",
-                                       "collect a resumed run with the records of every attempt")])
-            if records is not None:
-                kept, orphaned, problems = split_steps(chain, records)
+            if split is None:                         # one segment: records are optional
+                if samples.exists() or samples.is_symlink():
+                    records, why = read_sample_records(samples)
+                    if records is None:
+                        return stage(f"{why}, so the reconstructed rows cannot be cross-checked")
+                kept, orphaned, problems = split_records(stage_out, chain)
                 if problems:
                     raise Refused(problems)
+                split = (kept, orphaned)
+            kept, orphaned = split
+            if kept is not None:
                 for doc in kept:
                     kept_steps[doc["step"]] = by_attempt[doc["attempt"]]
                 orphan_steps = {(doc["attempt"], doc["step"]) for doc in orphaned}

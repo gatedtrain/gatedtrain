@@ -1,7 +1,9 @@
 """Attempt records of a resumable external run, their alignment with the host guard's events, the segment chain
 and the kept/orphaned split (EXT-RES-1 to EXT-RES-4; tests/README.md section 11.35).
 
-A run's `attempts.jsonl` holds, per attempt A (1, 2, ... in launch order), a `start` line
+A run's `attempts.jsonl` begins with the header line `{"schema": "gatedtrain.ext.attempts", "version": 1}` (the
+marker of the new layout; a file whose first line is not that header is an older launcher's file and is not read
+here), then holds, per attempt A (1, 2, ... in launch order), a `start` line
 `{"event": "start", "attempt": A, "utc": ..., "restore": null | {"cut", "last_step_included",
 "cut_json_sha256", "repaired"}}` and, only on a normal exit, an `end` line `{"event": "end", "attempt": A,
 "utc": ..., "status": ...}`. gpu-step.sh's log holds, per label, `START`, then `PREEMPTED` or `END rc=<int>`.
@@ -45,6 +47,28 @@ from . import armfs
 from .launch import _ts
 
 ATTEMPTS_FILE = "attempts.jsonl"
+HEADER_SCHEMA, HEADER_VERSION = "gatedtrain.ext.attempts", 1
+HEADER = {"schema": HEADER_SCHEMA, "version": HEADER_VERSION}
+
+
+def is_new_layout(stage_out: Path) -> bool:
+    """Whether `<stage_out>/attempts.jsonl` is the resumable layout: its FIRST line is the header
+    `{"schema": "gatedtrain.ext.attempts", "version": 1}`. Any other attempts.jsonl (the launchers' older formats)
+    or none is the old layout. A link counts as new so that read_attempts refuses it."""
+    path = Path(stage_out) / ATTEMPTS_FILE
+    if os.path.islink(path):
+        return True
+    try:
+        dfd = armfs.open_arm(Path(stage_out))
+        try:
+            data = armfs.read_file(dfd, ATTEMPTS_FILE)
+        finally:
+            os.close(dfd)
+        first = data.split(b"\n", 1)[0].decode("utf-8")
+        doc = json.loads(first)
+    except (armfs.Unreadable, UnicodeDecodeError, ValueError, RecursionError, OSError):
+        return False
+    return isinstance(doc, dict) and doc.get("schema") == HEADER_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -108,6 +132,11 @@ def read_attempts(stage_out: Path) -> list[AttemptRecord]:
             row = json.loads(line)
         except ValueError:
             raise _refuse(f"{field}:{n}", "line is not JSON", _FIX) from None
+        if n == 1 and isinstance(row, dict) and row.get("schema") == HEADER_SCHEMA:
+            if row.get("version") != HEADER_VERSION or isinstance(row.get("version"), bool):
+                raise _refuse(f"{field}:1", f"header version {row.get('version')!r} is not supported "
+                                            f"(this collector reads version {HEADER_VERSION})", _FIX)
+            continue
         if not isinstance(row, dict) or not isinstance(row.get("attempt"), int) or isinstance(row["attempt"], bool) \
                 or not isinstance(row.get("utc"), str):
             raise _refuse(f"{field}:{n}", "line is not an object with integer `attempt` and string `utc`", _FIX)

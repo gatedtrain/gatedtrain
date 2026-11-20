@@ -1901,6 +1901,8 @@ assert their reason. Suite: 1,369 tests, 40 skipped in CI (among them the root-o
 
 An external NeMo RL run preempted by the scheduler resumes from its last committed cut, and `ext-collect` counts consumption per segment (05 §12.4, linear chains only; 02 §2.1). Old layouts are not re-collected: new adapters accept only the new layout.
 
+A run is the new layout only when the first line of its `attempts.jsonl` is the header `{"schema": "gatedtrain.ext.attempts", "version": 1}`; the readers skip it, and a header with another version refuses (EXT-RES-1). Any other `attempts.jsonl` (the launchers' older formats, for example `{"attempt", "started_at", "argv"}` or start/end lines without a header) or none is the old layout and is collected as before, with attempt id "0".
+
 Run-side `utc` values in `attempts.jsonl` are written as `%Y-%m-%dT%H:%M:%SZ`; readers also accept ISO 8601 UTC with fractional seconds and `+00:00`, and compare at whole seconds against the guard log (second resolution).
 
 | ID | Subject | Rule | Test file |

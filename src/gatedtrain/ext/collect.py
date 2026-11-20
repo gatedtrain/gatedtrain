@@ -42,6 +42,7 @@ from . import registry
 from .armfs import ArmSnapshot
 from ..gates import _cluster_value_ok as cluster_value_ok
 from .arm import copy_output_ref, gate_record, meta_differences, provenance_problems, read_lines, read_meta
+from .sdk import read_run_args
 from .launch import first_start, gpu_seconds, gpu_step_log_problem, record_problems
 from .merge import write_problem
 from .smoke import smoke_problems
@@ -252,8 +253,14 @@ def resume_chain(ad, stage_out: Path, launch: dict, cuts: list[dict]) -> tuple[l
     pairs, problems = attempts_mod.align(records, guard)
     if problems:
         return None, problems
+    last = max(c["step"] for c in cuts)
+    args, _ = read_run_args(stage_out)
+    declared = args.get("max_steps") if args else None
+    # The final attempt ends at run_args.json `max_steps` when it is an integer not below the last cut (design 5.2);
+    # otherwise at the last cut, and its later records are ignored as on the old path.
+    max_steps = declared if isinstance(declared, int) and not isinstance(declared, bool) and declared >= last else last
     segs, problems = attempts_mod.segment_chain(pairs, [(c["step"], c["path"]) for c in cuts], run_id="",
-                                                max_steps=max(c["step"] for c in cuts))
+                                                max_steps=max_steps)
     if problems:
         return None, problems
     if len(segs) > 1 and not _supports_chain(ad):
@@ -263,10 +270,41 @@ def resume_chain(ad, stage_out: Path, launch: dict, cuts: list[dict]) -> tuple[l
     return segs, []
 
 
+def _parent_ref(sg, run_id: str) -> dict | None:
+    """The ledger's parent of a segment's rows: `<run_id>.<A-1>:<branch_step>`; none for attempt 1 (EXT-RES-1)."""
+    if sg.parent is None:
+        return None
+    return {"kind": "attempt", "id": f"{run_id}.{sg.parent}:{sg.branch_step}"}
+
+
+def _stamp(rows: list[dict], status: str, segs: list, run_id: str) -> list[dict]:
+    """The collector's own columns on adapter rows: `status`, and a `controller_epoch` and `parent_ref` that follow
+    the segment the row's `attempt_id` names. A row naming no segment of the chain, or an epoch other than its
+    segment's, refuses (EXT-RES-4)."""
+    by_id = {sg.attempt_id: sg for sg in segs}
+    out = []
+    for i, r in enumerate(rows):
+        sg = by_id.get(r.get("attempt_id"))
+        epoch = r.get("controller_epoch")
+        if sg is None or (epoch is not None and epoch != sg.attempt):
+            raise Refused([Problem("EXT-RES-4", "ledger", f"{status} row {i} has attempt_id {r.get('attempt_id')!r} and "
+                                   f"controller_epoch {epoch!r}, which belong to no segment of the chain "
+                                   f"({', '.join(by_id)})",
+                                   "return rows whose attempt_id is the segment's and controller_epoch its attempt")])
+        row = {**r, "status": status, "controller_epoch": sg.attempt}
+        if row.get("parent_ref") is None:
+            row["parent_ref"] = _parent_ref(sg, run_id)
+        out.append(row)
+    return out
+
+
 def _consumption(ad, stage_out: Path, data: Path, cuts: list[dict], run_id: str, chain: list | None):
     """(the adapter's consumption result, the chain with its attempt ids). Without a chain (the old layout) the
     adapter is called as before. With one, a chain-aware adapter gets it; for any other adapter the chain has one
-    segment (`resume_chain` refuses more), and its kept rows take that segment's attempt id and epoch."""
+    segment (`resume_chain` refuses more), and its kept rows take that segment's attempt id. The collector stamps
+    `status`, `controller_epoch` and `parent_ref` itself. `steps_redone` is the adapter's own count, else the
+    distinct (attempt, step) of the orphaned rows it returned, else 0 for a single segment and None (unknown) for
+    a chain it gave no `orphaned` list for."""
     cut_args = [(c["step"], c["path"]) for c in cuts]
     if chain is None:
         return ad.consumption(stage_out, data, cut_args, run_id=run_id), None
@@ -275,19 +313,26 @@ def _consumption(ad, stage_out: Path, data: Path, cuts: list[dict], run_id: str,
         cons = dict(ad.consumption(stage_out, data, cut_args, run_id=run_id, chain=segs))
     else:
         cons = dict(ad.consumption(stage_out, data, cut_args, run_id=run_id))
-        cons["rows"] = [{**r, "attempt_id": segs[0].attempt_id, "controller_epoch": segs[0].attempt, "status": "kept"}
+        cons["rows"] = [{**r, "attempt_id": segs[0].attempt_id, "controller_epoch": segs[0].attempt}
                         for r in cons["rows"]]
-    cons["orphaned"] = list(cons.get("orphaned") or [])
+    returned = cons.get("orphaned")
+    cons["rows"] = _stamp(list(cons["rows"]), "kept", segs, run_id)
+    cons["orphaned"] = _stamp(list(returned or []), "orphaned", segs, run_id)
+    if cons.get("steps_redone") is None:
+        if returned is not None:
+            cons["steps_redone"] = len({(r["attempt_id"], r["step"]) for r in cons["orphaned"]})
+        else:
+            cons["steps_redone"] = 0 if len(segs) == 1 else None
     return cons, segs
 
 
 def resume_report(chain: list | None, cons: dict) -> dict[str, Any]:
-    """The report keys of a new-layout run (design 5.5): attempt count, restore points, steps run again, and the
-    chain's parents (the ledger has no column for a parent step)."""
+    """The report keys of a new-layout run (design 5.5): attempt count, restore points, steps run again (null:
+    unknown) and the chain's parents."""
     if chain is None:
         return {}
-    redone = {(r["attempt_id"], r["step"]) for r in cons["orphaned"]}
-    return {"attempts": len(chain), "restored_at": [sg.branch_step for sg in chain[1:]], "steps_redone": len(redone),
+    return {"attempts": len(chain), "restored_at": [sg.branch_step for sg in chain[1:]],
+            "steps_redone": cons["steps_redone"],
             "resume_chain": [{"attempt": sg.attempt, "parent": sg.parent, "branch_step": sg.branch_step}
                              for sg in chain[1:]]}
 
@@ -523,12 +568,16 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
                                                        data_field=f"artifacts.{names['data']}.uri", **env_kw),
                                      "EXT-STAGE", "--stage-out")                       # EXT-65, EXT-68
 
-    # Resumed runs (EXT-RES-1 to EXT-RES-4): `attempts.jsonl` in the output directory is the new layout; without it
-    # the run is read as before (one attempt, attempt id "0").
+    # Resumed runs (EXT-RES-1 to EXT-RES-4): an `attempts.jsonl` that starts with the header line is the new layout;
+    # any other (the launchers' older formats) or none is read as before (one attempt, attempt id "0").
     chain = None
-    if listed and isinstance(launch, dict) and os.path.lexists(stage_out / attempts_mod.ATTEMPTS_FILE):
+    if listed and isinstance(launch, dict) and attempts_mod.is_new_layout(stage_out):
         chain, chain_problems = resume_chain(ad, stage_out, launch, cuts)
         problems += chain_problems
+
+    if chain is not None and hasattr(ad, "chain_problems"):          # EXT-RES-4 before the run directory exists
+        problems += _guarded(lambda: ad.chain_problems(stage_out, data, [(c["step"], c["path"]) for c in cuts], chain),
+                             "EXT-RES-4", "--stage-out")
 
     # Observed consumption log (EXT-102): checked before anything is written.
     if cuts and hasattr(ad, "consumption_problems") and data_ok:
