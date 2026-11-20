@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -330,21 +329,18 @@ def _deployment(ctx: StageContext) -> dict:
     return {"sampler": dep["sampler"], "eval_seeds": seeds}
 
 
-_BASE_ID = re.compile(r"-base-([0-9a-f]{64})$")
-
-
 def registered_base(full: dict) -> str | None:
-    """The `sha256:<hex>` of the base model reference a registration binds. The registration schema has no field for
-    it, so it rides in `registration_id` (`ainative-<item set>-base-<hex>`), which the registration hash covers."""
-    m = _BASE_ID.search(str(full.get("registration_id", "")))
-    return f"sha256:{m.group(1)}" if m else None
+    """The `sha256:<hex>` of the base model reference a registration binds (the `base_model` field)."""
+    bm = full.get("base_model")
+    h = bm.get("model_ref_sha256") if isinstance(bm, dict) else None
+    return h if isinstance(h, str) else None
 
 
 def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str) -> dict:
     row = SCORERS[v["scorer"]]
     return {
         "registration_version": 1,
-        "registration_id": f"ainative-{item_set_hash.removeprefix('sha256:')[:16]}-base-{base_sha.removeprefix('sha256:')}",
+        "registration_id": f"ainative-{item_set_hash.removeprefix('sha256:')[:16]}",
         "signed_by": "prototype-unsigned",
         "workflow": "ainative",
         "gate": "quality_gate",
@@ -358,6 +354,7 @@ def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str) -> dict
         "sigma_pilot": {"sigma": PILOT_SIGMA, "source": "the maximum SD of a 0/1 score (exact match)"},
         "eval_distribution": {"item_set_hash": item_set_hash, "env_version": None, "env_params_version": None},
         "sampler": dict(dep["sampler"]),
+        "base_model": {"model_ref_sha256": base_sha},
         "evaluators": [{"id": row["evaluator"], "manifest_hash": scorers.manifest_hash()}],
         "multiplicity": {"plan": "single_gate", "family": None},
         "analysis_code_version": ANALYSIS_CODE_VERSION,
@@ -466,7 +463,7 @@ class Preregister:
             bad("registration.evaluators[0].manifest_hash",
                 "the registered evaluator hash is not the one the library resolves for the scorer")
         if registered_base(full) != ctx.inputs["base_model"].sha256:
-            bad("registration.registration_id", "the registered base model is not the base model input")
+            bad("registration.base_model", "the registered base model is not the base model input")
         if bool(full.get("post_hoc", False)) != out.get("post_hoc"):
             bad("registration.post_hoc", "the output record and the registration disagree on post_hoc")
         return problems

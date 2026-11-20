@@ -710,6 +710,27 @@ class ModelBindingTest(GateBase):
     def test_candidate_must_come_from_a_training_stage(self) -> None:
         self.assertIn("training", self.refused_eval(candidate_src="other_x.model", extra_stage=True))
 
+    def test_check_contents_accepts_and_validates_the_base_model_field(self) -> None:
+        from gatedtrain.registration import check_contents
+        proj = self.make()
+        self.upto_registration(proj)
+        full = InProcessTrust(proj).registration(proj.read_artifact(self.reg_ref(proj))["hash"])
+        self.assertIn("base_model", full)
+        self.assertEqual(check_contents(full), [])
+        without = {k: v for k, v in full.items() if k != "base_model"}
+        self.assertEqual(check_contents(without), [])                   # registrations without it are unchanged
+        self.assertEqual(full["registration_id"][:8], "ainative")
+        self.assertNotIn("base", full["registration_id"].split("-", 1)[1])
+        for bad in ({"model_ref_sha256": "sha256:xyz"}, {"model_ref_sha256": full["base_model"]["model_ref_sha256"],
+                                                          "x": 1}, "sha256:" + "0" * 64, {}):
+            probs = check_contents({**full, "base_model": bad})
+            self.assertTrue(any(p.field.endswith("base_model") for p in probs), bad)
+
+    def test_the_base_sha_is_read_from_the_field(self) -> None:
+        full = {"base_model": {"model_ref_sha256": "sha256:" + "a" * 64}, "registration_id": "x-base-" + "b" * 64}
+        self.assertEqual(trust_stages.registered_base(full), "sha256:" + "a" * 64)
+        self.assertIsNone(trust_stages.registered_base({"registration_id": "x-base-" + "b" * 64}))
+
     def test_registration_binds_the_base_model(self) -> None:
         proj = self.make()
         self.upto_registration(proj)

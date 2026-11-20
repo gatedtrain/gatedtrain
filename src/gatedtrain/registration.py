@@ -103,7 +103,7 @@ UNITS = {"item": "item", "prompt": "item"}          # `prompt` is the legacy ali
 # `created_at` (R13-7, required with `amends`, R11A-29), and `baseline_pilot_mean` (R13-9; name and
 # optionality: design choice, R11A-29).
 OPTIONAL_KEYS = ("pairing", "min_paired", "amends", "post_hoc", "created_at", "baseline_pilot_mean", "constraint_set",
-                 "judge_qualification", "contamination", "clauses",
+                 "judge_qualification", "contamination", "clauses", "base_model",
                  "rename_proof") + tuple(d["field"] for d in _DISCLOSURES)   # rename_proof: R17-3
 # Design revision 15 (05 section 6.1, R15-1; tests/README.md section 11.20, EXT-127): a construct-aligned deciding
 # evaluator (its registry row declares `construct_aligned`) needs the registration to state what a pass shows, in
@@ -557,6 +557,12 @@ def check_contents(reg: dict, *, evaluator_id: str | None = None) -> list[Proble
         bad("prompt_set_hash", "not a sha256:<64 hex> manifest hash", "record the item-set manifest hash")
     if "eval_distribution" in reg:
         _check_eval_distribution(reg["eval_distribution"], bad)
+    if "base_model" in reg:                  # AI-native AN-7: the registered base model reference (05 section 18)
+        bm = reg["base_model"]
+        h = bm.get("model_ref_sha256") if isinstance(bm, dict) else None
+        if not (isinstance(bm, dict) and set(bm) == {"model_ref_sha256"} and isinstance(h, str) and SHA_RE.match(h)):
+            bad("base_model", "base_model is not {model_ref_sha256: sha256:<64 hex>}",
+                "give `base_model: {model_ref_sha256: sha256:<64 hex>}` or remove it")
     if "created_at" in reg and _utc_time(reg["created_at"]) is None:
         bad("created_at", f"created_at {reg['created_at']!r} is not an RFC 3339 UTC time (05 section 3.7, R13-7)",
             "set `created_at` to the registration's creation time in RFC 3339 UTC format")
