@@ -28,7 +28,7 @@ from pathlib import Path
 
 import yaml
 
-from _ext import ENV_HOST_WORK
+from _ext import ENV_HOST_WORK, container_user
 from _support import file_sha256
 from test_ext_launch import VENV_LOCK, bound_spec, golden_request, host_layout, rooted
 
@@ -135,13 +135,13 @@ class TestSidecarAccepted(SidecarCase):
         self.assertEqual(side["interpreter_sha256"], file_sha256(self.exec_dir / ".venv" / "bin" / "python"))
         self.assertEqual(side["script_sha256"], file_sha256(self.exec_dir / "serve.py"))
         self.assertEqual((side["network"], side["user"], side["read_only"], side["gpus"]),
-                         ("none", "1000:1000", True, False))
+                         ("none", container_user(), True, False))
         lines = cmd.split("\n")
         self.assertEqual(len(lines), 3, cmd)
         name = f"gatedtrain-exec-{rec['label']}"
         execd, spool = os.path.realpath(self.exec_dir), os.path.realpath(self.spool)
         self.assertEqual(lines[0], (
-            f"docker --context gatedtrain run -d --name {name} --rm --network none --user 1000:1000 --cap-drop ALL "
+            f"docker --context gatedtrain run -d --name {name} --rm --network none --user {container_user()} --cap-drop ALL "
             "--security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=4g --cpus 8 "
             "--memory 8g --memory-swap 8g --pids-limit 256 --ulimit nofile=1024:1024 --ulimit core=0 "
             "-e HOME=/tmp/home -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1 "
@@ -220,11 +220,13 @@ class TestSidecarRefusedIsolation(SidecarCase):
 
     def test_user(self):
         """The executor binds its socket with umask 077: only the trainer's uid may connect. The whole `uid:gid` must
-        equal the trainer's (1000:1000), so a matching uid with another gid is refused too."""
-        for user in ("1001:1001", "1000:1001", "1001:1000"):
+        equal the trainer's (the running user), so a matching uid with another gid is refused too."""
+        uid, gid = container_user().split(":")
+        other_uid, other_gid = str(int(uid) + 1), str(int(gid) + 1)
+        for user in (f"{other_uid}:{other_gid}", f"{uid}:{other_gid}", f"{other_uid}:{gid}"):
             with self.subTest(user=user):
                 self.refused(lambda r: r["sidecar"].update(user=user), "sidecar.user",
-                             text=f"user {user!r} is not the trainer's '1000:1000'")
+                             text=f"user {user!r} is not the trainer's {container_user()!r}")
 
     def test_flags(self):
         for key, value in (("read_only", False), ("cap_drop", []), ("cap_drop", ["NET_RAW"]), ("security_opt", []),
