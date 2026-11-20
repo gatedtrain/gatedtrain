@@ -6,8 +6,8 @@ proposes what the stage would do and has no side effects; `run` executes a confi
 artifacts it wrote; `check` re-validates the outputs and returns refusals in the standard problem form.
 
 The five trust stages are built-in names reserved by the registry: a plugin that registers one of them is
-refused (`AN-3`), so an agent cannot swap a trust stage for its own implementation. In step 1 the built-ins are
-placeholders; the real trust stages replace them without changing the reserved names.
+refused (`AN-3`), so an agent cannot swap a trust stage for its own implementation. `intake_seal` and `preregister` are real (trust_stages.py); the other three are placeholders until their
+implementation lands, without changing the reserved names.
 """
 
 from __future__ import annotations
@@ -87,7 +87,12 @@ def _placeholder(name: str) -> type:
 
 
 def builtin_stages() -> dict[str, type]:
-    return {name: _placeholder(name) for name in TRUST_STAGES}
+    from .trust_stages import IntakeSeal, Preregister
+
+    stages = {name: _placeholder(name) for name in TRUST_STAGES}
+    stages["intake_seal"] = IntakeSeal
+    stages["preregister"] = Preregister
+    return stages
 
 
 def _plugin_entry_points() -> list[Any]:
