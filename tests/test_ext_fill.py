@@ -235,7 +235,17 @@ class TestFillLora(FillCase):
                           env_version_sha256=file_sha256(arm / "env_version.json"))
             (ok / "env_version.json").write_bytes((arm / "env_version.json").read_bytes())
             self.assertIn("checkpoint.model_hash", self.fill(ok, checkpoint=self.lora, base=self.base)["filled"])
-            (self.lora / "normalizer.json").unlink()                       # EXT-154: unreadable refuses
+            # a set value that is not the cut's is refused, each field on its own (MM-19, EXT-154)
+            other = "sha256:" + "2" * 64
+            for key in ("normalizer_sha256", "env_version_sha256"):
+                vals = {"normalizer_sha256": file_sha256(self.lora / "normalizer.json"),
+                        "env_version_sha256": file_sha256(arm / "env_version.json"), key: other}
+                bad = self.arm(f"arm-{key}", **vals)
+                (bad / "env_version.json").write_bytes((arm / "env_version.json").read_bytes())
+                probs = self.refused(bad, f"ARM.{key}", checkpoint=self.lora, base=self.base)
+                self.assertEqual([p.field for p in probs], [f"ARM.{key}"])
+                self.assertIn(f"{key} is {other!r}, not the cut's", probs[0].message)
+            (self.lora / "normalizer.json").unlink()                      # EXT-154: unreadable refuses
             self.refused(self.arm("arm-gone"), "--checkpoint", checkpoint=self.lora, base=self.base)
 
 
