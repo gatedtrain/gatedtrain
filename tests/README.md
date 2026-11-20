@@ -353,6 +353,11 @@ Interfaces:
 | `test_ledger_unit.py` | Ledger writer on NeMo RL-shaped fixture outputs | yes |
 | `test_e2e_slow.py` | E2E-pass, the three negative controls plus the NI variant, registration integrity, impact query, determinism, no-overwrite, warm-up, stub markers | yes (slow) |
 | `test_stubs_docs_tierb.py` | Stub marking in code, docs, Tier B command construction and parsing | yes |
+| `test_ext_sidecar.py` | EXT-190, EXT-249: the paired sidecar in process (synthetic adapter, sidecar row through `HostConfig.sidecar`): the accepted record and printed start, trainer and stop lines, each isolation refusal (image, lock, flags, network, user, limits, tmpfs, mounts, socket, credential file, spool, environment, argv), `--recheck` | yes |
+| `test_ext_fill.py` | EXT-110, EXT-126, EXT-154, EXT-241: `ext-arm-fill` fill, verify, convert and refuse, the LoRA base, normalizer and environment version paths (a patched subclass of the synthetic adapter), the CLI lines | yes |
+| `test_ext_rederive.py` | EXT-52: `arm.provenance_problems` re-derives merged (`ext-merge-eval`) and converted (`ext-from-nel`) arms in process | yes |
+| `test_ext_sdk.py` | The adapter SDK readers, safetensors check, option parsing and `runtime_argv_problems`, `runtime_script_problems`; `rowkit`; the B18 executor limits; the NeMo RL family pins | yes |
+| `test_family_flow_grpo.py` | The Flow-GRPO and diffusers LoRA family bases on a synthetic run (`MiniFlowGrpo`): cuts, identity, the observed ledger and each samples, plan, steps and cut-count refusal, target overlap, pins, the family's run checks | yes |
 
 ### 8.1 Mutants (MVP-SPEC §7) and the tests that kill them
 
