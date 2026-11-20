@@ -1913,7 +1913,7 @@ step 2 and are not tested here.
 | AN-5 | Same inputs and decision give identical artifacts or a refusal; interrupted stage resumes from records | `tests/test_an_machine.py` |
 | AN-6 | `intake_seal`: deterministic split, only the allowed views pass on, unlabelled data refused, small-data warning (pilot sigma 0.5 for `exact_match`) | `tests/test_an_intake.py` |
 | AN-7 | `preregister`: registration fields, metric from the library, nothing trains before confirmation, amendment marks `post_hoc` | `tests/test_an_intake.py` |
-| AN-8 | `evaluate_sealed`: records out, no item content out; the stub states its guarantee | `tests/test_an_gate.py` |
+| AN-8 | `evaluate_sealed`: records out, no item content out; the stub states its guarantee; one sealed evaluation per project (a claim in the trust store bound to the candidate's model hash: the same candidate may be scored again, another candidate is refused, and the report lists every `evaluate_sealed` attempt) | `tests/test_an_gate.py` |
 | AN-9 | `gate` on the sealed records: item-set hash check, `post_hoc`, `FixedAlphaLedger` refuses a second attempt, attempt log | `tests/test_an_gate.py` |
 | AN-10 | `report` from records only; `sealed_guarantee` in the known limits; unrecorded numbers refused | `tests/test_an_gate.py` |
 | all | End to end on the synthetic pack | `tests/test_an_e2e.py`, `tests/test_an_synthetic_pack.py` |

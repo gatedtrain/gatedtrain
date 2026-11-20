@@ -55,6 +55,7 @@ DEFAULT_ALPHA = 0.05
 DEFAULT_POWER = 0.8
 PILOT_SIGMA = 0.5            # the maximum SD of a 0/1 score, so the plan never under-sizes the sealed part
 MAX_SEALED_FRACTION = 0.5
+SEALED_TEST_USED = "this project's sealed test is used; testing another candidate needs new sealed data"
 
 
 def _refuse(rule: str, field: str, message: str, fix: str) -> Refused:
@@ -644,7 +645,12 @@ class EvaluateSealed:
     """AN-8: scores the sealed items with exactly the registered sampler and eval_seeds and exact match only. What
     leaves the trust backend is one `{item_id, seed, score}` record per item and seed (`item_id` is an index the
     backend assigns, not a content hash). In step 1 the operator process can still read the sealed items; the
-    guarantee is stated (`sealed_guarantee`), not enforced."""
+    guarantee is stated (`sealed_guarantee`), not enforced.
+
+    A project has one sealed evaluation: before scoring, `run` claims it in the trust store for the candidate's
+    model hash (and the registration). Scoring the same candidate again is allowed; another candidate is refused
+    (`AN-8`), because comparing several candidates on the sealed set and gating the best would select on the test
+    data without spending alpha."""
 
     name = "evaluate_sealed"
     version = "1"
@@ -699,6 +705,15 @@ class EvaluateSealed:
                               f"the {arm} model names the generator {model.get('generator')!r}, not the registered "
                               f"{served[1]!r}", "both models must be served by the registered generator")
             models[arm] = model
+        # One sealed evaluation per project (05 §18.5: no repeated testing): the claim is made before any item is
+        # scored, so scoring several candidates and gating the best is refused. The same candidate may be scored
+        # again (its scores do not change); any later registration is an amendment after training, so post hoc.
+        claim = ctx.trust.claim_sealed_evaluation(cand_ref.sha256, reg["hash"])
+        if claim.get("candidate_model_sha256") != cand_ref.sha256:
+            raise _refuse("AN-8", "inputs.candidate_model",
+                          f"the sealed set of this project was already used to evaluate another candidate "
+                          f"({claim.get('candidate_model_sha256')}); scoring a second one would select on the test "
+                          "data", SEALED_TEST_USED)
         out: dict[str, ArtifactRef] = {}
         for arm in ("baseline", "candidate"):
             ref = ctx.inputs[f"{arm}_model"]
@@ -857,6 +872,7 @@ class Gate:
         return problems
 
 
+_LOGGED_STAGES = ("evaluate_sealed", "gate")      # every attempt row (start, done, failed, refused) goes in the report
 METRIC_UNITS = {"exact_match": "share of items answered exactly (0 to 1)"}
 REPORT_MD = "report.md"
 
@@ -913,8 +929,9 @@ def render_markdown(report: dict) -> str:
     for e in report["ledger"]:
         outcome = {True: "passed", False: "did not pass", None: "no outcome recorded"}[e["passed"]]
         lines.append(f"- attempt {e['attempt_id']}: alpha {e['alpha']}, {outcome}")
+    lines += ["", "## Sealed evaluation and gate log"]
     for a in report["attempts"]:
-        lines.append(f"- log: attempt {a['attempt']} {a['event']} at {a['utc']}")
+        lines.append(f"- {a['stage']} attempt {a['attempt']} {a['event']} at {a['utc']}")
     lines += ["", "## Known limits", report["sealed_guarantee"], ""]
     return "\n".join(lines)
 
@@ -945,8 +962,9 @@ class Report:
             raise _refuse("AN-10", "inputs.gate_result", "the gate result is not for the latest registration",
                           "rerun the gate in a new project or rerun report with the matching result")
         keep = {"schema", "schema_version"}
-        attempts = [{"attempt": r.get("attempt"), "event": r.get("event"), "utc": r.get("utc"), "key": r.get("key")}
-                    for r in ctx.project.read_attempts() if r.get("stage") == "gate"]
+        attempts = [{"stage": r.get("stage"), "attempt": r.get("attempt"), "event": r.get("event"), "utc": r.get("utc"),
+                     "key": r.get("key")}
+                    for r in ctx.project.read_attempts() if r.get("stage") in _LOGGED_STAGES and r.get("event") != "stale"]
         return {**_meta(SCHEMA_REPORT),
                 "status": _effective_status(gate["status"], bool(reg["post_hoc"])),
                 "metric": {"scorer": reg["scorer"], "unit": METRIC_UNITS[reg["scorer"]]},

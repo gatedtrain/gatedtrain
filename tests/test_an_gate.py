@@ -896,6 +896,101 @@ class ModelBindingTest(GateBase):
         self.assertEqual(trust_stages.registered_base(full), base.sha256)
 
 
+def tunable_train(stage_name: str = "train_x") -> type:
+    """A training stage whose answer rate comes from the decision (`rate`), so a rerun yields a new candidate."""
+
+    class _Train(model_stage(stage_name, 1.0, True)):
+        def run(self, ctx, decision):
+            rec = {"schema": SCHEMA_MODEL_REF, "schema_version": 1, "generator": GENERATOR,
+                   "rate": decision.get("rate", 1.0), "label": stage_name}
+            return {"model": ctx.project.write_artifact(self.name, "model", rec, SCHEMA_MODEL_REF)}
+
+    return _Train
+
+
+class SealedOnceTest(GateBase):
+    """Final review C1: one sealed evaluation per project. Scoring several candidates on the sealed set and gating
+    the best one would select on the test data without spending alpha (design 05 §18.5: no repeated testing)."""
+
+    def registry(self) -> dict:
+        return {**super().registry(), "train_x": tunable_train()}
+
+    def evaluate_twice(self, proj: Project, rates: tuple[float, float]):
+        self.upto_registration(proj)
+        self.run_(proj, "train_x", {"rate": rates[0], "rerun": True})
+        first = self.run_(proj, "evaluate_sealed").outputs
+        self.run_(proj, "train_x", {"rate": rates[1], "rerun": True})
+        return first
+
+    def test_a_second_candidate_is_refused(self) -> None:
+        proj = self.make()
+        first = self.evaluate_twice(proj, (0.6, 0.9))
+        before = (proj.root / first["candidate_records"].path).read_bytes()
+        with self.assertRaises(Refused) as cm:
+            self.run_(proj, "evaluate_sealed")
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field), ("AN-8", "inputs.candidate_model"))
+        self.assertIn("this project's sealed test is used", p.fix)
+        self.assertIn("new sealed data", p.fix)
+        self.assertNotIn("new project", p.fix)
+        self.assertEqual((proj.root / first["candidate_records"].path).read_bytes(), before)   # nothing rescored
+        self.assertEqual(proj.read_attempts()[-1]["event"], "refused")
+        with self.assertRaises(Refused):                                   # and the gate cannot use stale records
+            self.run_(proj, "gate")
+        self.assertEqual(FixedAlphaLedger(proj).entries(), [])
+
+    def test_the_claim_is_a_trust_record_bound_to_the_candidate_and_the_registration(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+        self.run_(proj, "evaluate_sealed")
+        claim = InProcessTrust(proj).sealed_evaluation()
+        cand = self.run_(proj, "train_x").outputs["model"]
+        self.assertEqual(claim["candidate_model_sha256"], cand.sha256)
+        self.assertEqual(claim["registration_hash"], proj.read_artifact(self.reg_ref(proj))["hash"])
+        self.assertTrue((proj.root / InProcessTrust.SEALED_EVALUATION).is_file())
+
+    def test_the_same_candidate_may_be_scored_again(self) -> None:
+        proj = self.make()
+        self.upto_registration(proj)
+        first = self.run_(proj, "evaluate_sealed").outputs
+        again = self.run_(proj, "evaluate_sealed", {"rerun": True, "again": 1})
+        self.assertFalse(again.reused)
+        self.assertEqual(again.outputs["candidate_records"].sha256, first["candidate_records"].sha256)
+        self.assertEqual(self.gate(proj), "PASS")
+
+    def gate(self, proj: Project) -> str:
+        return proj.read_artifact(self.run_(proj, "gate").outputs["gate_result"])["status"]
+
+    def test_back_to_the_evaluated_candidate_the_gate_runs_and_the_report_lists_every_attempt(self) -> None:
+        proj = self.make()
+        self.evaluate_twice(proj, (1.0, 0.9))
+        with self.assertRaises(Refused):
+            self.run_(proj, "evaluate_sealed")
+        self.run_(proj, "train_x", {"rate": 1.0, "rerun": True})             # the evaluated candidate again
+        self.run_(proj, "evaluate_sealed")                                  # done and current: a reuse
+        self.assertEqual(self.gate(proj), "PASS")
+        rep = proj.read_artifact(self.run_(proj, "report").outputs["report"])
+        evals = [(a["event"]) for a in rep["attempts"] if a["stage"] == "evaluate_sealed"]
+        self.assertEqual(evals, ["start", "done", "start", "refused"])
+        md = (proj.root / "stages" / "report" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("evaluate_sealed attempt 2 refused", md)
+
+    def test_the_claim_is_a_side_effect_so_a_later_refusal_fails_the_attempt(self) -> None:
+        from gatedtrain.ainative.machine import status
+
+        def boom(model_ref, item, *, sampler, seed):
+            raise RuntimeError("pack bug")
+
+        proj = self.make()
+        self.upto_registration(proj)
+        TEST_GENERATORS[GENERATOR] = boom
+        trust_stages._reset_scenario_snapshot()
+        with self.assertRaises(Refused):
+            self.run_(proj, "evaluate_sealed")
+        self.assertEqual(proj.read_attempts()[-1]["event"], "failed")       # the claim was made before scoring
+        self.assertEqual(status(proj, registry=self.registry())["evaluate_sealed"]["status"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()
 

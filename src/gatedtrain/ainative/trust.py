@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -45,6 +46,10 @@ class TrustBackend(Protocol):
 
     def latest_registration(self) -> str | None: ...              # the hash the last `register` returned
 
+    def claim_sealed_evaluation(self, candidate_sha256: str, registration_hash: str) -> dict: ...  # the claim on record
+
+    def sealed_evaluation(self) -> dict | None: ...               # the claim on record, or None
+
 
 class AlphaLedger(Protocol):
     def available(self) -> float: ...
@@ -71,6 +76,11 @@ def _hex(digest: object) -> str:
     return h
 
 
+def _refuse_sealed_claim() -> Refused:
+    return Refused([Problem("AN-8", "trust/sealed_evaluation", "the sealed evaluation claim is missing or damaged",
+                            "this project's sealed test is used; a new test needs new sealed data")])
+
+
 def _read_trust_file(project: Project, rel: str) -> bytes | None:
     _refuse_links(project.root, rel)
     try:
@@ -92,6 +102,7 @@ class InProcessTrust:
 
     sealed_guarantee = UNSEALED_GUARANTEE
     LATEST = "trust/registrations/latest"
+    SEALED_EVALUATION = "trust/sealed_evaluation"
 
     def __init__(self, project: Project) -> None:
         self.project = project
@@ -151,6 +162,44 @@ class InProcessTrust:
         digest = data.decode("ascii", "replace").strip()
         _hex(digest)
         return digest
+
+    def claim_sealed_evaluation(self, candidate_sha256: str, registration_hash: str) -> dict:
+        """Claim the project's one sealed evaluation for this candidate. The claim is created once, complete, by a
+        hard link that fails when it exists (no half-written claim); the claim on record is returned, so the caller
+        sees an earlier claim for another candidate and refuses."""
+        rel = self.SEALED_EVALUATION
+        _refuse_links(self.project.root, rel)
+        path = self.project.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        claim = {"candidate_model_sha256": candidate_sha256, "registration_hash": registration_hash}
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".sealed_evaluation.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(canonical_json(claim))
+                f.flush()
+                os.fsync(f.fileno())
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+        finally:
+            os.unlink(tmp)
+        held = self.sealed_evaluation()
+        if held is None:
+            raise _refuse_sealed_claim()
+        return held
+
+    def sealed_evaluation(self) -> dict | None:
+        data = _read_trust_file(self.project, self.SEALED_EVALUATION)
+        if data is None:
+            return None
+        try:
+            claim = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            claim = None
+        if not (isinstance(claim, dict) and isinstance(claim.get("candidate_model_sha256"), str)
+                and isinstance(claim.get("registration_hash"), str)):
+            raise _refuse_sealed_claim()
+        return claim
 
     def registration(self, hash: str) -> dict:
         rel = f"trust/registrations/{_hex(hash)}.json"

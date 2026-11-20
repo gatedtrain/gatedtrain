@@ -8,7 +8,8 @@ Attempt lines: `{stage, attempt, key, event, utc}` with `event` one of `start` (
 `failed` (also names the error), `refused` (a stage refused in `run` before it wrote any record or spent alpha: also the rules and
 the first reason; it is audit only and `_states` ignores it, so a refused attempt, such as a second gate or an
 amendment after the alpha is spent, never changes the derived state) and `stale` (an audit note that a rerun of an
-earlier stage invalidated this one). A refusal after the stage wrote records or spent alpha, or raised by the output checks, is
+earlier stage invalidated this one). A refusal after the stage wrote records, spent alpha or changed a trust marker
+(the alpha claim, the latest registration, the claim of the sealed evaluation), or raised by the output checks, is
 `failed` (with its rules and reason).
 A `done` line records the key parts (`stage_type`, `version`, `params_sha256`, `input_sha256s`, `decision_sha256`).
 Staleness is derived from those parts, never from `stale` lines: a done stage is `stale` when its recorded type,
@@ -228,9 +229,14 @@ def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, 
     return registry[sref.stage]().plan(ctx)
 
 
-def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int]:
-    """What a stage's `run` may have changed: the hash of every file under `stages/<stage>/` and the number of lines
-    in the alpha ledger (a spend is a side effect)."""
+# Trust files whose change is a side effect of a stage: the alpha claim, the latest registration and the claim of
+# the project's one sealed evaluation (the ledger is counted by lines, below).
+_TRUST_MARKERS = ("trust/spent", "trust/registrations/latest", "trust/sealed_evaluation")
+
+
+def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, dict[str, str | None]]:
+    """What a stage's `run` may have changed: the hash of every file under `stages/<stage>/`, the number of lines
+    in the alpha ledger (a spend is a side effect) and the hash of each trust marker file (`_TRUST_MARKERS`)."""
     files: dict[str, str] = {}
     base = project.root / "stages" / stage
     if base.is_dir():
@@ -241,7 +247,13 @@ def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int]:
         lines = (project.root / "trust" / "ledger.jsonl").read_bytes().count(b"\n")
     except OSError:
         lines = 0
-    return files, lines
+    markers: dict[str, str | None] = {}
+    for rel in _TRUST_MARKERS:
+        try:
+            markers[rel] = sha256_bytes((project.root / rel).read_bytes())
+        except OSError:
+            markers[rel] = None
+    return files, lines, markers
 
 
 def done_output(project: Project, stage: str, name: str, *, spec: PipelineSpec | None = None,
