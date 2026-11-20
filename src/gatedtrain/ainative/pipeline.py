@@ -6,7 +6,7 @@ a pluggable stage before `report`, and it checks the wiring (inputs from earlier
 the stage types and the params.
 
     name: <pipeline name>
-    training_stages: [<stage name or type>, ...]     # optional; a stage needing "gpu" is also a training stage
+    training_stages: [<stage name or type>, ...]     # optional; can only ADD training stages
     stages:
       - {name: <ref>, stage: <registered type>, params: {...}, inputs: {<input>: "<ref>.<output>"}}
 """
@@ -75,7 +75,8 @@ def load_pipeline(path: Path) -> PipelineSpec:
 
 def _is_training(spec: PipelineSpec, ref: StageRef, cls: Any) -> bool:
     needs = getattr(cls, "needs", frozenset()) if cls is not None else frozenset()
-    return "gpu" in needs or ref.name in spec.training_stages or ref.stage in spec.training_stages
+    trains = bool(getattr(cls, "trains", False)) if cls is not None else False
+    return trains or "gpu" in needs or ref.name in spec.training_stages or ref.stage in spec.training_stages
 
 
 def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
@@ -89,6 +90,14 @@ def pipeline_problems(spec: PipelineSpec, registry: dict) -> list[Problem]:
     for i, ref in enumerate(stages):
         if names.index(ref.name) != i:
             add(f"stages[{i}].name", f"stage name {ref.name!r} is used twice", "give every stage a unique name")
+
+    for k, entry in enumerate(spec.training_stages):
+        if entry in TRUST_STAGES:
+            add(f"training_stages[{k}]", f"{entry!r} is a trust stage and cannot be listed as a training stage",
+                "list only pluggable stages")
+        elif entry not in names and entry not in registry:
+            add(f"training_stages[{k}]", f"{entry!r} matches no stage name or registered stage type",
+                "list the name of a stage in this pipeline")
 
     # Stage types, params, wiring.
     for i, ref in enumerate(stages):

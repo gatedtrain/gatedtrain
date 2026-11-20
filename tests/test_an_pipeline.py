@@ -22,10 +22,10 @@ from gatedtrain.errors import Problem, Refused
 S = "gatedtrain.ainative."
 
 
-def _stub(name, inputs=None, outputs=None, needs=(), params=()):
+def _stub(name, inputs=None, outputs=None, needs=(), params=(), trains=False):
     return type(name, (), {
         "name": name, "version": "1", "inputs": dict(inputs or {}), "outputs": dict(outputs or {}),
-        "needs": frozenset(needs), "params": frozenset(params)})
+        "needs": frozenset(needs), "params": frozenset(params), "trains": trains})
 
 
 REGISTRY = {
@@ -33,6 +33,7 @@ REGISTRY = {
     "preregister": _stub("preregister", {"views": S + "views"}, {"prereg": S + "prereg"}),
     "train": _stub("train", {"prereg": S + "prereg"}, {"model": S + "model"}, needs={"gpu"}, params={"steps"}),
     "tune": _stub("tune", {"prereg": S + "prereg"}, {"model": S + "model"}),   # trains only by name
+    "trainer": _stub("trainer", {"prereg": S + "prereg"}, {"model": S + "model"}, trains=True),  # no gpu need
     "prep": _stub("prep", {"views": S + "views"}, {"prepared": S + "views"}),
     "note": _stub("note", outputs={"note": S + "note"}),
     "evaluate_sealed": _stub("evaluate_sealed", {"model": S + "model", "prereg": S + "prereg"},
@@ -105,6 +106,18 @@ class PipelineValidatorTest(PipelineBase):
         tune = {"name": "tune", "stage": "tune", "inputs": {"prereg": "preregister.prereg"}}
         p = self.problems([INTAKE, tune, PREREG, EVAL, GATE, REPORT], training_stages=["tune"])
         self.assertRefused(p, "stages[2].stage", "preregister must come before every training stage")
+
+    def test_trains_flag_stage_before_preregister(self):
+        trainer = {"name": "trainer", "stage": "trainer", "inputs": {"prereg": "preregister.prereg"}}
+        p = self.problems([INTAKE, trainer, PREREG, EVAL, GATE, REPORT])
+        self.assertRefused(p, "stages[2].stage", "preregister must come before every training stage")
+
+    def test_training_stages_entries_validated(self):
+        p = self.problems(GOOD, training_stages=["ghost"])
+        self.assertRefused(p, "training_stages[0]", "matches no stage")
+        p = self.problems(GOOD, training_stages=["gate"])
+        self.assertRefused(p, "training_stages[0]", "trust stage")
+        self.assertEqual(self.problems(GOOD, training_stages=["train"]), [])
 
     def test_evaluate_sealed_before_last_training_stage(self):
         p = self.problems([INTAKE, PREREG, EVAL, TRAIN, GATE, REPORT])
@@ -205,6 +218,49 @@ class StageRegistryTest(unittest.TestCase):
                 p = cm.exception.problems[0]
                 self.assertEqual((p.rule, p.field), ("AN-3", f"entry point {name}"))
                 self.assertTrue(p.fix)
+
+    def _refused_plugin(self, cls):
+        ep = SimpleNamespace(name="mine", value="x:Y", load=lambda: cls)
+        with mock.patch.object(stage_mod, "_plugin_entry_points", return_value=[ep]):
+            with self.assertRaises(Refused) as cm:
+                stage_registry()
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field), ("AN-3", "entry point mine"))
+        self.assertTrue(p.fix)
+        return p
+
+    def test_plugin_attribute_validation(self):
+        def without(attr):
+            return type("P", (), {k: v for k, v in vars(REGISTRY["note"]).items()
+                                  if k != attr and not k.startswith("__")})
+        for attr in ("name", "version", "inputs", "outputs", "needs", "params", "trains"):
+            with self.subTest(missing=attr):
+                self.assertIn(attr, self._refused_plugin(without(attr)).message)
+        bad = {"needs": frozenset({"GPU"}), "trains": "yes", "name": 3, "version": 1, "inputs": {"a": 1},
+               "outputs": [], "params": {"a"}}
+        for attr, value in bad.items():
+            with self.subTest(bad=attr):
+                cls = type("P", (REGISTRY["note"],), {attr: value})
+                self.assertIn(attr, self._refused_plugin(cls).message)
+        cls = type("P", (REGISTRY["note"],), {"needs": frozenset({"cuda"})})
+        self.assertIn("cuda", self._refused_plugin(cls).message)
+        cls = type("P", (REGISTRY["note"],), {"needs": ["gpu"]})
+        self.assertIn("needs", self._refused_plugin(cls).message)
+
+    def test_plugin_load_failure(self):
+        def boom():
+            raise ImportError("nope")
+        ep = SimpleNamespace(name="mine", value="x:Y", load=boom)
+        with mock.patch.object(stage_mod, "_plugin_entry_points", return_value=[ep]):
+            with self.assertRaises(Refused) as cm:
+                stage_registry()
+        self.assertEqual((cm.exception.problems[0].rule, cm.exception.problems[0].field), ("AN-3", "entry point mine"))
+        self.assertIn("nope", cm.exception.problems[0].message)
+
+    def test_builtins_do_not_train(self):
+        with mock.patch.object(stage_mod, "_plugin_entry_points", return_value=[]):
+            reg = stage_registry()
+        self.assertTrue(all(reg[n].trains is False for n in TRUST_STAGES))
 
     def test_proposal_and_context_shapes(self):
         prop = Proposal("train", "summary", {"a": 1}, {"gpu_h": 0}, None)

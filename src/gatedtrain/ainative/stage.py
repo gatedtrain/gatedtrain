@@ -52,6 +52,7 @@ class Stage(Protocol):
     outputs: dict[str, str]
     needs: frozenset[str]         # subset of NEEDS
     params: frozenset[str]        # accepted param names
+    trains: bool                  # True when the stage trains a model (the registry decides, not the spec)
 
     def plan(self, ctx: StageContext) -> Proposal: ...
 
@@ -69,6 +70,7 @@ class _TrustPlaceholder:
     outputs: dict[str, str] = {}
     needs: frozenset[str] = frozenset()
     params: frozenset[str] = frozenset()
+    trains = False
 
     def plan(self, ctx: StageContext) -> Proposal:
         raise NotImplementedError(f"trust stage {self.name!r} is not implemented yet")
@@ -92,6 +94,31 @@ def _plugin_entry_points() -> list[Any]:
     return list(metadata.entry_points(group=STAGE_ENTRY_POINT_GROUP))
 
 
+def _is_str_map(value: object) -> bool:
+    return isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items())
+
+
+def _plugin_attr_problems(cls: Any) -> list[str]:
+    """What is wrong with the declared attributes of a plugin stage class (empty when it is well formed)."""
+    bad: list[str] = []
+
+    def check(attr: str, ok: Any, want: str) -> None:
+        if not hasattr(cls, attr):
+            bad.append(f"`{attr}` is missing (expected {want})")
+        elif not ok(getattr(cls, attr)):
+            bad.append(f"`{attr}` is {getattr(cls, attr)!r} (expected {want})")
+
+    check("name", lambda v: isinstance(v, str), "str")
+    check("version", lambda v: isinstance(v, str), "str")
+    check("inputs", _is_str_map, "dict[str, str]")
+    check("outputs", _is_str_map, "dict[str, str]")
+    check("needs", lambda v: isinstance(v, frozenset) and v <= NEEDS,
+          f"frozenset subset of {sorted(NEEDS)}")
+    check("params", lambda v: isinstance(v, frozenset) and all(isinstance(x, str) for x in v), "frozenset[str]")
+    check("trains", lambda v: isinstance(v, bool), "bool")
+    return bad
+
+
 def stage_registry() -> dict[str, type]:
     """Built-ins plus plugins from the `gatedtrain.stages` entry-point group; a plugin named like a trust stage
     is refused."""
@@ -108,7 +135,20 @@ def stage_registry() -> dict[str, type]:
             problems.append(Problem("AN-3", f"entry point {ep.name}", f"stage name {ep.name!r} is registered twice",
                                     "give each plugin stage a unique name"))
             continue
-        registry[ep.name] = ep.load()
+        try:
+            cls = ep.load()
+        except Exception as exc:  # a broken plugin must not escape as a traceback
+            problems.append(Problem("AN-3", f"entry point {ep.name}",
+                                    f"plugin {ep.value!r} failed to load: {type(exc).__name__}: {exc}",
+                                    "fix or uninstall the plugin"))
+            continue
+        bad = _plugin_attr_problems(cls)
+        if bad:
+            problems.append(Problem("AN-3", f"entry point {ep.name}",
+                                    f"plugin {ep.value!r} is not a valid stage: " + "; ".join(bad),
+                                    "declare name, version, inputs, outputs, needs, params and trains on the class"))
+            continue
+        registry[ep.name] = cls
     if problems:
         raise Refused(problems)
     return registry
