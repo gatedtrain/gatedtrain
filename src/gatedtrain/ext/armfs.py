@@ -4,13 +4,16 @@ An arm directory is written by a container that may still run while it is collec
 path. The arm directory itself is opened once as the operator names it (a link to the arm is the operator's choice);
 every file below it is reached component by component under directory descriptors, never following a symbolic link:
 
-- intermediate components with `O_PATH | O_DIRECTORY | O_NOFOLLOW` (a directory the user may only search, mode
-  0o111, is fine; a link is refused);
-- the last component with `O_PATH | O_NOFOLLOW`, then `fstat`: only a regular file is opened for reading, through
-  `/proc/self/fd/<n>` with `O_NOCTTY`, and the reopened file must be the same (`st_dev`, `st_ino`). So a FIFO, a
-  socket or a device node is never opened (no block, no side effect of `open`), and nothing swapped in between is
-  read. Where `O_PATH` or `/proc/self/fd` is missing (macOS), `fstatat` without following, then `O_NOFOLLOW |
-  O_NONBLOCK | O_NOCTTY` and the same identity check.
+- on Linux (`O_PATH` and `/proc/self/fd`): intermediate components with `O_PATH | O_DIRECTORY | O_NOFOLLOW` (a
+  directory the user may only search, mode 0o111, is fine; a link is refused); the last component with `O_PATH |
+  O_NOFOLLOW`, then `fstat`: only a regular file is opened for reading, through `/proc/self/fd/<n>` with
+  `O_NOCTTY`, and the reopened file must be the same (`st_dev`, `st_ino`). So a FIFO, a socket or a device node is
+  never opened (no block, no side effect of `open`), and nothing swapped in between is read;
+- elsewhere (macOS), with weaker guarantees: intermediate components with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` (a
+  search-only directory is refused with EACCES), the last one inspected by `fstatat` without following and then
+  opened with `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`. A file swapped for a FIFO or device between the two is opened
+  (without blocking, `O_NONBLOCK`) and then refused by the identity check, so `open` itself may have a side effect
+  on a device there.
 
 `ArmSnapshot.read` reads `items.jsonl`, `eval_meta.json` and `merge.json` once each (at most `MAX_FILE_BYTES`), with
 their SHA-256; every check parses those bytes and `ext-collect` writes them into the run, so the run holds exactly
@@ -51,7 +54,7 @@ class Unreadable(Exception):
                 "absent": "is absent",
                 "not_regular": "is not a regular file",
                 "changed": "changed while it was opened",
-                "too_large": f"is larger than {MAX_FILE_BYTES} bytes"}.get(self.kind,
+                "too_large": f"is larger than {self.detail} bytes"}.get(self.kind,
                                                                            f"cannot be opened ({self.detail})")
 
     def text(self, what: str) -> str:
@@ -148,7 +151,11 @@ def open_regular(dir_fd: int, rel: str) -> int:
                              dir_fd=parent)
             except OSError as exc:
                 raise _classify(parent, name, exc) from None
-        now = os.fstat(fd)
+        try:
+            now = os.fstat(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise Unreadable("error", errname(exc)) from None
         if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(now.st_mode):
             os.close(fd)
             raise Unreadable("changed")
@@ -157,14 +164,16 @@ def open_regular(dir_fd: int, rel: str) -> int:
         os.close(parent)
 
 
-def read_fd(fd: int, limit: int = MAX_FILE_BYTES) -> bytes:
-    """Everything `fd` holds, at most `limit` bytes (Unreadable `too_large` beyond; OSError as Unreadable)."""
+def read_fd(fd: int, limit: int | None = None) -> bytes:
+    """Everything `fd` holds, at most `limit` bytes (default `MAX_FILE_BYTES`, read when called; Unreadable
+    `too_large` beyond; OSError as Unreadable)."""
+    limit = MAX_FILE_BYTES if limit is None else limit
     chunks, n = [], 0
     try:
         while chunk := os.read(fd, 1 << 20):
             n += len(chunk)
             if n > limit:
-                raise Unreadable("too_large")
+                raise Unreadable("too_large", str(limit))
             chunks.append(chunk)
     except OSError as exc:
         raise Unreadable("error", errname(exc)) from None
@@ -253,8 +262,19 @@ class ArmSnapshot:
 
 def under_root(root: Path | str, path: object) -> str | None:
     """`path` relative to `root` when it is an absolute path in normal form lexically at or below `root`, else None
-    (MM-5: provenance sources lie under the sources root)."""
-    r = posixpath.normpath(os.fspath(root))
+    (MM-5: provenance sources lie under the sources root). A relative `root` is taken from the working directory,
+    and `path` may name the root as written (absolute) or by its real path (a source recorded through the link
+    that the output root is, or the link's target)."""
+    from ..paths import realpath
+
+    for r in dict.fromkeys((os.path.abspath(root), realpath(os.path.abspath(root)))):
+        rel = _below(r, path)
+        if rel is not None:
+            return rel
+    return None
+
+
+def _below(r: str, path: object) -> str | None:
     if not (isinstance(path, str) and path.startswith("/") and "\x00" not in path
             and posixpath.normpath(path) == path and not path.startswith("//")):
         return None

@@ -15,8 +15,15 @@ Not released yet. Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPE
   is refused, also one that stays inside the arm. Write copies or hard links.
 - `output_ref` paths must be in canonical form: relative, UTF-8, no NUL, no `.`, `..` or empty component
   (`outputs/x.png`, not `./outputs//x.png`).
-- A merged arm's sources (`merge.json` `sources[].path`, or `run_dir` for `ext-from-nel`) must lie under the host's
-  output root, or under the directory given to `ext-collect --sources-root`.
+- A merged arm's sources (`merge.json` `sources[].path`, or `run_dir` for `ext-from-nel`) must be absolute paths in
+  normal form under the host's output root, or under the directory given to `ext-collect --sources-root` (a relative
+  one is taken from the working directory). Arms that 0.3.0 merged from paths spelled with `.` or `..` record such
+  paths and must be merged again.
+- `ext-from-nel` reads each NeMo Evaluator run once, without following links: a `full_config.yaml` or
+  `results.jsonl` that is a symbolic link, a FIFO or another non-regular file is refused, and the hashes recorded in
+  `merge.json` are those of the bytes checked.
+- Tests run as any non-root user (the launch fixtures run the container as the running user and its primary group).
+  With `GATEDTRAIN_REQUIRE_CONTAINER_USER=1`, as in CI, the tests that need such a user fail instead of skipping.
 
 ## Install and run the demo
 

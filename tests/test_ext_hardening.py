@@ -81,7 +81,8 @@ class CollectCase(unittest.TestCase):
     def record(self, **overrides) -> Path:
         return write_canonical(self.path("launch").with_suffix(".json"), self.sc.launch_record(**overrides))
 
-    def refused(self, rule: str, field_prefix: str | None = None, **collect_kw):
+    def refused(self, rule: str, field_prefix: str | None = None, *, reason: str | None = None, **collect_kw):
+        """The refusal's hits; with `reason`, one of them names it (review of PR 2, T6)."""
         runs = self.runs()
         collect_kw.setdefault("sources_root", self.tmp)  # MM-5: merged arms' sources are built under the test root
         proc = self.sc.collect(runs, **collect_kw)
@@ -91,6 +92,8 @@ class CollectCase(unittest.TestCase):
         self.assertTrue(hits, f"expected error[{rule}] {field_prefix}...; got {errs}\n{describe(proc)}")
         self.assertNotIn("Traceback", proc.stderr)
         self.assertTrue(no_run_dir(runs), "a refusal creates no run directory (MM-10)")
+        if reason is not None:
+            self.assertTrue(any(reason in h["message"] for h in hits), hits)
         return hits
 
     def passes(self, **collect_kw) -> dict:
@@ -464,7 +467,7 @@ class TestMetaCanonicalComparison(CollectCase):
 # EXT-45 (L4, review mutant M01): output_ref stays a plain file of the arm, never a reserved file
 # ---------------------------------------------------------------------------
 
-RESERVED = ("eval_meta.json", "./eval_meta.json", "items.jsonl", "merge.json", "judge_batches.jsonl")
+RESERVED = ("eval_meta.json", "items.jsonl", "merge.json", "judge_batches.jsonl")
 
 
 class TestOutputRef(CollectCase):
@@ -484,7 +487,10 @@ class TestOutputRef(CollectCase):
         for rel in RESERVED:
             with self.subTest(path=rel):
                 arm = self.arm_with_ref("res_" + rel.replace("/", "_"), rel)
-                self.refused("EXT-ARM", "--eval-candidate", candidate=arm)
+                self.refused("EXT-ARM", "--eval-candidate", candidate=arm, reason="names a file of the arm itself")
+        with self.subTest(path="./eval_meta.json"):                  # T7: another spelling is not canonical
+            arm = self.arm_with_ref("res_dot_eval_meta", "./eval_meta.json", self.tmp / "dot-target.txt")
+            self.refused("EXT-ARM", "--eval-candidate", candidate=arm, reason="is not in canonical form")
 
     def test_file_symlink_out_of_the_arm_refused(self):
         outside = self.tmp / "outside.txt"
@@ -494,8 +500,7 @@ class TestOutputRef(CollectCase):
         lines = read_jsonl(arm / "items.jsonl")
         lines[0]["output_ref"] = {"path": "link.txt", "sha256": file_sha256(outside)}
         (arm / "items.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines), encoding="utf-8")
-        hits = self.refused("EXT-ARM", "--eval-candidate", candidate=arm)
-        self.assertTrue(any("leaves the arm" in h["message"] or "symbolic link" in h["message"] for h in hits), hits)
+        self.refused("EXT-ARM", "--eval-candidate", candidate=arm, reason="contains a symbolic link")
 
     def test_directory_symlink_out_of_the_arm_refused(self):
         outside = self.tmp / "outside-dir"
@@ -684,17 +689,18 @@ class TestMergeProvenance(CollectCase):
         out, srcs = self.merged("changed")
         with (srcs[1] / "items.jsonl").open("a", encoding="utf-8") as f:
             f.write("\n")
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out,
+                     reason="merge.json source sources[1] items.jsonl differs from the recorded hash")
 
     def test_source_missing_refused(self):
         out, srcs = self.merged("missing")
         shutil.rmtree(srcs[0])
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out, reason="is absent; provenance cannot be checked")
 
     def test_seeds_disagree_refused(self):
         out, _ = self.merged("seeds")
         self.edit_merge_json(out, lambda m: m["sources"][1].update(seeds=[SEEDS[0]]))
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out, reason="merge.json sources cover seeds")
 
     def test_source_meta_other_model_refused(self):
         """A source evaluated another model than the merged arm claims."""
@@ -703,12 +709,13 @@ class TestMergeProvenance(CollectCase):
         meta["checkpoint"]["model_hash"] = "sha256:" + "9" * 64
         write_canonical(srcs[1] / "eval_meta.json", meta)
         self.edit_merge_json(out, lambda m: m["sources"][1].update(eval_meta_sha256=file_sha256(srcs[1] / "eval_meta.json")))
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out,
+                     reason="eval_meta.json differs from the arm's beyond eval_seeds")
 
     def test_unknown_schema_refused(self):
         out, _ = self.merged("schema")
         self.edit_merge_json(out, lambda m: m.update(schema="gatedtrain.something"))
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out, reason="merge.json schema is 'gatedtrain.something'")
 
     def test_from_nel_sources_checked(self):
         runs = nel_runs(self.tmp / "nel", self.sc.rows, score_fn=scorer_candidate, model="cand")
@@ -720,7 +727,8 @@ class TestMergeProvenance(CollectCase):
         self.assertEqual(self.passes(candidate=arm)["status"], "PASS")
         with (runs[1] / "gsm8k" / "results.jsonl").open("a", encoding="utf-8") as f:
             f.write("\n")
-        self.refused("EXT-ARM", "--eval-candidate", candidate=arm)
+        self.refused("EXT-ARM", "--eval-candidate", candidate=arm,
+                     reason="merge.json source sources[1] gsm8k/results.jsonl differs from the recorded hash")
 
 
 class TestEvaluatedBase(CollectCase):

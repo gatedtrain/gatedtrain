@@ -410,8 +410,12 @@ def provenance_problems(arm: Path, meta: dict, *, nel_benchmark: str | None, row
                 out.append(f"merge.json sources (repeat, seed) {got} are not the arm's eval_seeds {seeds} in order")
             for i, s in enumerate(sources):
                 run = s.get("run_dir")
-                if not isinstance(run, str) or nel_benchmark is None or path_problem(nel_benchmark):
+                if not isinstance(run, str):
                     out.append(f"merge.json sources[{i}] has no run_dir")
+                    continue
+                if nel_benchmark is None or path_problem(nel_benchmark):
+                    out.append(f"the evaluator's nel_benchmark {nel_benchmark!r} is not a relative path in canonical "
+                               "form; provenance cannot be checked")
                     continue
                 dfd = source_dir(i, "run_dir", run)
                 if dfd is None:

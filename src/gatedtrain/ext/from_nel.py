@@ -6,7 +6,9 @@ The runs are read as `merge-eval` reads them, with the same strict helpers (`tie
 (orchestration/orchestrator.py:1046-1047, :1081 at ea35ba3) and the composed-config snapshot
 `<run>/full_config.yaml` (config/snapshot.py:72-81), whose header line `# nemo-evaluator version: <v>`
 (snapshot.py:59) names the framework version. Run r is repeat r with seed `eval_seeds[r]` of the registration,
-in registered order.
+in registered order. Each run directory is opened once and both files are read once without following links
+(`armfs`; a link, a FIFO or another non-regular file is refused): every check, the conversion and the hashes in
+`merge.json` use those bytes (docs/findings.md, "Review of PR 2, round 2").
 
 Each record is converted by `items.from_nemo_evaluator(record, scorer_key="scorer:<scorer>")` under the deciding
 evaluator's registry scorer (`scorer_rewards["scorer:numeric_match"]`, engine/eval_loop.py:785-794): a raising
@@ -40,11 +42,12 @@ from pathlib import Path
 import yaml
 
 from .. import TAGS
-from ..canonical import canonical_json, file_sha256, manifest_hash, sha256_bytes, text_lines, write_canonical
+from ..canonical import canonical_json, manifest_hash, sha256_bytes, text_lines, write_canonical
 from ..errors import Problem, Refused
 from . import registry
 from .collect import read_item_set
 from .arm import items_text
+from .armfs import Unreadable, open_arm, path_problem, read_file, sha256
 from .merge import load_registration, write_problem
 
 FROM_NEL_SCHEMA = "gatedtrain.ext_from_nel"
@@ -59,6 +62,29 @@ def _framework_version(config_text: str) -> str | None:
         if not line.startswith("#"):
             break
     return None
+
+
+def _read_run_files(run: Path, benchmark: str) -> tuple[dict[str, bytes | None], str | None]:
+    """`<run>/<benchmark>/results.jsonl` and `<run>/full_config.yaml`, each read once below the run directory without
+    following a link (`armfs`): ({results, config}: bytes, or None when absent; None) or ({}, why)."""
+    if path_problem(benchmark):
+        return {}, f"the registry's nel_benchmark {benchmark!r} is not a relative path in canonical form"
+    try:
+        fd = open_arm(run)
+    except Unreadable as exc:
+        return {}, f"the run directory {run} {exc.reason()}"
+    out: dict[str, bytes | None] = {}
+    try:
+        for key, rel in (("results", f"{benchmark}/results.jsonl"), ("config", "full_config.yaml")):
+            try:
+                out[key] = read_file(fd, rel)
+            except Unreadable as exc:
+                if exc.kind != "absent":
+                    return {}, exc.text(f"{run}/{rel}")
+                out[key] = None
+    finally:
+        os.close(fd)
+    return out, None
 
 
 def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, checkpoint: Path, out: Path,
@@ -118,8 +144,19 @@ def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, c
     versions = set()
     for r, run in enumerate(map(Path, runs)):
         fld = f"runs[{r}]"
+        # The run is read once, below the directory as named, without following links (review of PR 2, round 2):
+        # every check, the conversion and the hashes recorded in merge.json use these bytes.
         results = run / row["nel_benchmark"] / "results.jsonl"
-        recs, bad_lines = _read_run_strict(results)
+        data, why = _read_run_files(run, row["nel_benchmark"])
+        if why:
+            problems.append(Problem("EXT-NEL", fld, why, "pass the run's own output directory, with plain files"))
+            continue
+        try:
+            results_text = data["results"].decode("utf-8") if data["results"] is not None else None
+        except UnicodeDecodeError:
+            problems.append(Problem("EXT-NEL", fld, f"{results} is not UTF-8", fix))
+            continue
+        recs, bad_lines = _read_run_strict(results, text=results_text) if results_text is not None else ({}, [])
         if bad_lines:
             problems += [Problem("EXT-NEL", fld, f"{results}: {m}", fix) for m in bad_lines]
             continue
@@ -127,10 +164,13 @@ def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, c
             problems.append(Problem("EXT-NEL", fld, f"{results} is missing or holds no records", fix))
             continue
         try:
-            config_text = (run / "full_config.yaml").read_text(encoding="utf-8")
-            seed, repeats = _run_seed_and_repeats(run)
-            used = _run_sampler(run)
-            declared = _declared_scorers(yaml.safe_load(config_text))
+            if data["config"] is None:
+                raise FileNotFoundError("full_config.yaml")
+            config_text = data["config"].decode("utf-8")
+            cfg = yaml.safe_load(config_text)
+            seed, repeats = _run_seed_and_repeats(run, cfg)
+            used = _run_sampler(run, cfg)
+            declared = _declared_scorers(cfg)
         except (OSError, ValueError, yaml.YAMLError, AttributeError) as exc:
             problems.append(Problem("EXT-NEL", fld, f"cannot read {run}/full_config.yaml: {exc.__class__.__name__}",
                                     "pass the run's own output directory, with its config snapshot"))
@@ -153,8 +193,8 @@ def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, c
             problems.append(Problem("EXT-NEL", fld, f"the run's full_config.yaml declares scorers {declared!r}, not "
                                     f"the registry scorer `{scorer}` (G-21)", "evaluate with the scorer declared"))
         versions.add(_framework_version(config_text))
-        per_run.append({"run": run, "recs": recs, "results": results, "config": run / "full_config.yaml",
-                        "service_model": used.get("model")})
+        per_run.append({"run": run, "recs": recs, "results_sha256": sha256(data["results"]),
+                        "config_sha256": sha256(data["config"]), "service_model": used.get("model")})
     if not problems:
         if len(versions) != 1 or None in versions:
             problems.append(Problem("EXT-NEL", "runs", f"the runs' nemo-evaluator versions are {sorted(map(str, versions))}"
@@ -207,7 +247,7 @@ def from_nel(*, registration: Path, adapter: str, evaluator: str, items: Path, c
         write_canonical(tmp / "merge.json", {
             "schema": FROM_NEL_SCHEMA, "schema_version": "1.0", "tags": list(TAGS),
             "sources": [{"repeat": r, "seed": seeds[r], "run_dir": os.path.abspath(info["run"]),
-                         "results_sha256": file_sha256(info["results"]), "config_sha256": file_sha256(info["config"]),
+                         "results_sha256": info["results_sha256"], "config_sha256": info["config_sha256"],
                          "service_model": info["service_model"]}
                         for r, info in enumerate(per_run)],
             "notes": [f"Scores are NeMo Evaluator scorer_rewards[{key!r}] (engine/eval_loop.py:785-794 at ea35ba3); "

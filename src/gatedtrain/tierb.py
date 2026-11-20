@@ -338,12 +338,14 @@ def _declared_scorers(cfg: Any) -> list[str] | None:
 # H-3 merge-eval
 # ---------------------------------------------------------------------------
 
-def _run_sampler(run: Path) -> dict[str, Any]:
+def _run_sampler(run: Path, cfg: dict | None = None) -> dict[str, Any]:
     """The sampler a run actually used, from `<run>/full_config.yaml`: GenerationConfig temperature,
     top_p, max_tokens (config/services.py:38-41), the solver's fields overriding the service's
     (services.py:28-46), the service `model` (services.py:240-259) and
-    `proxy.extra_body.chat_template_kwargs.enable_thinking` (ProxyConfig.extra_body, services.py:82-105)."""
-    cfg = yaml.safe_load((run / "full_config.yaml").read_text(encoding="utf-8"))
+    `proxy.extra_body.chat_template_kwargs.enable_thinking` (ProxyConfig.extra_body, services.py:82-105). `cfg`: the
+    parsed snapshot when the caller already read it (ext-from-nel reads it once, without following links)."""
+    if cfg is None:
+        cfg = yaml.safe_load((run / "full_config.yaml").read_text(encoding="utf-8"))
     benches = [b for b in cfg.get("benchmarks") or [] if isinstance(b, dict)]
     bench = ([b for b in benches if b.get("name") == "gsm8k"] or benches or [{}])[0]
     solver = bench.get("solver") or {}
@@ -355,13 +357,14 @@ def _run_sampler(run: Path) -> dict[str, Any]:
             "model": service.get("model"), "enable_thinking": kwargs.get("enable_thinking")}
 
 
-def _run_seed_and_repeats(run: Path) -> tuple[int | None, int | None]:
+def _run_seed_and_repeats(run: Path, cfg: dict | None = None) -> tuple[int | None, int | None]:
     """Seed and repeats from NeMo Evaluator's composed-config snapshot `<run>/full_config.yaml`
     (config/snapshot.py:39, :72-81; written by executors/local_executor.py:69). The seed is the solver's
     `generation.seed` if set, otherwise the solver service's (config/solvers.py:26-36; GenerationConfig
     merge, config/services.py:28-46; orchestrator.py:881-889). `repeats` defaults to 1
-    (config/benchmarks.py:41)."""
-    cfg = yaml.safe_load((run / "full_config.yaml").read_text(encoding="utf-8"))
+    (config/benchmarks.py:41). `cfg`: the parsed snapshot, as for `_run_sampler`."""
+    if cfg is None:
+        cfg = yaml.safe_load((run / "full_config.yaml").read_text(encoding="utf-8"))
     benches = [b for b in cfg.get("benchmarks") or [] if isinstance(b, dict)]
     gsm = [b for b in benches if b.get("name") == "gsm8k"] or benches
     if len(gsm) != 1:
