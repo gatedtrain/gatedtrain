@@ -1896,3 +1896,24 @@ after the checks not recorded), `TestSourcesRoot` (a relative root, a root that 
 tests inherited), `TestSnapshotIsWhatIsChecked` (files changed after the snapshot, the arm replaced before the copy,
 the size cap, no descriptor leaked); the provenance refusal tests of `test_ext_hardening` and `test_ext_review2`
 assert their reason. Suite: 1,369 tests, 40 skipped in CI (among them the root-only device-node test).
+
+## 12. AI-native step 1 (AN-1 to AN-10)
+
+Design revision 21, `05-evaluation-and-lineage.md` §18. Step 1 runs on a CPU only synthetic pack. The trust backend is
+`InProcessTrust` (`sealed_guarantee`: "unsealed (step 1): the operator process can read the sealed items") and the
+alpha ledger is `FixedAlphaLedger` (alpha 0.05, one attempt). The keeper daemon and the alpha-investing variant are
+step 2 and are not tested here.
+
+| Rule | Behaviour pinned | Test file |
+|---|---|---|
+| AN-1 | `--json` prints one object with `schema`, `ok`, and `result` or `problems`; nothing else on stdout; no sealed content | `tests/test_an_json.py` |
+| AN-2 | Project store: created once, `project.yaml` fields, schema id on every record, invalid record refused | `tests/test_an_project.py` |
+| AN-3 | Stage protocol: declared schemas, `plan` without side effects, `check` problems in the AN-1 form | `tests/test_an_pipeline.py` |
+| AN-4 | Pipeline spec refused when a trust stage is missing, duplicated, replaced or out of order | `tests/test_an_pipeline.py` |
+| AN-5 | Same inputs and decision give identical artifacts or a refusal; interrupted stage resumes from records | `tests/test_an_machine.py` |
+| AN-6 | `intake_seal`: deterministic split, only the allowed views pass on, unlabelled data refused, small-data warning (pilot sigma 0.5 for `exact_match`) | `tests/test_an_intake.py` |
+| AN-7 | `preregister`: registration fields, metric from the library, nothing trains before confirmation, amendment marks `post_hoc` | `tests/test_an_intake.py` |
+| AN-8 | `evaluate_sealed`: records out, no item content out; the stub states its guarantee | `tests/test_an_gate.py` |
+| AN-9 | `gate` on the sealed records: item-set hash check, `post_hoc`, `FixedAlphaLedger` refuses a second attempt, attempt log | `tests/test_an_gate.py` |
+| AN-10 | `report` from records only; `sealed_guarantee` in the known limits; unrecorded numbers refused | `tests/test_an_gate.py` |
+| all | End to end on the synthetic pack | `tests/test_an_e2e.py`, `tests/test_an_synthetic_pack.py` |
