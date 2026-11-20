@@ -98,8 +98,9 @@ list these points, that the metric confirmation is the decision flag `metric_con
 stages, and how many `evaluate_sealed` attempts the project made.
 
 `project create` copies the pipeline into `<root>/pipeline.yaml` and records its sha256; the project refuses a copy
-that was changed. To use another pipeline, create a new project. A stage that refuses in `run` before writing outputs is logged as `refused` and changes no stage state; a refusal
-after it wrote outputs, or from the output checks, is `failed`.
+that was changed. To use another pipeline, create a new project. A stage that refuses in `run` before it writes any
+record, spends alpha or claims a trust record is logged as `refused` and changes no stage state; a refusal after any
+of these, or from the output checks, is `failed`.
 
 ## Adapter plugins
 

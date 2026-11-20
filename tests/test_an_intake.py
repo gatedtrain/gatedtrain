@@ -259,6 +259,17 @@ class IntakeTest(Base):
         self.assertIn("UTF-8", messages["bad_utf8"])
         self.assertIn("64 MiB", messages["too_big"])
 
+    def test_a_value_that_is_not_canonical_json_is_refused_without_echoing_it(self) -> None:
+        """The refusal names the row only: canonical_json's own message can quote the value or the key."""
+        for i, bad in enumerate(('{"input": {"secret-key-\U0001F600": 1}, "label": "a"}',
+                                 '{"input": "x", "label": 12345678901234567890123}')):
+            proj = self.make(jsonl(rows(5)) + bad.encode() + b"\n", name=f"canon{i}")
+            p = self.refused(proj, "intake_seal")
+            self.assertEqual(p.field, "data line 6")
+            for leak in ("secret", "12345678901234567890123", "\U0001F600"):
+                self.assertNotIn(leak, p.message)
+            self.nothing_written(proj)
+
     def test_one_distinct_row_cannot_be_split(self) -> None:
         proj = self.make(jsonl(rows(1, dups=3)))
         self.refused(proj, "intake_seal")
@@ -510,6 +521,24 @@ class PreregisterTest(Base):
         path.write_text(yaml.safe_dump(spec))
         out = self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.3, "rerun": True}).outputs
         self.assertTrue(proj.read_artifact(out["registration"])["post_hoc"])
+
+    def test_a_start_row_without_trains_fails_closed(self) -> None:
+        """Each reader of `trains` fails closed: for the post hoc test an unrecorded flag counts as training (so a
+        later change is an amendment); for the candidate's provenance it does not (so the candidate is refused)."""
+        from gatedtrain.ainative.project import ArtifactRef
+
+        proj = self.intake()
+        self.run_(proj, "preregister", {"metric_confirmed": True})
+        self.assertFalse(trust_stages._training_ran(proj))
+        proj.append_attempt({"stage": "x", "attempt": 1, "key": "k", "event": "start"})        # no `trains`
+        self.assertTrue(trust_stages._training_ran(proj))
+        ref = proj.write_artifact("y", "model", {"w": 1}, SCHEMA_MODEL)
+        row = {"stage": "y", "name": "model", "schema": SCHEMA_MODEL, "sha256": ref.sha256, "path": ref.path}
+        for trains, want in (({}, False), ({"trains": "yes"}, False), ({"trains": True}, True)):
+            n = len(proj.read_attempts())
+            proj.append_attempt({"stage": "y", "attempt": n, "key": "k", "event": "start", **trains})
+            proj.append_attempt({"stage": "y", "attempt": n, "key": "k", "event": "done", "outputs": {"model": row}})
+            self.assertIs(trust_stages._produced_by_training(proj, ArtifactRef(**row)), want, trains)
 
     def test_post_hoc_stickiness_reads_the_trust_store(self) -> None:
         proj = self.intake()

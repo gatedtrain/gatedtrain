@@ -180,17 +180,26 @@ def cmd_tierb_collect(args) -> int:
     return _gate_result(args, run_dir, report, text)
 
 
-def _ext_warnings() -> list[str]:
-    """EXT-85: a line per active `GATEDTRAIN_EXT_*` host-layout override (stderr in text mode, `warnings` in JSON)."""
+def _ext_warnings(args) -> list[str]:
+    """EXT-85: a line per active `GATEDTRAIN_EXT_*` host-layout override. In text mode they go to stderr at once,
+    before anything else the command prints (as before AN-1), and an empty list is returned so `emit` does not print
+    them again; with `--json` they are returned for the envelope's `warnings`. Either way they are kept on `args`, so
+    `main` puts them in the envelope of an uncaught exception too."""
     from .ext.launch import override_warnings
 
-    return list(override_warnings())
+    warnings = list(override_warnings())
+    args.ext_warnings = warnings
+    if _as_json(args):
+        return warnings
+    for line in warnings:
+        print(line, file=sys.stderr)
+    return []
 
 
 def cmd_ext_collect(args) -> int:
     from .ext.collect import collect
 
-    warnings = _ext_warnings()
+    warnings = _ext_warnings(args)
     try:
         run_dir, report, text = collect(Path(args.spec), adapter=args.adapter, stage_out=Path(args.stage_out),
                                         launch_record=Path(args.launch_record), smoke_record=Path(args.smoke_record),
@@ -215,7 +224,7 @@ def cmd_ext_merge_eval(args) -> int:
 def cmd_ext_launch(args) -> int:
     from .ext.launch import ext_launch, recheck
 
-    warnings = _ext_warnings()
+    warnings = _ext_warnings(args)
     spec = Path(args.spec) if args.spec else None
     if args.recheck:                                     # EXT-69: re-validate a record right before the command
         try:
@@ -230,8 +239,6 @@ def cmd_ext_launch(args) -> int:
         if _as_json(args):
             problem = Problem("USAGE", ", ".join(missing), message, "pass the missing options, or --recheck RECORD")
             return emit(Result(args.command, False, EXIT_USAGE, {}, [problem], warnings), as_json=True, human="")
-        for line in warnings:
-            print(line, file=sys.stderr)
         print(f"gatedtrain ext-launch: error: {message}", file=sys.stderr)
         return EXIT_USAGE
     try:
@@ -658,7 +665,8 @@ def main(argv: list[str] | None = None) -> int:
             raise
         name = _project_command(args) if args.command == "project" else args.command
         problem = Problem("INTERNAL", "", f"unexpected {type(exc).__name__}; this is a bug", "report it")
-        return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem], []), as_json=True, human="")
+        return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem], list(getattr(args, "ext_warnings", []))),
+                    as_json=True, human="")
     finally:
         runner.QUIET = False
 

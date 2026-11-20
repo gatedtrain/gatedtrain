@@ -225,6 +225,47 @@ class TestJson(unittest.TestCase):
                 self.assertRaises(RuntimeError):
             cli.main(["validate", "spec.yaml"])
 
+    EXT_ARGS = ["ext-collect", "spec.yaml", "--adapter", "a", "--stage-out", "s", "--launch-record", "l",
+                "--smoke-record", "m", "--eval-baseline", "b", "--eval-candidate", "c"]
+
+    def ext_run(self, argv, side_effect):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        from gatedtrain import cli
+
+        out, err = io.StringIO(), io.StringIO()
+        env = {"GATEDTRAIN_EXT_HOST_WORK": "/nonexistent-host-work"}
+        with mock.patch.dict(os.environ, env), mock.patch("gatedtrain.ext.collect.collect", side_effect=side_effect), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cli.main(argv)
+            except RuntimeError:
+                code = None
+        return code, out.getvalue(), err.getvalue()
+
+    def test_ext_override_warnings_print_first_in_text_mode(self):
+        """EXT-85 warnings go to stderr before anything else the command prints, as before AN-1."""
+        refusal = __import__("gatedtrain.errors", fromlist=["x"]).Refused([Problem("EXT-X", "f", "m", "fix")])
+        code, out, err = self.ext_run(self.EXT_ARGS, refusal)
+        self.assertEqual(code, EXIT_REFUSED)
+        lines = err.splitlines()
+        self.assertTrue(lines[0].startswith("warning: GATEDTRAIN_EXT_HOST_WORK overrides"), err)
+        self.assertEqual(sum("GATEDTRAIN_EXT_HOST_WORK" in x for x in lines), 1, err)   # printed once
+        self.assertIn("error[EXT-X]", lines[-1])
+
+    def test_ext_override_warnings_survive_an_uncaught_exception(self):
+        code, out, err = self.ext_run(self.EXT_ARGS, RuntimeError("bug"))
+        self.assertIsNone(code)                                     # text mode: the exception propagates
+        self.assertIn("warning: GATEDTRAIN_EXT_HOST_WORK overrides", err)
+        code, out, err = self.ext_run(["--json", *self.EXT_ARGS], RuntimeError("bug"))
+        doc = json.loads(out)
+        self.assertEqual((code, doc["problems"][0]["rule"]), (1, "INTERNAL"))
+        self.assertTrue(any("GATEDTRAIN_EXT_HOST_WORK" in w for w in doc["warnings"]), doc)
+        self.assertEqual(err, "")
+
     def test_a_non_finite_number_never_reaches_the_envelope(self):
         import contextlib
         import io

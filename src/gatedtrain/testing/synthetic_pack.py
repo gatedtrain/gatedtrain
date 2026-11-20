@@ -5,9 +5,11 @@ a "model" is a lookup table `token -> label` learned from the training part by m
 parameter in [0, 1]) corrupts that share of the training labels before the vote: `noise=0` learns the task,
 `noise=1` learns only wrong answers. The base model is the empty table, which answers nothing.
 
-The pack is registered through two entry point groups: `gatedtrain.stages` (the six pluggable stages) and
-`gatedtrain.scenarios` (`SCENARIO`, which carries the pack's generation function and its pipeline file). The
-pipeline file `synthetic_pack.yaml` lists the five trust stages around these stages.
+The pack is not registered as an entry point: a real pack is a separate distribution that registers its stages in
+`gatedtrain.stages` and its `SCENARIO` (the generation function and the pipeline file) in `gatedtrain.scenarios`.
+Tests inject this one by patching those two loaders (`tests/fixtures/ainative/run_cli.py`, `inject_pack` in
+`tests/test_an_synthetic_pack.py`). The pipeline file `synthetic_pack.yaml` lists the five trust stages around the
+six stages here. Every stage writes its outputs under its pipeline ref name (`ctx.stage`).
 
 `smoke` trains on a few rows and scores a probe set with the exact-match scorer; `ext.smoke.smoke_verdict` (the
 MM-38 rule for a binary metric) refuses a mean of 0 or 1, so a recipe that learns nothing never reaches `train`.

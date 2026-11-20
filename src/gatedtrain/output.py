@@ -1,7 +1,9 @@
 """One result shape for every CLI command (tests/README.md section 12, AN-1).
 
-`emit` prints the human text exactly as the command always did (problems and warnings on stderr), or, with `--json`,
-one JSON object on stdout and nothing on stderr. The exit code is the same in both modes.
+In text mode `emit` writes the result's warnings and then its problems to stderr and the human text to stdout (a
+command that must print warnings before its work starts, such as the EXT-85 override lines, prints them itself and
+passes none); with `--json` it prints one JSON object on stdout and nothing on stderr. The exit code is the same in
+both modes.
 """
 
 from __future__ import annotations

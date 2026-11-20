@@ -189,6 +189,38 @@ class ProjectStoreTest(unittest.TestCase):
             self.assertEqual(r["schema_version"], 1)
         self.assertEqual(lines[0], canonical_json(rows[0]).decode())
 
+    def test_an_event_cannot_override_the_schema(self) -> None:
+        p = self.make()
+        p.append_attempt({"stage": "gate", "schema": "forged", "schema_version": 99})
+        row = p.read_attempts()[-1]
+        self.assertEqual((row["schema"], row["schema_version"]), ("gatedtrain.ainative.attempt", 1))
+
+    def test_an_unterminated_last_line_is_ignored_and_cut_before_the_next_append(self) -> None:
+        """A crash in the middle of an append leaves a partial last line: it is not a row, so reading ignores it
+        and the next append starts on a fresh line (the partial tail is cut first)."""
+        p = self.make()
+        p.append_attempt({"stage": "a", "n": 1})
+        log = self.root / "attempts.jsonl"
+        with log.open("ab") as f:
+            f.write(b'{"stage": "a", "n": 2, "eve')
+        self.assertEqual([r["n"] for r in p.read_attempts()], [1])
+        p.append_attempt({"stage": "a", "n": 3})
+        self.assertEqual([r["n"] for r in p.read_attempts()], [1, 3])
+        self.assertTrue(log.read_bytes().endswith(b"\n"))
+        self.assertNotIn(b"eve", log.read_bytes())
+
+    def test_a_complete_but_unterminated_last_line_is_ignored_too(self) -> None:
+        p = self.make()
+        log = self.root / "attempts.jsonl"
+        log.write_bytes(canonical_json({"stage": "a", "n": 1}) + b"\n" + canonical_json({"stage": "a", "n": 2}))
+        self.assertEqual([r["n"] for r in p.read_attempts()], [1])
+
+    def test_a_bad_line_in_the_middle_is_still_refused(self) -> None:
+        p = self.make()
+        log = self.root / "attempts.jsonl"
+        log.write_bytes(canonical_json({"n": 1}) + b"\n{broken\n" + canonical_json({"n": 2}) + b"\n")
+        self.assertIn("line 2", self.refusal(p.read_attempts))
+
 
 if __name__ == "__main__":
     unittest.main()

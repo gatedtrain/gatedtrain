@@ -144,10 +144,13 @@ def _parse_rows(raw: bytes) -> list[tuple[int, Any, Any]]:
 
 
 def _canon(value: Any, field: str) -> bytes:
+    """The refusal names the row only: the encoder's own message can quote a key or a number of the data."""
     try:
         return canonical_json(value)
-    except ValueError as exc:
-        raise _refuse("AN-6", field, f"the value is not canonical JSON: {exc}", "use plain JSON values") from None
+    except ValueError:
+        raise _refuse("AN-6", field, "the row holds a value canonical JSON cannot encode (a non-finite number, an "
+                      "integer beyond 2^53 - 1, or a key or text with a character it refuses)",
+                      "use plain JSON values") from None
 
 
 def _dedup(rows: list[tuple[int, Any, Any]]) -> tuple[list[dict], int]:
@@ -379,12 +382,14 @@ _AMEND_KEYS = ("amends", "created_at", "post_hoc")
 
 def _training_ran(project: Project) -> bool:
     """True when the attempt log shows a stage that trains starting after the first `preregister` run was done.
-    Reads only the log (`start` rows carry `trains`, resolved at run time), never the editable pipeline file."""
+    Reads only the log (`start` rows carry `trains`, resolved at run time), never the editable pipeline file. It
+    fails closed: a `start` row that does not record `trains: false` counts as training, so a later change of the
+    registration is an amendment (post hoc)."""
     done = False
     for row in project.read_attempts():
         if row.get("event") == "done" and row.get("stage_type") == "preregister":
             done = True
-        elif done and row.get("event") == "start" and row.get("trains") is True:
+        elif done and row.get("event") == "start" and row.get("trains") is not False:
             return True
     return False
 
@@ -602,7 +607,8 @@ def _done_row(project: Project, stage: str) -> dict | None:
 
 
 def _produced_by_training(project: Project, ref: ArtifactRef) -> bool:
-    """True when the artifact is an output of a done run of its stage whose start line recorded `trains`."""
+    """True when the artifact is an output of a done run of its stage whose start line recorded `trains: true`. It
+    fails closed: a start line without the flag (or with another value) does not count as training."""
     attempt = None
     for r in project.read_attempts():
         if r.get("stage") == ref.stage and r.get("event") == "done":
@@ -654,8 +660,8 @@ def _score_arm(ctx: StageContext, sealed: SealedRef, fn: Callable[..., Any], mod
 
 class EvaluateSealed:
     """AN-8: scores the sealed items with exactly the registered sampler and eval_seeds and exact match only. What
-    leaves the trust backend is one `{item_id, seed, score}` record per item and seed (`item_id` is an index the
-    backend assigns, not a content hash). In step 1 the operator process can still read the sealed items; the
+    leaves the trust backend is one `{item_id, seed, score}` record per item and seed (`item_id` is the item's
+    position in the backend's item order, counted by `_score_arm` for each seed, not a content hash). In step 1 the operator process can still read the sealed items; the
     guarantee is stated (`sealed_guarantee`), not enforced.
 
     A project has one sealed evaluation: before scoring, `run` claims it in the trust store for the candidate's

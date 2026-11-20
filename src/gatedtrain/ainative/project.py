@@ -152,18 +152,27 @@ class Project:
         return json.loads(data.decode("utf-8"))
 
     def append_attempt(self, event: dict) -> None:
-        row = {"schema": ATTEMPT_SCHEMA, "schema_version": SCHEMA_VERSION, **event}
+        """One `O_APPEND` write per line. An unterminated last line (a crash in the middle of an earlier append) is
+        not a row: `read_attempts` ignores it, and it is cut here before the new line is written, so it never ends
+        up in the middle of the log."""
+        row = {**event, "schema": ATTEMPT_SCHEMA, "schema_version": SCHEMA_VERSION}   # event keys cannot override
         line = canonical_json(row) + b"\n"
         _refuse_links(self.root, "attempts.jsonl")
-        fd = os.open(self.root / "attempts.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        fd = os.open(self.root / "attempts.jsonl", os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
         try:
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                data = os.pread(fd, size, 0)
+                os.ftruncate(fd, data.rfind(b"\n") + 1)
             os.write(fd, line)
             os.fsync(fd)
         finally:
             os.close(fd)
 
     def read_attempts(self) -> list[dict]:
-        """The attempt log in order; an absent log is empty; a line that is not a JSON object is refused."""
+        """The attempt log in order; an absent log is empty; a line that is not a JSON object is refused. An
+        unterminated last line is a write cut short by a crash and is ignored (see `append_attempt`); every other
+        line must be a complete row."""
         _refuse_links(self.root, "attempts.jsonl")
         try:
             raw = (self.root / "attempts.jsonl").read_bytes()
@@ -173,7 +182,9 @@ class Project:
             raise _refuse("attempts.jsonl", f"cannot read the attempt log ({type(exc).__name__})",
                           "check the file permissions") from None
         rows: list[dict] = []
-        for n, line in enumerate(raw.split(b"\n"), 1):
+        lines = raw.split(b"\n")
+        lines.pop()                           # after the last newline: empty, or an unterminated (cut) write
+        for n, line in enumerate(lines, 1):
             if not line:
                 continue
             try:

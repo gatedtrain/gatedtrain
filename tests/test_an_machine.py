@@ -81,6 +81,29 @@ class MachineTest(unittest.TestCase):
     def lines(self) -> list[dict]:
         return [json.loads(x) for x in (self.root / "attempts.jsonl").read_text().splitlines()]
 
+    def test_a_refusal_after_a_trust_write_is_a_failed_attempt(self) -> None:
+        """A registration (the latest-registration marker) or the sealed-evaluation claim written before a refusal
+        is a side effect: the attempt is `failed`, not an audit-only `refused`."""
+        from gatedtrain.errors import Problem
+
+        def writes_then_refuses(write):
+            class Stage(REGISTRY["intake_seal"]):
+                def run(self, ctx, decision):
+                    write(ctx)
+                    raise Refused([Problem("X-1", "f", "refused after a trust write", "fix")])
+            return Stage
+
+        for i, write in enumerate((lambda ctx: ctx.trust.register({"n": 1}),
+                                   lambda ctx: ctx.trust.claim_sealed_evaluation("sha256:" + "a" * 64,
+                                                                                 "sha256:" + "b" * 64))):
+            project = create_project(self.root.parent / f"p{i}", goal="g", data=Path(self.project.data["path"]),
+                                     pipeline=str(self.root.parent / "pipeline.yaml"),
+                                     budget={"gpu_hours": 1, "llm_usd": 1})
+            reg = {**REGISTRY, "intake_seal": writes_then_refuses(write)}
+            with self.assertRaises(Refused):
+                run_stage(project, "intake_seal", {}, registry=reg)
+            self.assertEqual(project.read_attempts()[-1]["event"], "failed", i)
+
     def test_run_order_enforced(self) -> None:
         with self.assertRaises(Refused) as cm:
             self.run_("gate")
