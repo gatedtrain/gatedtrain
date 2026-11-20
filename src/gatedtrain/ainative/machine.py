@@ -142,7 +142,7 @@ def _key(sref: StageRef, version: str, inputs: dict[str, ArtifactRef], decision:
 def _context(project: Project, sref: StageRef, inputs: dict[str, ArtifactRef], trust: TrustBackend | None,
              ledger: AlphaLedger | None) -> StageContext:
     return StageContext(project, inputs, dict(sref.params), trust if trust is not None else InProcessTrust(project),
-                        ledger if ledger is not None else FixedAlphaLedger())
+                        ledger if ledger is not None else FixedAlphaLedger(project))
 
 
 def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, registry: dict | None = None,

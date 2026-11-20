@@ -227,7 +227,7 @@ class TrustStubTest(unittest.TestCase):
                                       budget={"gpu_hours": 1, "llm_usd": 1})
 
     def test_fixed_ledger_refuses_second_spend(self) -> None:
-        led = FixedAlphaLedger()
+        led = FixedAlphaLedger(self.project)
         self.assertEqual(led.available(), 0.05)
         self.assertEqual(led.spend("a1"), 0.05)
         self.assertEqual(led.available(), 0.0)
@@ -239,6 +239,51 @@ class TrustStubTest(unittest.TestCase):
         self.assertEqual(led.entries(), [{"attempt_id": "a1", "alpha": 0.05, "passed": True}])
         with self.assertRaises(Refused):
             led.record("nope", False)
+
+    def test_ledger_persists_across_instances(self) -> None:
+        a = FixedAlphaLedger(self.project)
+        a.spend("a1")
+        b = FixedAlphaLedger(Project.load(self.project.root))
+        self.assertEqual(b.available(), 0.0)
+        with self.assertRaises(Refused) as cm:
+            b.spend("a2")
+        self.assertEqual((cm.exception.problems[0].rule, cm.exception.problems[0].field), ("AN-9", "gate"))
+        b.record("a1", False)
+        c = FixedAlphaLedger(Project.load(self.project.root))
+        self.assertEqual(c.entries(), [{"attempt_id": "a1", "alpha": 0.05, "passed": False}])
+        lines = (self.project.root / "trust" / "ledger.jsonl").read_text().splitlines()
+        self.assertEqual([json.loads(x)["event"] for x in lines], ["spend", "record"])
+
+    def test_registrations_and_sealed_summary_survive_reload(self) -> None:
+        t = InProcessTrust(self.project)
+        ref = t.seal([{"q": "a", "label": "x"}, {"q": "b", "label": "x"}])
+        h = t.register({"metric": "exact_match"})
+        t2 = InProcessTrust(Project.load(self.project.root))
+        self.assertEqual(t2.registration(h), {"metric": "exact_match"})
+        self.assertEqual(t2.sealed_summary(ref), t.sealed_summary(ref))
+        self.assertEqual(t2.run_sealed(ref, lambda it: {"q": it["q"]}), [{"q": "a"}, {"q": "b"}])
+
+    def test_no_colon_in_any_file_name(self) -> None:
+        t = InProcessTrust(self.project)
+        t.seal([{"q": "a"}])
+        t.register({"m": 1})
+        FixedAlphaLedger(self.project).spend("a1")
+        names = [p.name for p in self.project.root.rglob("*")]
+        self.assertTrue(any(n.endswith(".json") for n in names))
+        self.assertEqual([n for n in names if ":" in n], [])
+
+    def test_symlinked_trust_dir_refused(self) -> None:
+        outside = self.project.root.parent / "outside"
+        outside.mkdir()
+        (self.project.root / "trust").symlink_to(outside, target_is_directory=True)
+        for fn in (lambda: InProcessTrust(self.project).seal([{"q": 1}]),
+                   lambda: InProcessTrust(self.project).register({"m": 1}),
+                   lambda: FixedAlphaLedger(self.project).spend("a1"),
+                   lambda: FixedAlphaLedger(self.project).available()):
+            with self.assertRaises(Refused) as cm:
+                fn()
+            self.assertEqual(cm.exception.problems[0].rule, "AN-2")
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_in_process_trust(self) -> None:
         t = InProcessTrust(self.project)
