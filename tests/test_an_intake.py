@@ -21,7 +21,7 @@ from gatedtrain.errors import Refused
 from gatedtrain.registration import check_contents, resolved_evaluator_hash
 
 MiB = 1024 * 1024
-SCHEMA_MODEL = "gatedtrain.ainative.fake_model"
+SCHEMA_MODEL = "gatedtrain.ainative.model_ref"
 
 
 class FakeTrain:
@@ -97,9 +97,16 @@ class Base(unittest.TestCase):
             {"name": "preregister", "stage": "preregister",
              "inputs": {"sealed_summary": "intake_seal.sealed_summary", "deployment": "choose_x.deployment"}},
             {"name": "train_x", "stage": "train_x"},
-            {"name": "evaluate_sealed", "stage": "evaluate_sealed"},
-            {"name": "gate", "stage": "gate"},
-            {"name": "report", "stage": "report"}]}
+            {"name": "evaluate_sealed", "stage": "evaluate_sealed",
+             "inputs": {"registration": "preregister.registration", "baseline_model": "train_x.model",
+                        "candidate_model": "train_x.model"}},
+            {"name": "gate", "stage": "gate",
+             "inputs": {"registration": "preregister.registration",
+                        "baseline_records": "evaluate_sealed.baseline_records",
+                        "candidate_records": "evaluate_sealed.candidate_records"}},
+            {"name": "report", "stage": "report",
+             "inputs": {"registration": "preregister.registration", "power": "intake_seal.power",
+                        "gate_result": "gate.gate_result"}}]}
         (self.tmp / f"{name}.yaml").write_text(yaml.safe_dump(spec))
         return create_project(self.tmp / name, goal="g", data=d, pipeline=str(self.tmp / f"{name}.yaml"),
                               budget={"gpu_hours": 1, "llm_usd": 1})
@@ -139,7 +146,7 @@ class RegistryTest(unittest.TestCase):
             self.assertFalse(cls.trains)
             self.assertEqual(cls.needs, needs)
         for name in ("evaluate_sealed", "gate", "report"):
-            self.assertNotIn(reg[name].__module__, ("gatedtrain.ainative.trust_stages",))
+            self.assertEqual(reg[name].name, name)             # real classes: tests/test_an_gate.py
 
 
 class IntakeTest(Base):
@@ -445,6 +452,7 @@ class PreregisterTest(Base):
         for st in spec["stages"]:
             if st["name"] == "train_x":
                 st["name"] = "train_y"
+            st["inputs"] = {k: v.replace("train_x.", "train_y.") for k, v in st.get("inputs", {}).items()}
         path.write_text(yaml.safe_dump(spec))
         out = self.run_(proj, "preregister", {"metric_confirmed": True, "margin": 0.3, "rerun": True}).outputs
         self.assertTrue(proj.read_artifact(out["registration"])["post_hoc"])
