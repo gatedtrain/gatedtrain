@@ -119,6 +119,36 @@ class TestJson(unittest.TestCase):
         got = tel.unrooted(doc["data"]["command"] + "\n", self.tmp / "j" / "host", label)
         self.assertEqual(got, want)
 
+    def test_progress_lines_are_text_mode_only(self):
+        """The `[gatedtrain] ...` progress lines (runner._log: run, tierb-collect, ext-collect) go to stderr in text
+        mode only; with `--json` stderr stays empty. (The real `run` of the demo spec was checked by hand: ~4.5 min.)"""
+        import contextlib
+        import io
+        from unittest import mock
+
+        from gatedtrain import cli, runner
+
+        def fake_run(spec, runs_root):
+            runner._log("run r1: progress")
+            return self.tmp / "r1", {"status": "PASS"}, "report text\n"
+
+        for as_json in (False, True):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch("gatedtrain.runner.run", fake_run), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                code = cli.main([*(["--json"] if as_json else []), "run", "spec.yaml"])
+            self.assertEqual(code, EXIT_OK)
+            if as_json:
+                self.assertEqual(err.getvalue(), "")
+                self.assertEqual(json.loads(out.getvalue())["data"]["report"], {"status": "PASS"})
+            else:
+                self.assertEqual(err.getvalue(), "[gatedtrain] run r1: progress\n")
+                self.assertEqual(out.getvalue(), f"run_dir: {self.tmp / 'r1'}\nreport text\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runner._log("after")                       # the flag is reset once main returns
+        self.assertEqual(err.getvalue(), "[gatedtrain] after\n")
+
     def test_emit_and_result_json(self):
         r = Result("x", False, 3, {"a": 1}, [Problem("R", "f", "m", "x")], ["w"])
         self.assertEqual(result_json(r), {"schema": "gatedtrain.cli_result", "schema_version": 1, "command": "x",

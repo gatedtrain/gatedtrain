@@ -402,8 +402,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import runner
+
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    runner.QUIET = _as_json(args)                        # AN-1: no progress lines on stderr under --json
+    try:
+        return args.func(args)
+    finally:
+        runner.QUIET = False
 
 
 if __name__ == "__main__":                                # EXT-89: `python -m gatedtrain.cli` runs the CLI

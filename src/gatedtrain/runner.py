@@ -181,7 +181,12 @@ def _new_run_dir(runs_root: Path) -> Path:
     raise RuntimeError(f"could not create a new run directory under {runs_root}")
 
 
+QUIET = False        # set by `gatedtrain --json` (AN-1): stderr stays empty, the result is one JSON object
+
+
 def _log(msg: str) -> None:
+    if QUIET:
+        return
     print(f"[gatedtrain] {msg}", file=sys.stderr, flush=True)
 
 
