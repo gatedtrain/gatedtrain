@@ -249,9 +249,9 @@ class IntakeSeal:
                  "n_needed": s["n_needed"], "mde": s["mde"], "target_mde": DEFAULT_MDE, "alpha": DEFAULT_ALPHA,
                  "power": DEFAULT_POWER, "sigma": PILOT_SIGMA, "conclusive_expected": s["conclusive"],
                  "n_more_examples": s["more"]}
-        return {"train_part": project.write_artifact(self.name, "train_part", train, SCHEMA_TRAIN_PART),
-                "sealed_summary": project.write_artifact(self.name, "sealed_summary", sealed, SCHEMA_SEALED_SUMMARY),
-                "power": project.write_artifact(self.name, "power", power, SCHEMA_POWER)}
+        return {"train_part": project.write_artifact(ctx.stage or self.name, "train_part", train, SCHEMA_TRAIN_PART),
+                "sealed_summary": project.write_artifact(ctx.stage or self.name, "sealed_summary", sealed, SCHEMA_SEALED_SUMMARY),
+                "power": project.write_artifact(ctx.stage or self.name, "power", power, SCHEMA_POWER)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         problems: list[Problem] = []
@@ -458,7 +458,7 @@ class Preregister:
         out = {**_meta(SCHEMA_REGISTRATION), "hash": digest, "scorer": v["scorer"], "direction": v["direction"],
                "margin": v["margin"], "alpha": v["alpha"], "item_set_hash": item_hash, "post_hoc": post_hoc,
                "amends": amends}
-        return {"registration": ctx.project.write_artifact(self.name, "registration", out, SCHEMA_REGISTRATION)}
+        return {"registration": ctx.project.write_artifact(ctx.stage or self.name, "registration", out, SCHEMA_REGISTRATION)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         out = ctx.project.read_artifact(outputs["registration"])
@@ -728,7 +728,7 @@ class EvaluateSealed:
             doc = {**_meta(SCHEMA_SEALED_RECORDS), "arm": arm, "registration_hash": reg["hash"],
                    "item_set_hash": item_set, "n_items": len(records) // len(seeds), "eval_seeds": list(seeds),
                    "sampler": dict(full["sampler"]), "model_ref_sha256": ref.sha256, "records": records}
-            out[f"{arm}_records"] = ctx.project.write_artifact(self.name, f"{arm}_records", doc,
+            out[f"{arm}_records"] = ctx.project.write_artifact(ctx.stage or self.name, f"{arm}_records", doc,
                                                                 SCHEMA_SEALED_RECORDS)
         return out
 
@@ -837,7 +837,7 @@ class Gate:
         cand = _arm(ctx.project, ctx.inputs["candidate_records"], reg, seeds, n_sealed, ev_row)
         cand_model = (ev_row.get("input_sha256s") or {}).get("candidate_model")
         expected = {"baseline": registered_base(full), "candidate": cand_model}
-        attempt_id = _attempt_key(ctx.project, self.name)
+        attempt_id = _attempt_key(ctx.project, ctx.stage or self.name)
         alpha = ctx.ledger.spend(attempt_id)                      # the ledger decides alpha, not the registration
         clause["alpha"] = alpha
         boot = full["bootstrap"]
@@ -854,7 +854,7 @@ class Gate:
         ctx.ledger.record(attempt_id, result["status"] == gates.PASS)
         doc = {**_meta(SCHEMA_GATE_RESULT), **result, "alpha": alpha, "attempt_id": attempt_id,
                "registration_hash": reg["hash"], "post_hoc": bool(reg["post_hoc"])}
-        return {"gate_result": ctx.project.write_artifact(self.name, "gate_result", doc, SCHEMA_GATE_RESULT)}
+        return {"gate_result": ctx.project.write_artifact(ctx.stage or self.name, "gate_result", doc, SCHEMA_GATE_RESULT)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         res = ctx.project.read_artifact(outputs["gate_result"])
@@ -1010,15 +1010,15 @@ class Report:
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
         report = self._build(ctx)
-        ref = ctx.project.write_artifact(self.name, "report", report, SCHEMA_REPORT)
-        rel = f"stages/{self.name}/{REPORT_MD}"
+        ref = ctx.project.write_artifact(ctx.stage or self.name, "report", report, SCHEMA_REPORT)
+        rel = f"stages/{ctx.stage or self.name}/{REPORT_MD}"
         _refuse_links(ctx.project.root, rel)
         _write_atomic(ctx.project.root / rel, render_markdown(ctx.project.read_artifact(ref)).encode("utf-8"))
         return {"report": ref}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         report = ctx.project.read_artifact(outputs["report"])
-        rel = f"stages/{self.name}/{REPORT_MD}"
+        rel = f"stages/{ctx.stage or self.name}/{REPORT_MD}"
         _refuse_links(ctx.project.root, rel)
         try:
             text = (ctx.project.root / rel).read_text(encoding="utf-8")

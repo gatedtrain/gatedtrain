@@ -116,7 +116,7 @@ class ProfileData(_Base):
                         {}, {"n": p["n"]})
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
-        return {"profile": ctx.project.write_artifact(self.name, "profile", {**_meta(SCHEMA_PROFILE), **self._profile(ctx)},
+        return {"profile": ctx.project.write_artifact(ctx.stage or self.name, "profile", {**_meta(SCHEMA_PROFILE), **self._profile(ctx)},
                                                       SCHEMA_PROFILE)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
@@ -140,8 +140,8 @@ class ChooseTaskAndBase(_Base):
         _read(ctx, "profile")
         deployment = {**_meta(SCHEMA_DEPLOYMENT), "sampler": dict(SAMPLER), "eval_seeds": list(EVAL_SEEDS)}
         base = {**_meta(SCHEMA_MODEL_REF), "generator": GENERATOR, "label": "base", "table": {}}
-        return {"deployment": ctx.project.write_artifact(self.name, "deployment", deployment, SCHEMA_DEPLOYMENT),
-                "base": ctx.project.write_artifact(self.name, "base", base, SCHEMA_MODEL_REF)}
+        return {"deployment": ctx.project.write_artifact(ctx.stage or self.name, "deployment", deployment, SCHEMA_DEPLOYMENT),
+                "base": ctx.project.write_artifact(ctx.stage or self.name, "base", base, SCHEMA_MODEL_REF)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         base = ctx.project.read_artifact(outputs["base"])
@@ -173,7 +173,7 @@ class BuildTrainSet(_Base):
         return Proposal(self.name, f"keep {n} text rows for training", {}, {"n": n})
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
-        return {"train_set": ctx.project.write_artifact(self.name, "train_set", self._build(ctx), SCHEMA_TRAIN_PART)}
+        return {"train_set": ctx.project.write_artifact(ctx.stage or self.name, "train_set", self._build(ctx), SCHEMA_TRAIN_PART)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         t = ctx.project.read_artifact(outputs["train_set"])
@@ -203,7 +203,7 @@ class WriteRecipe(_Base):
         recipe = {**_meta(SCHEMA_RECIPE), "noise": self._noise(ctx), "noise_seed": 0,
                   "train_set_sha256": ctx.inputs["train_set"].sha256, "smoke_train_rows": SMOKE_TRAIN_ROWS,
                   "smoke_probe_rows": SMOKE_PROBE_ROWS}
-        return {"recipe": ctx.project.write_artifact(self.name, "recipe", recipe, SCHEMA_RECIPE)}
+        return {"recipe": ctx.project.write_artifact(ctx.stage or self.name, "recipe", recipe, SCHEMA_RECIPE)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         r = ctx.project.read_artifact(outputs["recipe"])
@@ -247,7 +247,7 @@ class Smoke(_Base):
                           "change the recipe or the data so the smoke model neither learns everything nor nothing")
         out = {**_meta(SCHEMA_SMOKE), "verdict": "PASS", "reasons": [], "baseline_scores": scores,
                "mean": sum(scores) / len(scores)}
-        return {"smoke": ctx.project.write_artifact(self.name, "smoke", out, SCHEMA_SMOKE)}
+        return {"smoke": ctx.project.write_artifact(ctx.stage or self.name, "smoke", out, SCHEMA_SMOKE)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         s = ctx.project.read_artifact(outputs["smoke"])
@@ -278,7 +278,7 @@ class Train(_Base):
         model = {**_meta(SCHEMA_MODEL_REF), "generator": GENERATOR, "label": "candidate",
                  "noise": recipe["noise"], "n_train": len(rows),
                  "table": fit(rows, recipe["noise"], recipe["noise_seed"])}
-        return {"model": ctx.project.write_artifact(self.name, "model", model, SCHEMA_MODEL_REF)}
+        return {"model": ctx.project.write_artifact(ctx.stage or self.name, "model", model, SCHEMA_MODEL_REF)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         m = ctx.project.read_artifact(outputs["model"])

@@ -1909,7 +1909,7 @@ step 2 and are not tested here.
 |---|---|---|
 | AN-1 | `--json` (before the subcommand) prints one object with `schema` `gatedtrain.cli_result`, `schema_version`, `command`, `ok`, `exit`, `data`, `problems` (`rule`, `field`, `message`, `fix`) and `warnings`; nothing else on stdout, stderr empty; the exit code is the text mode's; no sealed content | `tests/test_an_json.py` |
 | AN-2 | Project store: created once, `project.yaml` fields, schema id on every record, invalid record refused | `tests/test_an_project.py` |
-| AN-3 | Stage protocol: declared schemas, `plan` without side effects, `check` problems in the AN-1 form | `tests/test_an_pipeline.py` |
+| AN-3 | Stage protocol: declared schemas, `plan` without side effects, `check` problems in the AN-1 form; a stage writes its outputs under its pipeline ref name (`ctx.stage`) and an output under another stage name is refused, so two refs of one stage type keep apart | `tests/test_an_pipeline.py`, `tests/test_an_synthetic_pack.py` |
 | AN-4 | Pipeline spec refused when a trust stage is missing, duplicated, replaced or out of order | `tests/test_an_pipeline.py` |
 | AN-5 | Same inputs and decision give identical artifacts or a refusal; interrupted stage resumes from records | `tests/test_an_machine.py` |
 | AN-6 | `intake_seal`: deterministic split, only the allowed views pass on, unlabelled data refused, small-data warning (planning SD of the paired difference sqrt(0.5) ≈ 0.71 for `exact_match`, the independence bound at p = 0.5; expected sizes computed from it) | `tests/test_an_intake.py` |

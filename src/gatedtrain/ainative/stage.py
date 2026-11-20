@@ -37,11 +37,17 @@ class Proposal:
 
 @dataclass
 class StageContext:
+    """What a stage sees. `stage` is the stage's ref name in the pipeline (not its type): a stage writes its outputs
+    under it (`project.write_artifact(ctx.stage, ...)`), so two refs of one stage type keep apart, and the machine
+    refuses an output written under another name. The machine always sets it; it is empty only in a context built by
+    hand."""
+
     project: Project
     inputs: dict[str, ArtifactRef]
     params: dict
     trust: "TrustBackend"
     ledger: "AlphaLedger"
+    stage: str = ""
 
 
 class Stage(Protocol):

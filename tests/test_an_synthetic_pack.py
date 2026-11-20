@@ -176,6 +176,72 @@ class StageTest(PackBase):
         self.assertTrue(start["trains"])
 
 
+class RefNameTest(PackBase):
+    """Final review I4: a stage writes under its pipeline ref name (`ctx.stage`), not its class name, so two refs of
+    one stage type keep apart and the machine tracks the files it hashes."""
+
+    def make_two_refs(self) -> Project:
+        proj = self.make()
+        raw = yaml.safe_load(Path(proj.pipeline).read_text())
+        names = [s["name"] for s in raw["stages"]]
+        raw["stages"].insert(names.index("write_recipe") + 1,
+                             {"name": "write_recipe_b", "stage": "write_recipe", "params": {"noise": 0.5},
+                              "inputs": {"train_set": "build_train_set.train_set"}})
+        path = self.tmp / "two.yaml"
+        path.write_text(yaml.safe_dump(raw))
+        return create_project(self.tmp / "two", goal="lookup", data=Path(proj.data["path"]), pipeline=str(path),
+                              budget={"gpu_hours": 1, "llm_usd": 1})
+
+    def test_two_refs_of_one_stage_type_write_apart_and_both_stay_done(self) -> None:
+        from gatedtrain.ainative.machine import status
+
+        proj = self.make_two_refs()
+        out = self.run_all(proj, "write_recipe_b")
+        self.assertEqual(out["write_recipe"]["recipe"].path, "stages/write_recipe/recipe.json")
+        self.assertEqual(out["write_recipe_b"]["recipe"].path, "stages/write_recipe_b/recipe.json")
+        self.assertEqual(proj.read_artifact(out["write_recipe_b"]["recipe"])["noise"], 0.5)
+        self.assertEqual(proj.read_artifact(out["write_recipe"]["recipe"])["noise"], 0.0)
+        self.run_(proj, "smoke")                                   # reads write_recipe's record, still intact
+        states = {k: v["status"] for k, v in status(proj, registry=stage_registry()).items()}
+        self.assertEqual((states["write_recipe"], states["write_recipe_b"], states["smoke"]), ("done",) * 3)
+
+    def test_an_output_under_another_stage_name_is_refused(self) -> None:
+        from gatedtrain.ainative.machine import status
+
+        class ClassNamed(pack.WriteRecipe):
+            def run(self, ctx, decision):
+                ref = super().run(ctx, decision)["recipe"]
+                rec = ctx.project.read_artifact(ref)
+                return {"recipe": ctx.project.write_artifact(self.name, "recipe", rec, ref.schema)}
+
+        proj = self.make_two_refs()
+        reg = {**stage_registry(), "write_recipe": ClassNamed}
+        for name in ("intake_seal", "profile_data", "choose_task_and_base", "preregister", "build_train_set",
+                     "write_recipe"):
+            run_stage(proj, name, dict(DECISIONS.get(name, {})), registry=reg)
+        with self.assertRaises(Refused) as cm:
+            run_stage(proj, "write_recipe_b", {}, registry=reg)
+        p = cm.exception.problems[0]
+        self.assertEqual(p.rule, "AN-5")
+        self.assertIn("write_recipe_b", p.message)
+        self.assertEqual(status(proj, registry=reg)["write_recipe_b"]["status"], "failed")
+
+    def test_ctx_stage_is_the_ref_name(self) -> None:
+        seen = []
+
+        class Spy(pack.WriteRecipe):
+            def run(self, ctx, decision):
+                seen.append(ctx.stage)
+                return super().run(ctx, decision)
+
+        proj = self.make_two_refs()
+        reg = {**stage_registry(), "write_recipe": Spy}
+        for name in ("intake_seal", "profile_data", "choose_task_and_base", "preregister", "build_train_set",
+                     "write_recipe", "write_recipe_b"):
+            run_stage(proj, name, dict(DECISIONS.get(name, {})), registry=reg)
+        self.assertEqual(seen, ["write_recipe", "write_recipe_b"])
+
+
 class LearningTest(unittest.TestCase):
     def accuracy(self, model: dict, rows: list[dict]) -> float:
         return sum(scorers.exact_match(pack.generate(model, {"input": r["input"]}), r["label"])

@@ -215,7 +215,7 @@ def _key(sref: StageRef, version: str, inputs: dict[str, ArtifactRef], decision:
 def _context(project: Project, sref: StageRef, inputs: dict[str, ArtifactRef], trust: TrustBackend | None,
              ledger: AlphaLedger | None) -> StageContext:
     return StageContext(project, inputs, dict(sref.params), trust if trust is not None else InProcessTrust(project),
-                        ledger if ledger is not None else FixedAlphaLedger(project))
+                        ledger if ledger is not None else FixedAlphaLedger(project), sref.name)
 
 
 def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, registry: dict | None = None,
@@ -333,7 +333,7 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
         _event(project, sref.name, attempt, key, "failed", error=type(exc).__name__)
         raise
     try:
-        _check_outputs(stage, ctx, outputs)
+        _check_outputs(stage, ctx, outputs, sref.name)
     except Exception as exc:
         _event(project, sref.name, attempt, key, "failed", error=type(exc).__name__)
         raise
@@ -344,12 +344,16 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
     return StageResult(sref.name, key, attempt, outputs, False)
 
 
-def _check_outputs(stage: Any, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> None:
+def _check_outputs(stage: Any, ctx: StageContext, outputs: dict[str, ArtifactRef], ref_name: str) -> None:
     declared = dict(stage.outputs)
     if not isinstance(outputs, dict) or set(outputs) != set(declared):
         raise _refuse(f"stage {stage.name}", f"the stage returned outputs {sorted(outputs) if isinstance(outputs, dict) else outputs!r} "
                       f"but declares {sorted(declared)}", "return exactly the declared outputs")
     for name, ref in outputs.items():
+        if not isinstance(ref, ArtifactRef) or ref.stage != ref_name:
+            got = ref.stage if isinstance(ref, ArtifactRef) else type(ref).__name__
+            raise _refuse(f"stage {ref_name}", f"output {name!r} of stage {ref_name!r} is not written under its own "
+                          f"stage name (it names {got!r})", "write every output with project.write_artifact(ctx.stage, ...)")
         if ref.schema != declared[name]:
             raise _refuse(f"stage {stage.name}", f"output {name!r} has schema {ref.schema!r}, declared "
                           f"{declared[name]!r}", "write the output with its declared schema")
