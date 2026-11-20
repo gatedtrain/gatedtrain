@@ -225,6 +225,18 @@ class TestJson(unittest.TestCase):
                 self.assertRaises(RuntimeError):
             cli.main(["validate", "spec.yaml"])
 
+    def test_a_non_finite_number_never_reaches_the_envelope(self):
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = emit(Result("x", True, 0, {"v": float("nan")}), as_json=True, human="")
+        self.assertEqual(code, 3)
+        self.assertNotIn("NaN", out.getvalue())
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["exit"], doc["problems"][0]["rule"]), (False, 3, "OUTPUT"))
+
     def test_emit_and_result_json(self):
         r = Result("x", False, 3, {"a": 1}, [Problem("R", "f", "m", "x")], ["w"])
         self.assertEqual(result_json(r), {"schema": "gatedtrain.cli_result", "schema_version": 1, "command": "x",

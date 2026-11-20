@@ -43,7 +43,16 @@ def result_json(result: Result) -> dict[str, Any]:
 def emit(result: Result, *, as_json: bool, human: str) -> int:
     """Print `human` (text mode) or one JSON line (`as_json`); return the exit code."""
     if as_json:
-        print(json.dumps(result_json(result), sort_keys=True, default=str))
+        try:
+            text = json.dumps(result_json(result), sort_keys=True, default=str, allow_nan=False)
+        except ValueError:                       # a NaN or infinity is not JSON: say so instead of printing it
+            bad = Result(result.command, False, result.exit or 3, {},
+                         [Problem("OUTPUT", "data", "the result holds a non-finite number, which JSON cannot carry",
+                                  "report this as a bug")], list(result.warnings))
+            text = json.dumps(result_json(bad), sort_keys=True, default=str)
+            print(text)
+            return bad.exit
+        print(text)
         return result.exit
     for line in result.warnings:
         print(line, file=sys.stderr)

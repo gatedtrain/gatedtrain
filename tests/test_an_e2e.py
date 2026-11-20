@@ -139,6 +139,60 @@ class FullRunTest(E2EBase):
         self.assertEqual(self.attempts(root).count(b'"event":"done"'), log.count(b'"event":"done"'))
 
 
+class RefusalKeepsStateTest(E2EBase):
+    """A refusal is audited (`refused`) but never changes the derived state or hides a recorded verdict."""
+
+    def check_still_done(self, root: Path, verdict: str) -> None:
+        status = self.cli("project", "status", str(root))
+        self.assertEqual(status["data"]["gate"], verdict)
+        self.assertEqual(status["data"]["gate_recorded"], verdict)
+        self.assertEqual(len(status["data"]["alpha_ledger"]), 1)
+        self.assertEqual(status["data"]["stages"]["gate"]["status"], "done")
+        self.assertEqual(status["data"]["stages"]["preregister"]["status"], "done")
+        report = self.cli("project", "report", str(root), expect=EXIT_OK if verdict == "PASS" else EXIT_NOT_PASS)
+        self.assertEqual(report["data"]["report"]["status"], verdict)
+
+    def refused_attempts(self, root: Path) -> list[dict]:
+        return [json.loads(line) for line in self.attempts(root).splitlines() if b'"event":"refused"' in line]
+
+    def test_a_refused_second_gate_and_a_refused_amendment_change_nothing(self) -> None:
+        root = self.create()
+        self.run_all(root)
+        self.run_stage(root, "gate", expect=EXIT_REFUSED, decision={"rerun": True, "again": 1})
+        self.check_still_done(root, "PASS")
+        self.run_stage(root, "preregister", expect=EXIT_REFUSED,
+                       decision={"metric_confirmed": True, "margin": 0.05, "rerun": True})
+        self.check_still_done(root, "PASS")
+        refused = self.refused_attempts(root)
+        self.assertEqual([r["stage"] for r in refused], ["gate", "preregister"])
+        self.assertEqual([r["rules"] for r in refused], [["AN-9"], ["AN-7"]])
+        self.assertTrue(all(r["reason"] for r in refused))
+
+
+class PipelineCopyTest(E2EBase):
+    def test_the_project_keeps_its_own_pipeline_copy(self) -> None:
+        root = self.create()
+        original = self.tmp / "proj-pipe.yaml"
+        doc = yaml.safe_load((root / "project.yaml").read_text())
+        self.assertEqual(doc["pipeline"], "pipeline.yaml")
+        self.assertRegex(doc["pipeline_sha256"], r"^sha256:[0-9a-f]{64}$")
+        original.write_text("name: changed\nstages: []\n")          # editing the original changes nothing
+        self.run_stage(root, "intake_seal")
+        original.unlink()                                             # nor does deleting it
+        self.assertEqual(self.run_stage(root, "profile_data")["data"]["stage"], "profile_data")
+        self.assertEqual(self.cli("project", "status", str(root))["data"]["stages"]["profile_data"]["status"], "done")
+
+    def test_an_edited_copy_is_refused(self) -> None:
+        root = self.create()
+        self.run_stage(root, "intake_seal")
+        copy = root / "pipeline.yaml"
+        copy.write_text(copy.read_text() + "\n# edited\n")
+        for args in (("run", str(root), "profile_data"), ("status", str(root)), ("plan", str(root), "profile_data")):
+            doc = self.cli("project", *args, expect=EXIT_REFUSED)
+            self.assertEqual(doc["problems"][0]["rule"], "AN-5", args)
+            self.assertIn("new project", doc["problems"][0]["fix"])
+
+
 class DegenerateRecipeTest(E2EBase):
     def test_noise_one_is_refused_at_smoke_and_never_reaches_the_gate(self) -> None:
         root = self.create(noise=1.0)
@@ -152,7 +206,8 @@ class DegenerateRecipeTest(E2EBase):
         self.assertFalse(gate["ok"])
         self.assertFalse((root / "stages" / "gate").exists())
         status = self.cli("project", "status", str(root))
-        self.assertEqual(status["data"]["stages"]["smoke"]["status"], "failed")
+        self.assertEqual(status["data"]["stages"]["smoke"]["status"], "pending")     # a refusal changes no state
+        self.assertIn(b'"event":"refused"', self.attempts(root))
         self.assertEqual(status["data"]["stages"]["gate"]["status"], "pending")
         self.assertIsNone(status["data"]["gate"])
         self.assertFalse(status["data"]["passed"])
@@ -181,6 +236,13 @@ class CreateTest(E2EBase):
         missing = self.cli("project", "create", str(self.tmp / "other"), "--goal", "x", "--data", str(TOY),
                            "--pipeline", str(self.tmp / "nope.yaml"), expect=EXIT_REFUSED)
         self.assertFalse(missing["ok"])
+
+    def test_gpu_hours_must_be_finite_and_not_negative(self) -> None:
+        for bad in ("nan", "inf", "-1", "abc"):
+            doc = self.cli("project", "create", str(self.tmp / f"g{bad}"), "--goal", "x", "--data", str(TOY),
+                           "--pipeline", str(self.pipeline(0.0)), "--gpu-hours", bad, expect=EXIT_USAGE)
+            self.assertEqual(doc["problems"][0]["rule"], "USAGE", bad)
+            self.assertFalse((self.tmp / f"g{bad}").exists())
 
     def test_a_decision_file_that_is_not_an_object_is_refused(self) -> None:
         root = self.create()

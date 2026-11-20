@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -306,17 +307,6 @@ def _load_decision(path: str | None) -> dict:
     return doc
 
 
-def _done_output(project, stage: str, name: str):
-    """The record of a `done` stage's output, or None when the stage is not done (or is stale)."""
-    from .ainative.machine import _load_spec, _recorded_outputs, _states
-    from .ainative.stage import stage_registry
-
-    state = _states(project, _load_spec(project), stage_registry()).get(stage)
-    if state is None or state["status"] != "done":
-        return None
-    return project.read_artifact(_recorded_outputs(project, state)[name])
-
-
 def cmd_project_create(args) -> int:
     from .ainative.pipeline import load_pipeline
     from .ainative.project import create_project
@@ -325,10 +315,12 @@ def cmd_project_create(args) -> int:
     try:
         load_pipeline(pipeline)                                  # syntax only; stage types are checked on `plan`/`run`
         project = create_project(Path(args.root).absolute(), goal=args.goal, data=Path(args.data).absolute(),
-                                 pipeline=str(pipeline), budget={"gpu_hours": args.gpu_hours, "llm_usd": 0})
+                                 pipeline=str(pipeline), budget={"gpu_hours": args.gpu_hours, "llm_usd": 0},
+                                 pipeline_bytes=pipeline.read_bytes())     # the project keeps its own copy
     except Refused as exc:
         return _prefuse(args, exc.problems)
-    return _pfinish(args, {"root": str(project.root), "pipeline": project.pipeline, "budget": project.budget},
+    return _pfinish(args, {"root": str(project.root), "pipeline": project.pipeline,
+                           "pipeline_sha256": project.pipeline_sha256, "budget": project.budget},
                     f"project: {project.root}\n")
 
 
@@ -368,43 +360,78 @@ def cmd_project_run(args) -> int:
     return _pfinish(args, data, human)
 
 
+def _recorded_gate(project):
+    """(gate status recorded in the attempt log or None, the alpha ledger's entries): evidence apart from the
+    pipeline state, so a stale or unreadable derived state never hides a recorded verdict."""
+    from .ainative.machine import recorded_output
+    from .ainative.trust import FixedAlphaLedger
+
+    rec = recorded_output(project, _GATE_STAGE, "gate_result")
+    return (rec.get("status") if isinstance(rec, dict) else None), FixedAlphaLedger(project).entries()
+
+
 def cmd_project_status(args) -> int:
-    from .ainative.machine import status
+    from .ainative.machine import done_output, status
     from .ainative.project import Project
 
     try:
         project = Project.load(Path(args.root))
         stages = status(project)
-        gate = _done_output(project, _GATE_STAGE, "gate_result")
+        gate = done_output(project, _GATE_STAGE, "gate_result")
+        recorded, ledger = _recorded_gate(project)
     except Refused as exc:
         return _prefuse(args, exc.problems)
     gate_status = gate.get("status") if isinstance(gate, dict) else None
     data = {"goal": project.goal, "stages": {n: {"status": s["status"],
                                                  "last_event": (s["last_attempt"] or {}).get("event")}
                                              for n, s in stages.items()},
-            "gate": gate_status, "passed": gate_status == "PASS"}
+            "gate": gate_status, "passed": gate_status == "PASS", "gate_recorded": recorded,
+            "alpha_ledger": ledger}
     lines = [f"{n}: {s['status']}\n" for n, s in data["stages"].items()]
-    lines.append(f"gate: {gate_status or 'not run'}\n")
+    if gate_status:
+        lines.append(f"gate: {gate_status}\n")
+    elif recorded:
+        lines.append(f"gate: recorded {recorded}, but the gate stage is {stages[_GATE_STAGE]['status']}\n")
+    elif ledger:
+        lines.append("gate: alpha spent, no gate result recorded\n")
+    else:
+        lines.append("gate: no gate result recorded and no alpha spent\n")
     return _pfinish(args, data, "".join(lines))
 
 
 def cmd_project_report(args) -> int:
+    from .ainative.machine import done_output, status
     from .ainative.project import Project
 
     try:
         project = Project.load(Path(args.root))
-        report = _done_output(project, "report", "report")
+        report = done_output(project, "report", "report")
+        if report is None:
+            state = status(project)["report"]["status"]
+            recorded, ledger = _recorded_gate(project)
     except Refused as exc:
         return _prefuse(args, exc.problems)
     if report is None:
-        return _prefuse(args, [Problem("AN-11", "report", "there is no report: the report stage is not done, so the "
-                                       "project has no gate result to report (it did not pass)",
-                                       "run the stages in order up to `report`; `project status` shows where it stopped")])
+        evidence = (f"a gate result is recorded ({recorded}) and the alpha ledger has {len(ledger)} entries"
+                    if recorded else f"no gate result is recorded; the alpha ledger has {len(ledger)} entries")
+        return _prefuse(args, [Problem("AN-11", "report", f"there is no current report: the report stage is {state}; "
+                                       f"{evidence}", "run the stages in order up to `report`; `project status` "
+                                       "shows where it stopped")])
     ok = report.get("status") == "PASS"
     md = project.root / "stages" / "report" / "report.md"
     human = md.read_text(encoding="utf-8") if md.is_file() else f"status: {report.get('status')}\n"
     return _pfinish(args, {"report": report, "report_md": str(md)}, human, ok=ok,
                     exit_code=EXIT_OK if ok else EXIT_NOT_PASS)
+
+
+def _gpu_hours(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must be a finite number, at least 0")
+    return value
 
 
 def _add_project(sub) -> None:
@@ -415,10 +442,11 @@ def _add_project(sub) -> None:
     c.add_argument("root", help="a new or empty directory")
     c.add_argument("--goal", required=True, help="what the project is for, in words")
     c.add_argument("--data", required=True, help="the labelled data (a file or directory); its hash is recorded")
-    c.add_argument("--pipeline", required=True, metavar="NAME",
+    c.add_argument("--pipeline", required=True, metavar="FILE",
                    help="the pipeline spec: the path of a pipeline YAML (the loader resolves a path, not a registry "
-                        "name); stored as an absolute path")
-    c.add_argument("--gpu-hours", type=float, default=0.0, metavar="H",
+                        "name). The project keeps a copy and its sha256; a changed copy is refused, and another "
+                        "pipeline means a new project")
+    c.add_argument("--gpu-hours", type=_gpu_hours, default=0.0, metavar="H",
                    help="the GPU-hour budget; step 1 only records it in project.yaml and does not enforce it")
     c.set_defaults(func=cmd_project_create)
 

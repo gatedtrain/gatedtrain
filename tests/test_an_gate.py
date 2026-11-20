@@ -194,6 +194,48 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(cls.name, name)
 
 
+class RefusalKeepsStateTest(GateBase):
+    """A refusal in `run` is audited as `refused` and never changes the derived state (a refused second gate or
+    amendment once left the gate `failed` and the report stale, hiding a recorded verdict)."""
+
+    base_rate = cand_rate = 0.5                  # INCONCLUSIVE
+
+    def test_an_inconclusive_verdict_survives_a_refused_second_gate_and_amendment(self) -> None:
+        from gatedtrain.ainative.machine import done_output, status
+
+        proj = self.make()
+        self.through(proj)
+        reg = self.registry()
+        for stage, decision in (("gate", {"rerun": True, "again": 1}),
+                                ("preregister", {"metric_confirmed": True, "margin": 0.05, "rerun": True})):
+            with self.assertRaises(Refused):
+                run_stage(proj, stage, decision, registry=reg)
+        states = {k: v["status"] for k, v in status(proj, registry=reg).items()}
+        self.assertEqual(set(states.values()), {"done"}, states)
+        self.assertEqual(done_output(proj, "gate", "gate_result", registry=reg)["status"], "INCONCLUSIVE")
+        self.assertEqual(done_output(proj, "report", "report", registry=reg)["status"], "INCONCLUSIVE")
+        refused = [r for r in proj.read_attempts() if r["event"] == "refused"]
+        self.assertEqual([(r["stage"], r["rules"]) for r in refused], [("gate", ["AN-9"]), ("preregister", ["AN-7"])])
+        self.assertEqual(len(FixedAlphaLedger(proj).entries()), 1)
+
+    def test_a_refusal_after_the_outputs_were_written_still_fails_the_stage(self) -> None:
+        from gatedtrain.ainative.machine import status
+        from gatedtrain.errors import Problem
+
+        class Bad(model_stage("train_x", 1.0, True)):
+            def check(self, ctx, outputs):
+                return [Problem("T-1", "model", "the output check refuses", "fix")]
+
+        proj = self.make()
+        reg = {**self.registry(), "train_x": Bad}
+        for stage in ("intake_seal", "choose_x", "preregister"):
+            run_stage(proj, stage, {"metric_confirmed": True} if stage == "preregister" else {}, registry=reg)
+        with self.assertRaises(Refused):
+            run_stage(proj, "train_x", {}, registry=reg)
+        self.assertEqual(status(proj, registry=reg)["train_x"]["status"], "failed")
+        self.assertEqual(proj.read_attempts()[-1]["event"], "failed")
+
+
 class EvaluateSealedTest(GateBase):
     def test_records_hold_item_id_seed_and_score_only_and_no_sealed_text(self) -> None:
         proj = self.make()

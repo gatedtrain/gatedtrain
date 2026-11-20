@@ -81,14 +81,19 @@ gatedtrain project status ./proj
 gatedtrain project report ./proj
 ```
 
-`--pipeline` is the path of a pipeline YAML (stored as an absolute path). `--gpu-hours` is recorded in
+`--pipeline` is the path of a pipeline YAML. `--gpu-hours` is recorded in
 `project.yaml` as the budget; step 1 enforces nothing. `run` of the `gate` stage exits 0 on PASS and 1 otherwise;
 a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. The gate spends the
 project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result object per call.
 
-**Trust boundary in step 1.** Stages run in the operator's process. The sealed evaluation items are hash-only to
-the operator, but a step-1 stage can read and rewrite the trust records and the attempt log, so a report states
-`sealed_guarantee` as "unsealed (step 1)". Enforcement arrives with the step-2 keeper.
+**Trust boundary in step 1.** Stages run in the operator's process. CLI outputs carry only hashes of the sealed
+items, but in step 1 they sit in plain files under `<root>/trust/` that the operator and any stage can read and
+rewrite, as can the attempt log; the report's `sealed_guarantee` says so ("unsealed (step 1): the operator process
+can read the sealed items"). Enforcement arrives with the step-2 keeper.
+
+`project create` copies the pipeline into `<root>/pipeline.yaml` and records its sha256; the project refuses a copy
+that was changed. To use another pipeline, create a new project. A stage that refuses (for example a second gate,
+because the alpha is spent) is logged as `refused` in `attempts.jsonl` and changes no stage state.
 
 ## Adapter plugins
 

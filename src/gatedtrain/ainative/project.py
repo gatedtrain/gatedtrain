@@ -92,6 +92,7 @@ class Project:
         self.pipeline: str = doc["pipeline"]
         self.budget: dict[str, Any] = dict(doc["budget"])
         self.created_at: str = doc["created_at"]
+        self.pipeline_sha256: str | None = doc.get("pipeline_sha256")
 
     @classmethod
     def load(cls, root: Path) -> "Project":
@@ -113,8 +114,11 @@ class Project:
         return cls(Path(root), doc)
 
     def _doc(self) -> dict[str, Any]:
-        return {"schema": PROJECT_SCHEMA, "schema_version": SCHEMA_VERSION, "goal": self.goal, "data": self.data,
-                "pipeline": self.pipeline, "budget": self.budget, "created_at": self.created_at}
+        doc = {"schema": PROJECT_SCHEMA, "schema_version": SCHEMA_VERSION, "goal": self.goal, "data": self.data,
+               "pipeline": self.pipeline, "budget": self.budget, "created_at": self.created_at}
+        if self.pipeline_sha256 is not None:
+            doc["pipeline_sha256"] = self.pipeline_sha256
+        return doc
 
     def write_artifact(self, stage: str, name: str, obj: dict | list, schema: str) -> ArtifactRef:
         _check_name("stage", stage)
@@ -183,7 +187,13 @@ class Project:
         return rows
 
 
-def create_project(root: Path, *, goal: str, data: Path, pipeline: str, budget: dict) -> Project:
+PIPELINE_COPY = "pipeline.yaml"
+
+
+def create_project(root: Path, *, goal: str, data: Path, pipeline: str, budget: dict,
+                   pipeline_bytes: bytes | None = None) -> Project:
+    """With `pipeline_bytes`, the pipeline is copied to `<root>/pipeline.yaml` and its sha256 recorded as
+    `pipeline_sha256`; `pipeline` is then the copy's name and the machine refuses a copy that changed."""
     root = Path(root)
     if root.exists() and (not root.is_dir() or any(root.iterdir())):
         raise _refuse(str(root), "the project root exists and is not an empty directory",
@@ -200,5 +210,8 @@ def create_project(root: Path, *, goal: str, data: Path, pipeline: str, budget: 
            "data": {"path": str(data), "sha256": digest}, "pipeline": pipeline,
            "budget": {"gpu_hours": budget["gpu_hours"], "llm_usd": budget["llm_usd"]}, "created_at": _utc_now()}
     root.mkdir(parents=True, exist_ok=True)
+    if pipeline_bytes is not None:
+        _write_atomic(root / PIPELINE_COPY, pipeline_bytes)
+        doc["pipeline"], doc["pipeline_sha256"] = PIPELINE_COPY, sha256_bytes(pipeline_bytes)
     _write_atomic(root / "project.yaml", yaml.safe_dump(doc, sort_keys=False).encode("utf-8"))
     return Project(root, doc)
