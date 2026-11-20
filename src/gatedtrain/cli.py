@@ -174,7 +174,7 @@ def cmd_ext_collect(args) -> int:
                                         eval_baseline=[Path(a) for a in args.eval_baseline],
                                         eval_candidate=[Path(a) for a in args.eval_candidate],
                                         runs_root=Path(args.runs_root),
-                                        sources_root=Path(args.sources_root) if args.sources_root else None)
+                                        sources_root=Path(args.sources_root).absolute() if args.sources_root else None)
     except Refused as exc:
         return _refuse(exc.problems)
     print(f"run_dir: {run_dir}")

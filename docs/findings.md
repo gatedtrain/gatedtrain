@@ -591,44 +591,75 @@ fix; the reproductions are now tests (`tests/test_path_review.py`, tests/README.
 
 Four reviews and a verifier of the change above (gatedtrain PR 2) found that the arm's own files and the provenance
 sources were still read by path. Each finding was reproduced before the fix and is now a test
-(`tests/test_arm_reads.py`, `test_r18_clauses.CollectTwoClauses`, tests/README.md section 11.34).
+(`tests/test_arm_reads.py`, `test_r18_clauses.CollectTwoClauses`, tests/README.md section 11.34). The ids are
+prefixed `PR2-` here, since the review of the 3.12 path fix used C1 too; test docstrings cite them unprefixed.
 
-- **A1 (blocking).** `ext-collect` copied `items.jsonl`, `eval_meta.json` and `merge.json` into the run by path
+- **PR2-A1 (blocking).** `ext-collect` copied `items.jsonl`, `eval_meta.json` and `merge.json` into the run by path
   (`is_file`, `shutil.copyfile`, following links) after checking them, so a container still writing its arm could
   swap one for a link to a host file between the checks and the copy, and the run's `items.jsonl` could differ
   from the records gated. New module `ext/armfs.py`: `ArmSnapshot.read` opens the arm directory once and reads the
   three files once each (without following links, at most 1 GiB) with their SHA-256; `read_meta`, `read_lines`,
   `provenance_problems` and the EXT-52 re-derivation parse those bytes, and `ext-collect` writes them into the run.
-- **A2.** `provenance_problems` hashed any host path named in `merge.json` (`sources[].path`, `run_dir`), printed
+- **PR2-A2.** `provenance_problems` hashed any host path named in `merge.json` (`sources[].path`, `run_dir`), printed
   the hash (an oracle for host files) and blocked on a FIFO. Sources must now be absolute paths in normal form
   under the sources root (the host's output root, or the new `ext-collect --sources-root`; MULTIMODAL-SPEC MM-5),
   are reached from the root's descriptor without following links and read as arm files; a mismatch says
   `differs from the recorded hash`, and a source outside the root is refused (`provenance cannot be checked`).
   `ext-merge-eval` and `ext-from-nel` record `os.path.abspath` of a source (normal form).
-- **A3.** `read_meta` followed links and echoed the content of the file it read (unknown keys, the schema value);
+- **PR2-A3.** `read_meta` followed links and echoed the content of the file it read (unknown keys, the schema value);
   a stat-then-read race and a FIFO hang remained. A link is now refused before anything is read, so only the arm's
   own regular file is ever parsed.
-- **A4.** The output walk opened the last component before checking its type (a device node opened by the
+- **PR2-A4.** The output walk opened the last component before checking its type (a device node opened by the
   collecting user). Every component is now opened with `O_PATH` (intermediates `O_PATH | O_DIRECTORY |
   O_NOFOLLOW`); only a regular file is reopened for reading (`/proc/self/fd`, `O_NOCTTY`) and must be the same
   inode. Without `O_PATH` (macOS): `fstatat` without following, then `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`.
-- **A5.** `ext-merge-eval` told outputs apart by the raw path string (`outputs/x.txt` and `outputs/./x.txt`, the
+- **PR2-A5.** `ext-merge-eval` told outputs apart by the raw path string (`outputs/x.txt` and `outputs/./x.txt`, the
   second overwrote the first) and hashed its sources by path after the checks. Output paths must be canonical
   (`output_ref path '<p>' is not in canonical form (no `.` or empty component)`), and `merge.json` records the
   hashes of the bytes merged.
-- **A6.** A NUL or a lone surrogate in an output path raised `ValueError` or `UnicodeEncodeError`; now `contains a
+- **PR2-A6.** A NUL or a lone surrogate in an output path raised `ValueError` or `UnicodeEncodeError`; now `contains a
   NUL character` or `is not valid UTF-8`.
-- **B1.** An intermediate directory with mode 0o111 (search only) was refused (EACCES); `O_PATH` walks it.
-- **B2.** tests/README.md EXT-45 now says any link is refused.
-- **B3.** A read error of an output during the copy was reported as a failed write of `--runs-root`; it is an
+- **PR2-B1.** An intermediate directory with mode 0o111 (search only) was refused (EACCES); `O_PATH` walks it on
+  Linux. Without `O_PATH` (macOS) it is still refused, and a file swapped for a FIFO or device between the type check
+  and `open` is opened without blocking before the identity check refuses it (`armfs` docstring).
+- **PR2-B2.** tests/README.md EXT-45 now says any link is refused.
+- **PR2-B3.** A read error of an output during the copy was reported as a failed write of `--runs-root`; it is an
   `EXT-ARM` refusal now.
-- **B4.** The duplicate-arm key is the opened directory's identity from the snapshot; an arm that does not open
+- **PR2-B4.** The duplicate-arm key is the opened directory's identity from the snapshot; an arm that does not open
   is reported once (by its files), with the errno name.
-- **C1, C2.** The S4 test now includes an alias past `PATH_MAX` (a working directory deeper than `PATH_MAX`, `arm`
+- **PR2-C1, PR2-C2.** The S4 test now includes an alias past `PATH_MAX` (a working directory deeper than `PATH_MAX`, `arm`
   and `lnk` to one arm) that a resolved path string misses, and both collect copy sites have swap tests; mutants
   keying arms by `paths.resolve`, copying outputs or arm files by path, hashing merge sources by path or ignoring
   the sources root are killed.
-- **C3.** `_ext.container_user()` raises AssertionError instead of SkipTest under
+- **PR2-C3.** `_ext.container_user()` raises AssertionError instead of SkipTest under
   `GATEDTRAIN_REQUIRE_CONTAINER_USER=1`, which CI sets (and prints `id`), so a runner user that cannot launch a
   container fails the launch tests instead of skipping 176 of them.
-- **D1, D2.** The mutant ids and T5 above are defined; README "Changes since 0.3.0" states the breaking changes.
+- **PR2-D1, PR2-D2 (documentation).** The mutant ids and T5 of the previous section are defined (D1); README
+  "Changes since 0.3.0" states the breaking changes (D2).
+
+## Review of PR 2, round 2 (2026-11-19)
+
+Round 2 of the review (ids prefixed `R2-`). Each was reproduced first and is now a test in `tests/test_arm_reads.py`.
+
+- **R2-S1.** `ext-from-nel` read each NeMo Evaluator run by path: `full_config.yaml` four times and `results.jsonl`
+  twice, following links (an outside file's hash went into `merge.json`) and blocking on a FIFO, and a config swapped
+  after the sampler and seed checks was the one hashed (and later passed `ext-collect`, which compares only the
+  hash). The run directory is now opened once and both files are read once without following links
+  (`armfs.read_file`); the seed, sampler and scorer checks (`tierb._run_seed_and_repeats`, `_run_sampler` take the
+  parsed config; Tier B is unchanged), the conversion and the recorded hashes use those bytes.
+- **R2-C1.** A relative `--sources-root` never matched an absolute source path; the root is made absolute (CLI) and
+  `armfs.under_root` takes it from the working directory.
+- **R2-C2.** A source recorded by the real path of a root that is a link was refused; `under_root` accepts the root as
+  given or by its real path. The refusal's fix names `--sources-root`.
+- **R2-C3.** The `armfs` docstring and PR2-B1 state what holds only on Linux.
+- **R2-C4.** `open_regular` closes the reopened descriptor when `fstat` fails.
+- **R2-C5.** An invalid `nel_benchmark` and a source without `run_dir` have their own messages.
+- **R2-T2 to R2-T7.** New tests: the normal-form guard of `under_root` (`/root/a/../..`, `/root/../x`, `//root/x`), a
+  file changed after the snapshot leaves `read_meta` and `read_lines` unchanged, the arm directory replaced before
+  `copy_output_ref` is refused, the size cap with an explicit limit (`read_fd(limit=None)` reads `MAX_FILE_BYTES` when
+  called), the provenance refusal tests assert their reason, and `./eval_meta.json` is asserted as not canonical (it
+  no longer reaches the reserved-name check). The review's surviving mutants M13, M15, M16, M17, M18 and M21 are
+  killed.
+- **MM-5.** The sources root is where sources may be read from, not evidence that they are authentic.
+- Not in this change (a follow-up): stage outputs read by path (`manifest_entries`, `sdk.read_json`, `read_jsonl`,
+  `families/flow_grpo`), `tierb-collect`'s copies, per-file-type size caps, output hash caching and a total cap.

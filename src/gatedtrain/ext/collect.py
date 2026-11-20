@@ -43,6 +43,8 @@ from .merge import write_problem
 from .smoke import smoke_problems
 
 TRAINER_CONFIG_KEYS = ("backend", "profile")
+SOURCES_FIX = ("keep a merged arm's sources under the host's output root, or pass `--sources-root` with the directory "
+               "that holds them (MM-5); re-merge an arm whose sources were recorded with `.` or `..`")
 PROFILES = ("smoke", "full")
 # EXT-64: stage outputs besides the cuts that ext-collect reads; each must postdate the label's first START.
 # env-runtime.json also binds the script used by the run (EXT-83).
@@ -538,7 +540,7 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
                 except OSError as exc:                                     # EXT-154
                     why.append(f"an output or the scoring record cannot be read ({exc.__class__.__name__})")
             for msg in why:
-                problems.append(Problem("EXT-ARM", flag, f"{path}: {msg}",
+                problems.append(Problem("EXT-ARM", flag, f"{path}: {msg}", SOURCES_FIX if "sources root" in msg else
                                         "pass an arm directory (items.jsonl and eval_meta.json) of this evaluator and "
                                         "registration; merge single-seed runs with `gatedtrain ext-merge-eval`"))
             arms[arm] = {"path": path, "meta": meta, "records": recs, "snap": snap}

@@ -372,6 +372,199 @@ class TestPathStrings(ScenarioCase):
         self.assertEqual([s["items_sha256"] for s in doc["sources"]], [sha(b) for b in before])
 
 
+class TestFromNelReadsOnce(ScenarioCase):
+    """Round 2, S1: ext-from-nel reads each NeMo Evaluator run once below its directory, without following links;
+    the checks, the conversion and the hashes in merge.json use those bytes."""
+
+    def runs(self, tag: str) -> list[Path]:
+        from _tierb import build_eval_run
+
+        type(self).n += 1
+        d = self.tmp / f"nel-{tag}-{type(self).n}"
+        return [build_eval_run(d / f"rep{r}", self.sc.rows, reward_fn=lambda i: 0.0, seed=s, model="cand",
+                               scorer="numeric_match", scorer_fn=lambda i: 1.0) for r, s in enumerate(SEEDS)]
+
+    def convert(self, runs: list[Path]):
+        from _ext import EVALUATOR_ID
+        from gatedtrain.ext import from_nel
+
+        type(self).n += 1
+        return from_nel.from_nel(registration=self.sc.paths["registration"], adapter="synthetic",
+                                 evaluator=EVALUATOR_ID, items=self.sc.items_dir, checkpoint=self.sc.final_cut,
+                                 out=self.tmp / f"nel-out-{type(self).n}", runs=runs)
+
+    def test_fifo_config_refused_without_blocking(self):
+        def expired(signum, frame):
+            raise AssertionError("ext-from-nel blocked on a FIFO")
+
+        old = signal.signal(signal.SIGALRM, expired)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        signal.alarm(WATCHDOG_S)
+        self.addCleanup(signal.alarm, 0)
+        runs = self.runs("fifo")
+        (runs[0] / "full_config.yaml").unlink()
+        os.mkfifo(runs[0] / "full_config.yaml")
+        with self.assertRaises(Refused) as cm:
+            self.convert(runs)
+        self.assertIn("full_config.yaml is not a regular file", str(cm.exception))
+
+    def test_linked_config_refused(self):
+        runs = self.runs("link")
+        outside = self.tmp / f"outside-{type(self).n}.yaml"
+        shutil.copyfile(runs[0] / "full_config.yaml", outside)
+        (runs[0] / "full_config.yaml").unlink()
+        (runs[0] / "full_config.yaml").symlink_to(outside)
+        with self.assertRaises(Refused) as cm:
+            self.convert(runs)
+        self.assertIn("full_config.yaml contains a symbolic link", str(cm.exception))
+
+    def test_config_swapped_after_the_checks_is_not_recorded(self):
+        from gatedtrain.ext import from_nel
+
+        runs = self.runs("swap")
+        cfg = runs[0] / "full_config.yaml"
+        checked = cfg.read_bytes()
+        changed = checked.replace(b"temperature: 0.7", b"temperature: 0.9")
+        self.assertNotEqual(changed, checked)
+        real = from_nel.sha256
+        swapped = []
+
+        def swap_then_hash(data):
+            if not swapped:
+                swapped.append(True)
+                cfg.write_bytes(changed)
+            return real(data)
+
+        with mock.patch.object(from_nel, "sha256", swap_then_hash):
+            out = self.convert(runs)
+        self.assertTrue(swapped)
+        doc = json.loads((out / "merge.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["sources"][0]["config_sha256"], sha(checked))
+
+
+class TestSourcesRoot(TestProvenanceSources):
+    """Round 2: a relative sources root (C1), a root spelled through a link (C2), the normal-form guard (T2) and the
+    evaluator's benchmark (C5)."""
+
+    def test_relative_root(self):
+        out, _ = self.merged("relative")
+        cwd = os.getcwd()
+        os.chdir(self.tmp.parent)
+        try:
+            self.assertEqual(self.problems(out, Path(self.tmp.name)), [])
+        finally:
+            os.chdir(cwd)
+        proc = self.sc.collect(self.tmp / f"runs-rel-{type(self).n}", candidate=out,
+                               sources_root=Path(os.path.relpath(self.tmp, self.sc.root)))
+        self.assertNotIn("sources root", proc.stderr, describe(proc))
+
+    def test_root_through_a_link(self):
+        out, _ = self.merged("rootlink")
+        link = self.tmp.parent / f"{self.tmp.name}-link"
+        link.symlink_to(self.tmp)
+        self.addCleanup(link.unlink)
+        self.assertEqual(self.problems(out, link), [], "sources recorded by the real path, root named by the link")
+        doc = json.loads((out / "merge.json").read_text(encoding="utf-8"))
+        for s in doc["sources"]:
+            s["path"] = s["path"].replace(str(self.tmp), str(link), 1)
+        (out / "merge.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.assertEqual(self.problems(out, link), [], "sources recorded through the link, root named by the link")
+
+    def test_fix_names_the_sources_root_option(self):
+        out, _ = self.merged("fix")
+        proc = self.sc.collect(self.tmp / f"runs-fix-{type(self).n}", candidate=out)
+        hits = [e for e in parse_errors(proc.stderr) if "sources root" in e["message"]]
+        self.assertTrue(hits and all("--sources-root" in e["fix"] for e in hits), proc.stderr)
+
+    def test_normal_form_guard(self):
+        root = "/data/root"
+        for path in ("/data/root/a/../..", "/data/root/../x", "//data/root/x", "/data/root/./x", "/data/root//x",
+                     "data/root/x", "/data/rootx", "/data/root/x\x00", "/data/root/\ud800"):
+            with self.subTest(path=path):
+                self.assertIsNone(armfs.under_root(root, path))
+        self.assertEqual(armfs.under_root(root, "/data/root/a/b"), "a/b")
+        self.assertEqual(armfs.under_root(root, "/data/root"), "")
+
+    def test_benchmark_and_run_dir_messages(self):
+        arm = self.tmp / f"nelarm-{type(self).n}"
+        arm.mkdir()
+        (arm / "merge.json").write_text(json.dumps({"schema": "gatedtrain.ext_from_nel", "sources": [
+            {"repeat": 0, "seed": 1, "run_dir": str(self.tmp)}, {"repeat": 1, "seed": 2}]}), encoding="utf-8")
+        got = arm_mod.provenance_problems(arm, {"eval_seeds": [1, 2]}, nel_benchmark="../gsm8k",
+                                          sources_root=self.tmp)
+        self.assertIn("the evaluator's nel_benchmark '../gsm8k' is not a relative path in canonical form; provenance "
+                      "cannot be checked", got)
+        self.assertIn("merge.json sources[1] has no run_dir", got)
+
+
+class TestSnapshotIsWhatIsChecked(ScenarioCase):
+    """Round 2: checks parse the snapshot's bytes (T4); the arm directory replaced after the snapshot is refused
+    (T3); the size cap (T5); no descriptor is leaked when `fstat` fails (C4)."""
+
+    def test_files_changed_after_the_snapshot(self):
+        cand = self.fresh("parse")
+        snap = armfs.ArmSnapshot.read(cand)
+        meta_before = arm_mod.read_meta(cand, snap)
+        lines_before = arm_mod.read_lines(cand, seeds=list(SEEDS), score_range=[0, 1], error_classes=(), snap=snap)
+        (cand / "items.jsonl").write_text("not json\n", encoding="utf-8")
+        (cand / "eval_meta.json").write_text('{"schema": "other"}', encoding="utf-8")
+        self.assertEqual(arm_mod.read_meta(cand, snap), meta_before)
+        self.assertEqual(arm_mod.read_lines(cand, seeds=list(SEEDS), score_range=[0, 1], error_classes=(), snap=snap),
+                         lines_before)
+        self.assertEqual(lines_before[1], [])
+
+    def test_arm_replaced_before_the_copy(self):
+        cand = self.with_output(self.fresh("replaced"))
+        snap = armfs.ArmSnapshot.read(cand)
+        moved = cand.with_name(cand.name + "-old")
+        cand.rename(moved)
+        shutil.copytree(moved, cand)
+        with self.assertRaises(Refused) as cm:
+            arm_mod.copy_output_ref(cand, {"path": "outputs/a.txt", "sha256": sha(b"output")},
+                                    self.tmp / f"dst-{type(self).n}", flag="--eval-candidate", key=snap.key)
+        self.assertIn("the arm directory was replaced since it was read", cm.exception.problems[0].message)
+
+    def test_size_cap(self):
+        cand = self.fresh("cap")
+        fd = armfs.open_arm(cand)
+        try:
+            data = armfs.read_file(fd, "eval_meta.json")
+            ffd = armfs.open_regular(fd, "eval_meta.json")
+            try:
+                with self.assertRaises(armfs.Unreadable) as cm:
+                    armfs.read_fd(ffd, limit=len(data) - 1)
+            finally:
+                os.close(ffd)
+        finally:
+            os.close(fd)
+        self.assertEqual(cm.exception.reason(), f"is larger than {len(data) - 1} bytes")
+        with mock.patch.object(armfs, "MAX_FILE_BYTES", 10):
+            snap = armfs.ArmSnapshot.read(cand)
+        self.assertEqual(snap.files["eval_meta.json"].problem, "is larger than 10 bytes")
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "no /proc/self/fd")
+    def test_no_descriptor_leaked_when_fstat_fails(self):
+        cand = self.fresh("fstat")
+        real = os.fstat
+        calls = []
+
+        def failing(fd):
+            calls.append(fd)
+            if len(calls) == 2:                     # the reopened file (the first is the O_PATH one)
+                raise OSError(5, "Input/output error")
+            return real(fd)
+
+        fd = armfs.open_arm(cand)
+        try:
+            before = set(os.listdir("/proc/self/fd"))
+            with mock.patch.object(armfs.os, "fstat", failing), self.assertRaises(armfs.Unreadable) as cm:
+                armfs.open_regular(fd, "eval_meta.json")
+            self.assertEqual(set(os.listdir("/proc/self/fd")), before)
+        finally:
+            os.close(fd)
+        self.assertEqual(cm.exception.reason(), "cannot be opened (EIO)")
+
+
 class TestRequireContainerUser(unittest.TestCase):
     """C3: in CI the launch fixtures fail instead of skipping when the running user cannot launch a container."""
 

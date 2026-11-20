@@ -19,6 +19,9 @@ The tests pin the CLI, report and file formats described below. See the reposito
 - **Slow tests:** the classes named `Slow*` in `test_e2e_slow.py` are the end-to-end runs.
   - `GATEDTRAIN_SKIP_SLOW=1` skips them.
   - `GATEDTRAIN_KEEP_TMP=1` keeps the temporary workspace for inspection.
+- **Container user:** the launch fixtures run the container as the user running the tests and its primary group
+  (`_ext.container_user`, EXT-63); as root, for a uid without a user database entry or a primary group that owns a
+  Docker socket those tests skip, and with `GATEDTRAIN_REQUIRE_CONTAINER_USER=1` (set in CI) they fail instead.
 - **Design set and pinned clones:** the tests read them only from the environment variables below (`tests/_support.py`); there are no defaults. A test that needs a variable that is unset or empty skips and names the variable (a missing directory: the path).
 
   | Variable | Root | Expected content |
@@ -1881,4 +1884,10 @@ regular file, a 0o111 directory walked; NUL, lone surrogate, `.` and empty compo
 `GATEDTRAIN_REQUIRE_CONTAINER_USER` switch. `test_r18_clauses.CollectTwoClauses` (2): one arm passed as `arm` and
 `lnk` from a working directory deeper than `PATH_MAX` is passed twice; with two clauses, arm files swapped after the
 checks change nothing and an output swapped for a link refuses. CollectCase tests pass `--sources-root` (the test
-root). Suite: 1,351 tests.
+root). Round 2 (`docs/findings.md`, "Review of PR 2, round 2"): `test_arm_reads.py` (+18):
+`TestFromNelReadsOnce` (a FIFO `full_config.yaml` refused under a watchdog, a linked one refused, a config swapped
+after the checks not recorded), `TestSourcesRoot` (a relative root, a root that is a link, the fix names
+`--sources-root`, the normal-form guard, the `nel_benchmark` and `run_dir` messages; with `TestProvenanceSources`'
+tests inherited), `TestSnapshotIsWhatIsChecked` (files changed after the snapshot, the arm replaced before the copy,
+the size cap, no descriptor leaked); the provenance refusal tests of `test_ext_hardening` and `test_ext_review2`
+assert their reason. Suite: 1,369 tests, 40 skipped in CI (among them the root-only device-node test).

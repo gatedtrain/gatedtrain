@@ -204,12 +204,14 @@ class TestRederivedArm(CollectCase):
         """Review probe p1: every score of the merged arm set to 1.0; sources and merge.json unchanged."""
         out = self.merged("p1")
         self.rewrite(out, lambda recs: [dict(r, score=1.0) if r["score"] is not None else r for r in recs])
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out,
+                     reason="the arm was edited after it was written (EXT-52)")
 
     def test_lines_reordered(self):
         out = self.merged("order")
         self.rewrite(out, lambda recs: list(reversed(recs)))
-        self.refused("EXT-ARM", "--eval-baseline", baseline=out)
+        self.refused("EXT-ARM", "--eval-baseline", baseline=out,
+                     reason="the arm was edited after it was written (EXT-52)")
 
     def test_untouched_merged_arm_passes(self):
         self.assertEqual(self.passes(baseline=self.merged("ok"))["status"], "PASS")
@@ -221,7 +223,8 @@ class TestRederivedArm(CollectCase):
         self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
         self.assertEqual(self.passes(candidate=arm)["status"], "PASS")
         self.rewrite(arm, lambda recs: [dict(r, score=1.0) if r["score"] is not None else r for r in recs])
-        self.refused("EXT-ARM", "--eval-candidate", candidate=arm)
+        self.refused("EXT-ARM", "--eval-candidate", candidate=arm,
+                     reason="the arm was edited after it was written (EXT-52)")
 
 
 # ---------------------------------------------------------------------------
