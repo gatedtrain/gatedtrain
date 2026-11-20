@@ -534,3 +534,13 @@ Source: the area runtime `<mm-root>/area10-agentic` (README section 0, in partic
   the results are the standard library's; on 3.12 they differ only after a symbolic link loop, where 3.12 stops and
   3.13 resolves the rest (`tests/test_paths.py`: 2,000 random paths over a tree of link chains, a loop and `..`; the
   `/proc` cases where the link is not readable).
+
+## The CPU demo across machines (found by CI, 2026-11-20)
+
+- **The demo's gate depended on the runner's CPU.** The stand-ins train on one thread with deterministic algorithms,
+  so a run repeats exactly on one machine, but PyTorch chooses CPU kernels by instruction set and MKL its BLAS code
+  path. On GitHub runners the same commit and the same wheels gave PASS in one job and FAIL in another
+  (`test_e2e_slow`: the warm-up baseline scored 0.833 there against 0.522 on the development host). The stand-ins now
+  pin `ATEN_CPU_CAPABILITY=default` and `MKL_CBWR=COMPATIBLE` before torch is imported (`gatedtrain/stubs/__init__.py`;
+  an operator's own setting wins), and `runner.run` imports the stand-ins before torch. The CI workflow prints the
+  runner's CPU model and instruction sets.

@@ -6,6 +6,15 @@ They write the file formats of NeMo RL at 4f39fd8 and NeMo Evaluator at
 ea35ba3 so the real ledger writer and pairing code read them unchanged.
 """
 
+import os
+
+# The stand-ins train on one thread with deterministic algorithms (model.py), which makes a run reproducible on one
+# machine but not across CPUs: PyTorch picks its CPU kernels by instruction set (AVX2, AVX-512, ...) and MKL its BLAS
+# code path, so the demo's gate could PASS on one runner and FAIL on another. Pin both before torch is imported (an
+# operator's own setting wins): ATen's portable kernels and MKL's conditional numerical reproducibility mode.
+os.environ.setdefault("ATEN_CPU_CAPABILITY", "default")
+os.environ.setdefault("MKL_CBWR", "COMPATIBLE")
+
 STUB_MARKER_FILE = "SKELETON_STUB"
 
 

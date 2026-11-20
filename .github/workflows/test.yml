@@ -30,6 +30,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -e '.[tier-a]'
+      # The CPU model and instruction sets of the runner, to match a demo result with the hardware it ran on.
+      - run: grep -m1 'model name' /proc/cpuinfo; grep -o -m1 -w -E 'avx512f|avx2' /proc/cpuinfo | sort -u
       # The launch rules require a run's output directory to be owned by the container's uid 1000 (EXT-63); the
       # runner's user is another uid, so the tests run as uid 1000.
       - run: id -u 1000 > /dev/null 2>&1 || sudo useradd --uid 1000 --create-home gatedtrain-test

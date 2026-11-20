@@ -495,10 +495,10 @@ def gate_and_report_multi(wf: Workflow, run_dir: Path, *, plans: list[dict], has
 
 def run(spec_path: Path, runs_root: Path) -> tuple[Path, dict[str, Any], str]:
     """Validate, then run the whole path (Tier A). Returns (run_dir, report, text report)."""
-    import torch
-
-    from .stubs import evaluator as evaluator_mod
+    from .stubs import evaluator as evaluator_mod     # first: the package pins the CPU kernels before torch loads
     from .stubs import trainer as trainer_mod
+
+    import torch
 
     wf = load_spec(spec_path)
     pre = preflight(wf)
