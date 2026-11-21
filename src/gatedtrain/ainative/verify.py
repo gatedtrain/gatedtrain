@@ -13,7 +13,9 @@ lists every envelope it signed for the project, `records`) or a key fingerprint 
 
 Without an anchor the same checks run against the project's own key copy and binding (anchor `none`): that proves the
 records are consistent with each other, not that the keeper made them. Any failure is refused (AN-14); the caller
-turns the anchor into the exit code (0 anchored, 1 consistency only).
+turns the anchor into the exit code (0 anchored, 1 consistency only). A keeper whose `hello` does not say it runs as
+another uid than the owner's (`same_user` not false) is no anchor either: the owner can read its key
+(`SAME_USER_KEEPER`, exit 1).
 
 Only `--keeper` finds a deleted record: the project must hold exactly the envelopes the keeper's `records` op lists for
 it, no more and no fewer. Offline (`--fingerprint` or no anchor) a report is bound to this project through its
@@ -38,6 +40,9 @@ from .project import Project, _refuse_links
 from .trust_stages import REPORT_MD, SCHEMA_GATE_RESULT, SCHEMA_REGISTRATION, SCHEMA_REPORT, render_markdown
 
 CONSISTENCY_ONLY = "checked consistency only: no keeper and no fingerprint"
+SAME_USER_KEEPER = ("the keeper runs as the owner's own uid, so the owner, and anything running as the owner, can read "
+                    "its signing key: the records check against it, but a same-user keeper cannot anchor trust "
+                    "(consistency only)")
 OFFLINE_LIMIT = ("offline verify cannot detect deleted records; verify against the keeper (--keeper) to check "
                  "that the project holds every record the keeper signed for it")
 _FP = re.compile(r"sha256:[0-9a-f]{64}")
@@ -74,8 +79,9 @@ def _receipts(project: Project) -> list[tuple[str, Any]]:
     return out
 
 
-def _anchor(project: Project, keeper: Path | None, fingerprint: str | None) -> tuple[str, str, Any]:
-    """(anchor kind, anchor fingerprint, anchor public key)."""
+def _anchor(project: Project, keeper: Path | None, fingerprint: str | None) -> tuple[str, str, Any, bool | None]:
+    """(anchor kind, anchor fingerprint, anchor public key, whether the keeper runs as the owner's uid: None without a
+    keeper, True unless its `hello` says `same_user` false)."""
     if fingerprint is not None and not _FP.fullmatch(fingerprint):
         raise _bad("--fingerprint", "the fingerprint is not sha256:<64 lowercase hex>",
                    "pass the fingerprint `gatedtrain keeper fingerprint` printed at setup")
@@ -90,10 +96,12 @@ def _anchor(project: Project, keeper: Path | None, fingerprint: str | None) -> t
         copy = signing.load_public_pem((project.root / KEEPER_PUB).read_bytes())
     except OSError:
         raise _bad(KEEPER_PUB, "the project's copy of the keeper key is missing") from None
+    same_user = None
     if keeper is not None:
         hello = KeeperClient(Path(keeper).absolute(), timeout=protocol.LONG_OP_TIMEOUT_S).call("hello", None, {})
         fp, pem = _hello_key(hello)
         kind, public = "keeper", signing.load_public_pem(pem)
+        same_user = hello.get("same_user") is not False
         if fingerprint is not None and fingerprint != fp:
             raise _bad("--fingerprint", "the keeper serves another key than the fingerprint given")
     elif fingerprint is not None:
@@ -104,7 +112,7 @@ def _anchor(project: Project, keeper: Path | None, fingerprint: str | None) -> t
         raise _bad(KEEPER_PUB, "the project's copy of the keeper key is not the anchor's key")
     if binding.fingerprint != fp:
         raise _bad("trust/keeper.json.fingerprint", "the project is bound to another key than the anchor's")
-    return kind, fp, public
+    return kind, fp, public, same_user
 
 
 _NAMED = {"registration.json": SCHEMA_REGISTRATION, "gate_result.json": SCHEMA_GATE_RESULT,
@@ -163,11 +171,12 @@ def _check_registration(rel: str, doc: dict, env: dict) -> None:
 
 
 def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) -> dict:
-    """`{anchor: "keeper" | "fingerprint" | "none", checked, fingerprint}`; refused (AN-14) on a bad signature, a
-    record the keeper does not hold, or a record, key copy or binding that differs from the anchor. `checked` counts the
-    envelopes in the receipts plus the registration, gate result and report records compared with them."""
+    """`{anchor: "keeper" | "fingerprint" | "none", checked, fingerprint, same_user}` (`same_user` None without a
+    keeper); refused (AN-14) on a bad signature, a record the keeper does not hold, or a record, key copy or binding
+    that differs from the anchor. `checked` counts the envelopes in the receipts plus the registration, gate result and
+    report records compared with them."""
     project = Project.load(Path(root))
-    kind, fp, public = _anchor(project, keeper, fingerprint)
+    kind, fp, public, same_user = _anchor(project, keeper, fingerprint)
     pid = project_id(project)
     by_sha: dict[str, dict] = {}
     for where, env in _receipts(project):
@@ -192,8 +201,10 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
         missing = sorted(signed - set(by_sha))
         if missing:
             raise _bad(RECEIPTS, f"{len(missing)} record(s) the keeper signed for this project are missing from the "
-                       f"project, first {missing[0]}", "a record was deleted from the project; do not trust its "
-                       "report")
+                       f"project, first {missing[0]}: signed by the keeper but not received by the driver, or deleted "
+                       "from the project", "run `gatedtrain project run <project> <stage>` or `gatedtrain project "
+                       "report <project>` again to fetch them from the keeper, then verify again; if they stay "
+                       "missing, do not trust the report")
     checked = len(by_sha)
     for rel, doc in _records(project):
         schema = doc["schema"]
@@ -222,4 +233,4 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
             elif env["record"] != {k: v for k, v in doc.items() if k not in _ENVELOPE_META}:
                 raise _bad(rel, "the gate result is not the gate summary the keeper signed")
         checked += 1
-    return {"anchor": kind, "checked": checked, "fingerprint": fp}
+    return {"anchor": kind, "checked": checked, "fingerprint": fp, "same_user": same_user}

@@ -12,7 +12,9 @@ whose `label` is `base` is the baseline; every other model is a candidate.
 - `raise`: a candidate call raises `ValueError` whose message is the item's input (it must never leave the keeper);
 - `nan`: a candidate call returns a float NaN (not canonical JSON);
 - `block:<file>`: the first candidate call creates `<file>`, then sleeps (the test kills the process meanwhile);
-- `slow:<seconds>`: every candidate call sleeps that long first.
+- `slow:<seconds>`: every candidate call sleeps that long first;
+- `write_error`: the generator is the pack's, but the keeper cannot write a candidate's per-item records (`OSError`),
+  an exception after the grant that is not a refusal.
 """
 
 from __future__ import annotations
@@ -74,13 +76,28 @@ def _test_generator(mode: str):
 
 def _scenario():
     mode = os.environ.get(TEST_GENERATOR_ENV)
-    if not mode:
+    if not mode or mode == "write_error":
         return pack.SCENARIO
     return pack.Scenario(pack.SCENARIO.name, {pack.GENERATOR: _test_generator(mode)}, pack.SCENARIO.pipeline,
                          pack.SCENARIO.scorers)
 
 
+def _fail_candidate_record_writes() -> None:
+    from gatedtrain.ainative.keeper import state
+
+    original = state.KeeperState._write_arm
+
+    def write_arm(self, rel: str, model_sha: str, records: list) -> None:
+        if "/records/" in rel:
+            raise OSError("test: the candidate's records cannot be written")
+        original(self, rel, model_sha, records)
+
+    state.KeeperState._write_arm = write_arm
+
+
 def main(argv: list[str]) -> int:
+    if os.environ.get(TEST_GENERATOR_ENV) == "write_error":
+        _fail_candidate_record_writes()
     eps = [_StageEP(c) for c in (pack.ProfileData, pack.ChooseTaskAndBase, pack.BuildTrainSet, pack.WriteRecipe,
                                  pack.Smoke, pack.Train)]
     stage_mod._plugin_entry_points = lambda: list(eps)

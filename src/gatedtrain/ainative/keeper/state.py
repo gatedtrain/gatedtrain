@@ -35,7 +35,9 @@ training is forced into the training part of every later split, so it is never s
 No response, record or refusal holds a sealed input or label; an exception from scorer code is counted, never shown.
 
 Attempts (AN-8, AN-9, AN-10, AN-15; spec §5.4): `evaluate` settles the set's open attempt, checks, grants alpha_j
-(Foster-Stine, `alpha_investing`), commits and signs the claim, and only then scores; `gate` decides at alpha_j once
+(Foster-Stine, `alpha_investing`), commits and signs the claim, and only then scores (an exception while scoring,
+a refusal or not, settles the attempt as not passed and returns the spend's envelopes in `RefusedAfterSpend`, naming
+the exception class only); `gate` decides at alpha_j once
 and settles the ledger; `report` builds and signs `report.json` (`schema_version` 2) from keeper records and closes
 the set. An attempt still open at a restart is gated normally when its per-item records were stored, else it settles
 as not passed (MISSING); either happens on the next `evaluate`, `gate` or `report` on the set (preflight finding 8).
@@ -823,9 +825,13 @@ class KeeperState:
                               full, ev)
             try:
                 self._score(att, full, found, fn, base_rec, cand_rec, ev)
-            except Refused as exc:                          # pack code failed: the attempt settles, not passed
+            except Exception as exc:                        # after the grant: the attempt settles, not passed
+                problems = exc.problems if isinstance(exc, Refused) else [Problem(
+                    "AN-8", "evaluate", f"the sealed evaluation failed after alpha was granted ({type(exc).__name__}); "
+                    "the attempt settles as not passed", "check the keeper (its disk and its scenario pack), then "
+                    "train a new candidate")]           # class name only: the message may hold a sealed item
                 settled = self._settle(att)
-                raise RefusedAfterSpend(exc.problems, {**self._claim_response(settled),
+                raise RefusedAfterSpend(problems, {**self._claim_response(settled),
                                                        "summary": settled["summary"],
                                                        "settle": settled["settle"]}) from None
             return self._claim_response(att)

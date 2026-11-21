@@ -24,6 +24,9 @@ Not released yet. Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPE
   `merge.json` are those of the bytes checked.
 - Tests run as any non-root user (the launch fixtures run the container as the running user and its primary group).
   With `GATEDTRAIN_REQUIRE_CONTAINER_USER=1`, as in CI, the tests that need such a user fail instead of skipping.
+- AI-native projects: the library scorers of `gatedtrain.ainative.scorers` have a new evaluator hash. A registration
+  made with them before this change pins the old hash, which no longer matches the scorer; register it again (a new
+  `preregister`).
 
 ## Install and run the demo
 
@@ -84,12 +87,14 @@ gatedtrain project report ./proj
 
 `--pipeline` is the path of a pipeline YAML. `--gpu-hours` is recorded in
 `project.yaml` as the budget; step 1 enforces nothing. `run` of the `gate` stage exits 0 on PASS and 1 otherwise;
-a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result. A project scores its sealed items once:
+a refusal exits 3. Re-running a stage with unchanged inputs returns its recorded result.
+
+Without a keeper (step 1, in process), a project scores its sealed items once:
 after the first scoring `evaluate_sealed` refuses to score again, for the same model reference too (a rerun with
 unchanged inputs returns the recorded scores). A model reference must content-address its weights (for example
 carry their hash); step 1 does not check this, so a reference to a mutable checkpoint path lets the gate records
-describe weights the reference no longer points to after a retrain. The gate spends the project's single alpha: a second gate attempt is refused. A top-level `--json` prints one result
-object per call.
+describe weights the reference no longer points to after a retrain. The gate spends the project's single alpha: a second gate attempt is refused. A project bound to a keeper
+follows the keeper's alpha rule instead (below). A top-level `--json` prints one result object per call.
 
 **Trust boundary in step 1.** Stages run in the operator's process. CLI outputs carry only hashes of the sealed
 items, but in step 1 they sit in plain files under `<root>/trust/` that the operator and any stage can read and
@@ -123,8 +128,11 @@ gatedtrain verify ./proj --keeper /run/gatedtrain-keeper/keeper.sock          # 
 
 `setup keeper` prints the commands that create the keeper user, its 0700 state directory, a root-owned virtual
 environment with gatedtrain and the scenario packs pinned to versions, and a systemd unit running `gatedtrain keeper
-serve`; it writes nothing. The keeper refuses to start when its code, environment or state directory can be changed
-by another user (AN-13). `project create --keeper` binds the project to the key the keeper serves (`trust/keeper.json`,
+serve`; it writes nothing. The keeper refuses to start when its code, environment, state directory or socket
+directory can be changed by another user (AN-13); a path holding `%`, `$`, whitespace, a quote or a backslash is
+refused by `setup keeper`, since systemd would rewrite it in the unit. Known limit of that check: a module first
+imported after the start-up check that lies outside gatedtrain, the installed scenario packs and gatedtrain's runtime
+dependencies is not checked, and site-packages is not walked as a whole. `project create --keeper` binds the project to the key the keeper serves (`trust/keeper.json`,
 `trust/keeper.pub`); a bound project never falls back to step 1: an unreachable keeper (AN-12) or one serving another
 key (AN-14) is refused. `keeper confirm` shows the sentence that says what the scorer counts and the margin, and
 records it in the keeper only after you type `yes` (or pass `--yes`; under `--json` it never prompts); `preregister`
@@ -132,15 +140,24 @@ refuses a registration without a matching confirmation (AN-18). The scorer comes
 `numeric_match`, `normalised_match`, `set_f1`, `field_f1`) or from a pack by reference (AN-17).
 
 **Alpha rule.** Under the keeper the alpha is not per project but per sealed set, by alpha-investing (Foster-Stine):
-the initial wealth is W0 = 0.05 * (1 - 0.05) = 0.0475; attempt j bids alpha_j = W_{j-1} / 2; a FAIL, INCONCLUSIVE,
+the initial wealth is W0 = 0.05 * (1 - 0.05) = 0.0475; attempt j bids alpha_j = W_{j-1} / 2 (at most
+W_{j-1} / (1 + W_{j-1}), so a bid never costs more than the wealth; this binds only above a wealth of 1); a FAIL, INCONCLUSIVE,
 MISSING or crashed attempt costs alpha_j / (1 - alpha_j); a PASS earns the payout 0.05; an attempt whose bid would
 be below 0.005 is refused. Intake plans power at W0 / 2 = 0.02375. Each `evaluate_sealed` spends its alpha before any
 item is scored, so a project may gate several candidates (rerun `train`, then `evaluate_sealed` and `gate`)
 until one passes; a PASS ends the project's attempts. A new project on byte-identical data shares the sealed set and its wealth;
 other data holding a sealed item are refused (AN-16). The report lists every attempt with its alpha, cost and payout
 and states the guarantee: "alpha-investing (Foster-Stine) over the gate attempts on this sealed set controls the
-marginal false discovery rate (mFDR) at level 0.05". A report closes the sealed set: no further attempt on it, from any
-project, and a new project on the same data is refused at intake.
+marginal false discovery rate (mFDR) at level 0.05". Its known limits qualify this: it assumes each test is valid given
+the earlier outcomes; the sealed items are reused across attempts and only each attempt's status is revealed. A report
+closes the sealed set: no further attempt on it, from any project, and a new project on the same data is refused at
+intake.
+
+**Oracles.** The keeper answers some requests about sealed data with counts and does not limit how often they are
+asked: opening a project is free and a refused intake stores nothing, so anything running as the user can learn from
+intake refusals how many inputs of a candidate data file were sealed before (and, repeated, which); a registration
+refused for its scorer names how many sealed labels that scorer cannot take. The report lists this in its known
+limits.
 
 **Guarantee.** With the keeper under its own user, the report's `sealed_guarantee` reads: "the sealed items,
 registrations, claims, ledger and per-item records are held by a separate OS user running code the user's account
@@ -155,7 +172,11 @@ receipt in `trust/keeper/records.jsonl`, the gate result, `report.json` and `rep
 serves, and that the project holds every record the keeper signed for it; `--fingerprint` checks against a
 fingerprint held out of band, offline, and cannot detect a deleted record (it says so). It exits 0 when every record
 checks, 3 on a bad signature, an edited record, a replaced `trust/keeper.pub` or another fingerprint (AN-14), and 1
-without either anchor (consistency only).
+without either anchor or against a keeper that runs as the owner's own uid (consistency only: the owner can read that
+keeper's key). The driver keeps every envelope the keeper signed for the project: after each `evaluate_sealed`, `gate`
+and `report`, and on `project report`, it fetches the keeper's list and adds what it lacks (for example the claim of an
+evaluation it stopped waiting for), each verified first. A record the keeper signed that the project still lacks fails
+`verify --keeper` with exit 3.
 
 ## Adapter plugins
 

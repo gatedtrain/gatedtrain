@@ -13,6 +13,12 @@ fingerprint must be the binding's) and appended to the project's receipts (`RECE
 receipts are what the machine counts as a side effect, so a spend the keeper reports with a refusal
 (`RefusedAfterSpend`) is appended before the refusal is raised and the attempt is logged `failed`.
 
+The receipts are synced with the keeper (`sync`) after every `evaluate`, `gate` and `report`: the keeper lists every
+envelope it signed for the project (`records`), and each one the receipts lack is verified and appended. A driver can
+miss an envelope without any tampering: a client that gave up during an evaluation never received that attempt's claim
+and grant, and the next evaluate settles the attempt in the keeper; after a retrain the identical request that would
+return the stored claim is never sent.
+
 The project copy of the key is a convenience, not a trust anchor: `gatedtrain verify` anchors on the key the keeper
 serves or on a fingerprint the reader holds (AN-14).
 """
@@ -262,6 +268,24 @@ class KeeperTrust:
         self._append(envelope)
         return record
 
+    def sync(self) -> int:
+        """Append to the receipts every envelope the keeper signed for this project that they lack, each verified
+        against the bound key for this project first (AN-14); returns how many were appended (final review finding 1:
+        a claim and grant the driver never received)."""
+        held = self._call("records")
+        if not isinstance(held, list):
+            raise _anchor("records", "the keeper's record list is malformed", "check the keeper")
+        have = set(self._receipt_lines())
+        added = 0
+        for env in held:
+            kind = env.get("kind") if isinstance(env, dict) else None
+            self.verified(env, kind if isinstance(kind, str) else "")
+            if canonical_json(env) not in have:
+                self._append(env)
+                have.add(canonical_json(env))
+                added += 1
+        return added
+
     def receipt(self, kind: str, **match: Any) -> dict | None:
         """The last receipt of `kind` whose record has the given values, or None."""
         found = None
@@ -338,7 +362,8 @@ class KeeperTrust:
     def evaluate(self, registration_hash: str, baseline: tuple[dict, str], candidate: tuple[dict, str]) -> dict:
         """Ask the keeper for a sealed attempt: it grants alpha, signs the claim and scores both arms. Returns the
         claim record. A refusal after the grant (the scoring failed) appends the spend's envelopes before it is
-        raised, so the machine logs the attempt `failed` (preflight finding 9)."""
+        raised, so the machine logs the attempt `failed` (preflight finding 9). Either way the receipts are then synced
+        with the keeper (`sync`), which also brings in an earlier attempt this driver gave up on."""
         args = {"registration_hash": registration_hash,
                 "baseline": {"record": baseline[0], "sha256": baseline[1]},
                 "candidate": {"record": candidate[0], "sha256": candidate[1]}}
@@ -350,6 +375,10 @@ class KeeperTrust:
                               ("settle", "ledger_entry")):
                 if res.get(key) is not None:
                     self._keep(res[key], kind)
+            try:
+                self.sync()
+            except Refused:                          # the refusal below is the one to report; a later op syncs
+                pass
             raise Refused(exc.problems) from None
         claim = self._keep(out.get("claim") if isinstance(out, dict) else None, "claim")
         grant = self._keep(out.get("ledger"), "ledger_entry")
@@ -358,6 +387,7 @@ class KeeperTrust:
         if any(claim.get(k) != v for k, v in want.items()) or grant.get("attempt_id") != claim.get("attempt_id") or \
                 grant.get("alpha") != claim.get("alpha") or grant.get("entry") != "grant":
             raise _anchor("evaluate", "the keeper's signed claim is not for the attempt requested", "check the keeper")
+        self.sync()
         return claim
 
     def sealed_evaluation(self) -> dict | None:
@@ -377,12 +407,16 @@ class KeeperTrust:
                 settle.get("entry") != "settle":
             raise _anchor("gate", "the keeper's signed gate summary is not for the attempt requested",
                           "check the keeper")
+        self.sync()
         return summary
 
     def report(self) -> dict:
-        """The keeper's signed report record (`schema_version` 2)."""
+        """The keeper's signed report record (`schema_version` 2); the receipts are synced before it is returned, so
+        the project holds every envelope the report rests on."""
         out = self._call("report")
-        return self._keep(out.get("report") if isinstance(out, dict) else None, "report")
+        record = self._keep(out.get("report") if isinstance(out, dict) else None, "report")
+        self.sync()
+        return record
 
     def alpha(self) -> dict:
         """The alpha-investing state of the project's sealed set, its ledger envelopes verified."""

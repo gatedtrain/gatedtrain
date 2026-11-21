@@ -37,7 +37,16 @@ LIMIT_KEEPER_MODEL_REFERENCE = ("a model reference must content-address its weig
 
 LIMIT_ALPHA_RULE = ("the test level of each attempt is set by alpha-investing (Foster-Stine) over every sealed "
                     "evaluation on this sealed set, from every project that uses it; the guarantee is the marginal "
-                    "false discovery rate (mFDR) at level 0.05 over those attempts, not an error rate per attempt")
+                    "false discovery rate (mFDR) at level 0.05 over those attempts, not an error rate per attempt, "
+                    "assuming each test is valid given the earlier outcomes; the sealed items are reused across "
+                    "attempts and only each attempt's status is revealed")
+
+LIMIT_ORACLES = ("the keeper answers some requests about sealed data with counts, and does not limit how often they are "
+                 "asked: opening a project is free and a refused intake stores nothing, so anything running as the "
+                 "user can send candidate data files to new projects and learn from the refusals how many of their "
+                 "inputs were sealed before (repeated, this narrows down which); a registration refused for its scorer "
+                 "names how many sealed labels that scorer cannot take, which reveals counts of label types in the "
+                 "sealed part")
 
 
 def sealed_evaluations_text(n: int) -> str:
@@ -49,6 +58,7 @@ def known_limits(guarantee: str, n_attempts: int) -> list[dict]:
     """The known limits of a keeper report (`schema_version` 2)."""
     return [{"id": "sealed_guarantee", "text": guarantee},
             {"id": "original_data", "text": LIMIT_ORIGINAL_DATA},
+            {"id": "oracles", "text": LIMIT_ORACLES},
             {"id": "metric_confirmation", "text": LIMIT_KEEPER_CONFIRMATION},
             {"id": "model_reference", "text": LIMIT_KEEPER_MODEL_REFERENCE},
             {"id": "alpha_rule", "text": LIMIT_ALPHA_RULE},

@@ -323,8 +323,12 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
         self.assertEqual(set(report["attempts"][0]), {"attempt_id", "j", "candidate_model_sha256", "alpha", "status",
                                                       "utc"})
         self.assertEqual([x["id"] for x in report["known_limits"]],
-                         ["sealed_guarantee", "original_data", "metric_confirmation", "model_reference", "alpha_rule",
-                          "sealed_evaluations"])
+                         ["sealed_guarantee", "original_data", "oracles", "metric_confirmation", "model_reference",
+                          "alpha_rule", "sealed_evaluations"])
+        limits = {x["id"]: x["text"] for x in report["known_limits"]}
+        self.assertEqual(limits["oracles"], texts.LIMIT_ORACLES)        # final review finding 3
+        self.assertEqual(limits["alpha_rule"], texts.LIMIT_ALPHA_RULE)
+        self.assertIn("valid given the earlier outcomes", texts.LIMIT_ALPHA_RULE)   # final review 6e
         self.assertEqual(report["known_limits"][0]["text"], texts.KEEPER_SAME_USER_GUARANTEE)
         self.assertEqual(report["known_limits"][-1]["attempts"], 3)
         self.assertEqual(report["alpha_rule"], {"rule": "foster-stine", "initial_wealth": ai.INITIAL_WEALTH,

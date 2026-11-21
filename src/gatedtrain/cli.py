@@ -457,6 +457,7 @@ def cmd_project_report(args) -> int:
 
     try:
         project = Project.load(Path(args.root))
+        warnings = _sync_receipts(project)
         report = done_output(project, "report", "report")
         if report is None:
             state = status(project)["report"]["status"]
@@ -474,7 +475,21 @@ def cmd_project_report(args) -> int:
     md = project.root / "stages" / "report" / "report.md"
     human = md.read_text(encoding="utf-8") if md.is_file() else f"status: {report.get('status')}\n"
     return _pfinish(args, {"report": report, "report_md": str(md)}, human, ok=ok,
-                    exit_code=EXIT_OK if ok else EXIT_NOT_PASS)
+                    exit_code=EXIT_OK if ok else EXIT_NOT_PASS, warnings=warnings)
+
+
+def _sync_receipts(project) -> list[str]:
+    """A keeper project's receipts get every envelope the keeper signed for it that they lack (`KeeperTrust.sync`);
+    the report is printed either way, with a warning when the keeper cannot be asked."""
+    from .ainative.keeper_trust import KeeperTrust, load_binding
+
+    try:
+        if load_binding(project) is None:
+            return []
+        KeeperTrust(project).sync()
+    except Refused as exc:
+        return [f"the receipts were not synced with the keeper: {p.line()}" for p in exc.problems]
+    return []
 
 
 def _gpu_hours(text: str) -> float:
@@ -620,8 +635,9 @@ def cmd_setup_keeper(args) -> int:
 
 def cmd_verify(args) -> int:
     """AN-14: exit 0 when the project's signed records check against an anchor (the keeper's key or --fingerprint),
-    1 when there is no anchor and only their consistency was checked, 3 on a bad signature or a mismatch."""
-    from .ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, verify_project
+    1 when there is no anchor and only their consistency was checked (no anchor given, or a keeper that runs as the
+    owner's own uid, which can read its key), 3 on a bad signature or a mismatch."""
+    from .ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_KEEPER, verify_project
 
     try:
         out = verify_project(Path(args.root), keeper=Path(args.keeper) if args.keeper else None,
@@ -631,6 +647,10 @@ def cmd_verify(args) -> int:
     if out["anchor"] == "none":
         return _kfinish(args, out, f"consistent: {out['checked']} records under key {out['fingerprint']}\n",
                         ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY, OFFLINE_LIMIT])
+    if out["anchor"] == "keeper" and out["same_user"]:
+        return _kfinish(args, out, f"consistent with a same-user keeper: {out['checked']} records under key "
+                                   f"{out['fingerprint']}\n", ok=False, exit_code=EXIT_NOT_PASS,
+                        warnings=[SAME_USER_KEEPER])
     warnings = [] if out["anchor"] == "keeper" else [OFFLINE_LIMIT]       # only the keeper sees a deleted record
     return _kfinish(args, out, f"verified against the {out['anchor']}: {out['checked']} records under key "
                                f"{out['fingerprint']}\n", warnings=warnings)

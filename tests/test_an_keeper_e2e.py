@@ -8,6 +8,8 @@ INCONCLUSIVE at alpha 0.02375 and the rerun at the pipeline's noise 0 gates PASS
 
 Tampering: every signed copy in a project (the registration, each receipt line, the gate result, report.json,
 report.md, the key copy `trust/keeper.pub`) has one value edited in turn; `verify --keeper` exits 3 naming AN-14.
+An untouched project gets exit 1 from `verify --keeper` (the test keeper runs as the owner's uid, which can read its
+key, so it cannot anchor trust) and exit 0 from `verify --fingerprint`.
 `project run report` on an edited registration refuses: AN-2 (the project's hash pin), and AN-10 when the pin is
 rewritten to match (the record differs from the keeper's signed registration). No sealed input appears in any stdout, stderr, project file or the keeper's log.
 """
@@ -30,6 +32,7 @@ from _support import FIXTURES, cli_env
 from gatedtrain.ainative import alpha_investing as ai, signing
 from gatedtrain.ainative.keeper import texts
 from gatedtrain.ainative.keeper_trust import KEEPER_PUB, RECEIPTS
+from gatedtrain.ainative.verify import SAME_USER_KEEPER
 from gatedtrain.canonical import sha256_bytes
 from gatedtrain.testing import synthetic_pack as pack
 
@@ -109,8 +112,13 @@ class KeeperEndToEndTest(unittest.TestCase):
         self.stage(root, "gate", expect=expect)
         return self.read(root, GATE_RESULT)
 
-    def verify(self, root: Path, expect: int = EXIT_OK) -> dict:
-        return self.cli("verify", str(root), "--keeper", str(self.kp.socket), expect=expect)
+    def verify(self, root: Path, expect: int = EXIT_NOT_PASS) -> dict:
+        """`verify --keeper`: exit 1 when every record checks, since the test keeper runs as the owner's uid and so
+        cannot anchor trust (final review finding 2); 3 on a refusal."""
+        doc = self.cli("verify", str(root), "--keeper", str(self.kp.socket), expect=expect)
+        if expect == EXIT_NOT_PASS:
+            self.assertEqual((doc["problems"], doc["warnings"]), ([], [SAME_USER_KEEPER]), doc)
+        return doc
 
     # helpers --------------------------------------------------------------------------------------------------------
     def fingerprint(self) -> str:
@@ -161,7 +169,9 @@ class KeeperEndToEndTest(unittest.TestCase):
         self.assertEqual(status["data"]["gate"], "PASS")
         doc = self.verify(root)
         self.assertEqual((doc["data"]["anchor"], doc["data"]["fingerprint"]), ("keeper", self.fingerprint()))
-        self.assertEqual(doc["warnings"], [])
+        self.assertEqual(doc["warnings"], [SAME_USER_KEEPER])
+        doc = self.cli("verify", str(root), "--fingerprint", self.fingerprint())
+        self.assertEqual(doc["data"]["anchor"], "fingerprint")
         self.assert_no_sealed_input([root])
 
     def test_two_attempts_in_one_project(self):                       # AN-9, AN-10, AN-15, AN-16
