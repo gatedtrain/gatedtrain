@@ -327,7 +327,8 @@ class EvaluateSealedTest(GateBase):
         proj = self.make()
         self.upto_registration(proj)
         real = scorers.manifest_hash
-        scorers.manifest_hash = lambda: "sha256:" + "0" * 64
+        # Step 2 (AN-17): evaluate_sealed resolves the hash as scorers.manifest_hash(spec, params).
+        scorers.manifest_hash = lambda *args, **kwargs: "sha256:" + "0" * 64
         self.addCleanup(setattr, scorers, "manifest_hash", real)
         p = self.refused(proj, "evaluate_sealed", rule="AN-8")
         self.assertIn("evaluator", p.message)

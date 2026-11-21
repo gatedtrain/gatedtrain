@@ -292,14 +292,19 @@ class Train(_Base):
 @dataclass(frozen=True)
 class Scenario:
     """What the `gatedtrain.scenarios` entry point exposes: the generation functions of the pack, by the name a
-    model reference gives in `generator`, and the path of the pack's pipeline file."""
+    model reference gives in `generator`, the path of the pack's pipeline file, and the pack's scorers registered by
+    reference (`{name: {id, fn, code_sha256, planning_sd, direction, range, what, unit[, label_ok]}}`, AN-17; this
+    pack declares none)."""
 
     name: str
     generators: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     pipeline: Path | None = None
+    scorers: Mapping[str, dict] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "generators", MappingProxyType(dict(self.generators)))
+        object.__setattr__(self, "scorers", MappingProxyType({k: MappingProxyType(dict(v))
+                                                              for k, v in self.scorers.items()}))
 
 
 SCENARIO = Scenario("synthetic", {GENERATOR: generate}, Path(__file__).with_name("synthetic_pack.yaml"))

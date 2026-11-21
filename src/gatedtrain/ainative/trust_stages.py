@@ -12,8 +12,9 @@ registration and marks it `post_hoc` (an output field the report reads).
 
 `preregister` reads the deployment record (`gatedtrain.ainative.deployment`: `{"sampler": {...}, "eval_seeds": [...]}`)
 that a pluggable stage before it produces, and copies the sampler and the evaluation seeds into the registration.
-`evaluate_sealed` must use exactly the registered sampler and eval_seeds and score only with
-`scorers.exact_match`; the registered evaluator is `scorers.EVALUATOR_ID` with the hash of the scorer's source.
+`evaluate_sealed` must use exactly the registered sampler and eval_seeds and score only with the registered scorer
+(`scorers`: a library scorer or a scenario pack's scorer by reference, AN-17); the registered evaluator is
+`scorers.evaluator_entry` of the scorer and its parameters, with the hash of the scorer's code.
 
 Both stages take no pipeline params: their behaviour comes from the project's data, the user's decision and the
 registration, never from pipeline configuration.
@@ -131,12 +132,13 @@ def _parse_rows(raw: bytes) -> list[tuple[int, Any, Any]]:
             raise _refuse("AN-6", field, "the row has no `input`", 'add an "input" (text or object)')
         if row.get("label") is None:
             raise _refuse("AN-6", field, "the row has no `label`; every example needs a verifiable answer or label",
-                          'add a "label" (text, number or object); unlabelled data cannot be sealed')
+                          'add a "label" (text, number, list or object); unlabelled data cannot be sealed')
         if not isinstance(row["input"], (str, dict)):
             raise _refuse("AN-6", field, "`input` is neither text nor an object", "use text or an object as input")
-        if not (isinstance(row["label"], (str, dict)) or _num(row["label"])):
-            raise _refuse("AN-6", field, "`label` is not text, a number or an object",
-                          "use text, a number or an object as label")
+        # A list label is for set_f1 (design rev-23 AN-6, extended in step 2).
+        if not (isinstance(row["label"], (str, dict, list)) or _num(row["label"])):
+            raise _refuse("AN-6", field, "`label` is not text, a number, a list or an object",
+                          "use text, a number, a list or an object as label")
         out.append((n, row["input"], row["label"]))
     if not out:
         raise _refuse("AN-6", "data", "the data file is empty", "add labelled rows, one JSON object per line")
@@ -285,12 +287,9 @@ class IntakeSeal:
 # preregister
 # ---------------------------------------------------------------------------
 
-# The scorer library of step 1. Each scorer names the evaluator id that registers it and its direction; the evaluator's
-# manifest hash comes from the scorer's source (`scorers.manifest_hash`). The training reward may differ.
-SCORERS: dict[str, dict] = {
-    "exact_match": {"evaluator": scorers.EVALUATOR_ID, "direction": scorers.DIRECTION,
-                    "what": "the share of items whose answer matches yours exactly"},
-}
+# The scorers a registration may name: the library of `scorers` and the scorers of the installed scenario packs
+# (AN-17). Each names the evaluator id that registers it, its direction and planning SD; the evaluator's manifest
+# hash comes from the scorer's code and parameters (`scorers.evaluator_entry`). The training reward may differ.
 DEFAULT_SCORER = "exact_match"
 MAX_MARGIN = 0.5
 
@@ -299,17 +298,34 @@ def _refuse7(field: str, message: str, fix: str) -> Refused:
     return _refuse("AN-7", field, message, fix)
 
 
+def _scorer_names() -> list[str]:
+    return sorted({*scorers.library(), *scenario_scorers()})
+
+
+def _available_scorers() -> dict[str, str]:
+    """What each scorer a registration may name counts (pack scorers resolved, so a bad declaration is refused)."""
+    return {name: scorers.resolve(name).what for name in _scorer_names()}
+
+
+def _scorer(decision: dict) -> tuple[scorers.ScorerSpec, dict]:
+    """(spec, bound parameters) of the decision's `scorer` and `scorer_params`."""
+    name = decision.get("scorer", DEFAULT_SCORER)
+    if not isinstance(name, str) or name not in _scorer_names():
+        raise _refuse7("decision.scorer", f"{name!r} is not in the scorer library",
+                       f"use one of: {', '.join(_scorer_names())}")
+    spec = scorers.resolve(name)
+    entry = scorers.evaluator_entry(spec, decision.get("scorer_params", {}))
+    return spec, entry.get("params", {})
+
+
 def _values(ctx: StageContext, decision: dict) -> dict:
     """The scorer, direction, margin and alpha the registration will carry."""
-    scorer = decision.get("scorer", DEFAULT_SCORER)
-    if scorer not in SCORERS:
-        raise _refuse7("decision.scorer", f"{scorer!r} is not in the scorer library",
-                       f"use one of: {', '.join(sorted(SCORERS))}")
-    row = SCORERS[scorer]
-    direction = decision.get("direction", row["direction"])
-    if direction != row["direction"]:
-        raise _refuse7("decision.direction", f"scorer {scorer} is {row['direction']}, not {direction!r}",
-                       f"use direction {row['direction']}, or pick another scorer")
+    spec, _ = _scorer(decision)
+    scorer = spec.name
+    direction = decision.get("direction", spec.direction)
+    if direction != spec.direction:
+        raise _refuse7("decision.direction", f"scorer {scorer} is {spec.direction}, not {direction!r}",
+                       f"use direction {spec.direction}, or pick another scorer")
     margin = decision.get("margin", 0.0)
     if not _num(margin) or not 0 <= margin <= MAX_MARGIN:
         raise _refuse7("decision.margin", f"margin {margin!r} is not a number from 0 to {MAX_MARGIN}",
@@ -328,9 +344,30 @@ def _sealed_summary(ctx: StageContext) -> dict:
     return summary
 
 
+def _intake_sigma(ctx: StageContext) -> float:
+    """The planning SD the sealed set was sized for: `sigma` of the power record written with the `sealed_summary`
+    input (found through the attempt log, so `preregister` keeps its step 1 inputs)."""
+    ref = ctx.inputs["sealed_summary"]
+    power = None
+    for row in ctx.project.read_attempts():
+        outs = row.get("outputs") if row.get("event") == "done" and row.get("stage") == ref.stage else None
+        got = (outs or {}).get("sealed_summary")
+        if isinstance(got, dict) and got.get("sha256") == ref.sha256 and isinstance(outs.get("power"), dict):
+            power = outs["power"]
+    sigma = None
+    if power is not None:
+        rec = ctx.project.read_artifact(ArtifactRef(power["stage"], power["name"], power["schema"], power["sha256"],
+                                                    power["path"]))
+        sigma = rec.get("sigma") if isinstance(rec, dict) else None
+    if not (_num(sigma) and math.isfinite(sigma) and sigma > 0):
+        raise _refuse7("inputs.sealed_summary", "the power record written with the sealed summary is not found, so "
+                       "the planning SD the sealed set was sized for is unknown", "rerun intake_seal")
+    return float(sigma)
+
+
 def _sentence(v: dict, n_sealed: int) -> str:
     points = f"{v['margin'] * 100:g}"
-    return (f"I will count {SCORERS[v['scorer']]['what']}; the new model must beat the base model by more than "
+    return (f"I will count {scorers.resolve(v['scorer']).what}; the new model must beat the base model by more than "
             f"{points} points, tested at the {v['alpha']:g} significance level on {n_sealed} sealed items.")
 
 
@@ -350,8 +387,11 @@ def registered_base(full: dict) -> str | None:
     return h if isinstance(h, str) else None
 
 
-def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str, served: tuple[str, str] | None = None) -> dict:
-    row = SCORERS[v["scorer"]]
+def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str, served: tuple[str, str] | None = None,
+                  evaluator: dict | None = None) -> dict:
+    """`evaluator` is the `scorers.evaluator_entry` of the scorer; absent, exact match without parameters."""
+    if evaluator is None:
+        evaluator = scorers.evaluator_entry(scorers.library()[DEFAULT_SCORER], {})
     return {
         "registration_version": 1,
         "registration_id": f"ainative-{item_set_hash.removeprefix('sha256:')[:16]}",
@@ -370,7 +410,7 @@ def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str, served:
         "sampler": dict(dep["sampler"]),
         "base_model": {"model_ref_sha256": base_sha,
                        **({"scenario_pack": served[0], "generator": served[1]} if served else {})},
-        "evaluators": [{"id": row["evaluator"], "manifest_hash": scorers.manifest_hash()}],
+        "evaluators": [dict(evaluator)],
         "multiplicity": {"plan": "single_gate", "family": None},
         "analysis_code_version": ANALYSIS_CODE_VERSION,
         "bootstrap": {"replicates": 10000, "seed": int(item_set_hash.removeprefix("sha256:")[:8], 16)},
@@ -423,7 +463,7 @@ class Preregister:
     def plan(self, ctx: StageContext) -> Proposal:
         v = _values(ctx, {})
         n = _sealed_summary(ctx)["n"]
-        choices = {**v, "available_scorers": {k: r["what"] for k, r in SCORERS.items()}, "n_sealed": n}
+        choices = {**v, "available_scorers": _available_scorers(), "n_sealed": n}
         return Proposal(self.name, _sentence(v, n), choices, {}, "confirm_metric")
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
@@ -434,6 +474,14 @@ class Preregister:
                            "show the plan() summary to the user and set decision metric_confirmed to true once "
                            "they agree (they may change scorer or margin first)")
         v = _values(ctx, decision)
+        spec, params = _scorer(decision)
+        sigma = _intake_sigma(ctx)
+        if spec.planning_sd > sigma:
+            raise _refuse("AN-17", "decision.scorer",
+                          f"scorer {spec.name} has a planning SD of {spec.planning_sd:g}, larger than the sealed set "
+                          "was sized for, so the test would be underpowered",
+                          f"the sealed set was sized for a planning SD of {sigma}; pick a library scorer or run "
+                          "intake again with new data")
         item_hash = _sealed_summary(ctx)["manifest_sha256"]
         base_ref = ctx.project.read_artifact(ctx.inputs["base_model"])
         gen = base_ref.get("generator") if isinstance(base_ref, dict) else None
@@ -448,7 +496,8 @@ class Preregister:
         if pack is None:
             raise _refuse7("inputs.base_model.generator", f"no installed scenario pack serves the generator {gen!r}",
                            "install the scenario pack that serves the base model, or fix the model reference")
-        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, (pack, gen))
+        base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, (pack, gen),
+                             scorers.evaluator_entry(spec, params))
         problems = check_contents(base)
         if problems:
             raise Refused(problems)
@@ -488,7 +537,9 @@ class Preregister:
             bad("registration.scorer", "the output record and the registration disagree on the scorer")
         evs = full.get("evaluators")
         ev = evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict) else {}
-        if ev.get("id") != scorers.EVALUATOR_ID or ev.get("manifest_hash") != resolved_evaluator_hash(ev):
+        found = scorers.spec_for_evaluator(ev)
+        if found is None or found[0].name != out.get("scorer") or \
+                ev.get("manifest_hash") != resolved_evaluator_hash(ev):
             bad("registration.evaluators[0].manifest_hash",
                 "the registered evaluator hash is not the one the library resolves for the scorer")
         if registered_base(full) != ctx.inputs["base_model"].sha256:
@@ -518,7 +569,7 @@ def _scenario_entry_points() -> list[Any]:
 # (this snapshot, `_scenario_entry_points`, the scorers). What is closed here is the ordinary path: a pack's own
 # mutable `generators` dict is copied once and never re-read. Enforcement against hostile in-process code comes with
 # the step-2 keeper, which runs the sealed evaluation outside the stages' process.
-_SCENARIO_SNAPSHOT: tuple[MappingProxyType, MappingProxyType] | None = None
+_SCENARIO_SNAPSHOT: tuple[MappingProxyType, MappingProxyType, MappingProxyType] | None = None
 
 
 def _reset_scenario_snapshot() -> None:
@@ -527,15 +578,18 @@ def _reset_scenario_snapshot() -> None:
     _SCENARIO_SNAPSHOT = None
 
 
-def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType]:
-    """(generator name -> function, generator name -> pack name) of every installed scenario pack, loaded once per
-    process and frozen. A pack that fails to load, has no `generators` mapping of callables or reuses a generator
-    name is refused (`AN-8`) without echoing its message."""
+def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType, MappingProxyType]:
+    """(generator name -> function, generator name -> pack name, scorer name -> (pack name, declaration)) of every
+    installed scenario pack, loaded once per process and frozen. A pack that fails to load, has no `generators`
+    mapping of callables or reuses a generator name is refused (`AN-8`) without echoing its message; a pack whose
+    `scorers` is not a mapping of name to declaration, or that reuses another pack's scorer name, is refused
+    (`AN-17`). The declarations themselves are checked by `scorers.resolve`."""
     global _SCENARIO_SNAPSHOT
     if _SCENARIO_SNAPSHOT is not None:
         return _SCENARIO_SNAPSHOT
     fns: dict[str, Callable[..., Any]] = {}
     packs: dict[str, str] = {}
+    pack_scorers: dict[str, tuple[str, MappingProxyType]] = {}
     for ep in _scenario_entry_points():
         try:
             pack = ep.load()
@@ -552,12 +606,29 @@ def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType]:
                               "give each generator a unique name")
             fns[name] = fn
             packs[name] = ep.name
-    _SCENARIO_SNAPSHOT = (MappingProxyType(fns), MappingProxyType(packs))
+        decls = getattr(pack, "scorers", None)
+        decls = {} if decls is None else decls
+        if not (isinstance(decls, Mapping) and all(isinstance(k, str) and isinstance(v, Mapping)
+                                                   for k, v in decls.items())):
+            raise _refuse("AN-17", f"entry point {ep.name}", "the scenario pack's `scorers` is not a mapping of name "
+                          "to declaration", "expose `scorers = {name: {id, fn, code_sha256, ...}}` or leave it out")
+        for name, decl in dict(decls).items():
+            if name in pack_scorers:
+                raise _refuse("AN-17", f"entry point {ep.name}", f"scorer {name!r} is provided by two scenario packs",
+                              "give each pack scorer a unique name")
+            pack_scorers[name] = (ep.name, MappingProxyType(dict(decl)))
+    _SCENARIO_SNAPSHOT = (MappingProxyType(fns), MappingProxyType(packs), MappingProxyType(pack_scorers))
     return _SCENARIO_SNAPSHOT
 
 
 def scenario_generators() -> Mapping[str, Callable[..., Any]]:
     return _scenario_snapshot()[0]
+
+
+def scenario_scorers() -> Mapping[str, tuple[str, Mapping]]:
+    """Scorer name -> (pack name, frozen declaration) of the installed scenario packs (`scorers.resolve` checks
+    each declaration)."""
+    return _scenario_snapshot()[2]
 
 
 def scenario_pack_of(generator: Any) -> str | None:
@@ -621,10 +692,19 @@ def _produced_by_training(project: Project, ref: ArtifactRef) -> bool:
                and r.get("trains") is True for r in project.read_attempts())
 
 
+def _registered_scorer(full: dict) -> tuple[scorers.ScorerSpec, dict] | None:
+    """(spec, bound parameters) of the registration's `evaluators[0]`, or None when no scorer has its id."""
+    evs = full.get("evaluators")
+    ev = evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict) else {}
+    return scorers.spec_for_evaluator(ev)
+
+
 def _evaluator_problem(full: dict) -> str | None:
     evs = full.get("evaluators")
     ev = evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict) else {}
-    if ev.get("id") != scorers.EVALUATOR_ID or ev.get("manifest_hash") != scorers.manifest_hash():
+    found = _registered_scorer(full)
+    if found is None or (full.get("clause") or {}).get("metric") != found[0].name or \
+            ev.get("manifest_hash") != scorers.manifest_hash(*found):
         return ("the registered evaluator is not the scorer this build runs (its id or manifest hash differs), so the "
                 "sealed items cannot be scored as registered")
     return None
@@ -638,8 +718,12 @@ def _eval_seeds(full: dict) -> list:
     return seeds
 
 
-def _score_arm(ctx: StageContext, sealed: SealedRef, fn: Callable[..., Any], model: dict, full: dict) -> list[dict]:
+def _score_arm(ctx: StageContext, sealed: SealedRef, fn: Callable[..., Any], model: dict, full: dict,
+               spec: scorers.ScorerSpec, params: dict) -> list[dict]:
+    """Per-item records of one arm, scored with the registered scorer (`spec` bound to `params`)."""
     sampler = full["sampler"]
+    score = scorers.bind(spec, params)
+    lo, hi = spec.score_range
     records: list[dict] = []
     for seed in _eval_seeds(full):
         counter = [0]
@@ -652,15 +736,23 @@ def _score_arm(ctx: StageContext, sealed: SealedRef, fn: Callable[..., Any], mod
             except Exception as exc:       # never carry the item (or the pack's message about it) out
                 raise _refuse("AN-8", "generate", f"the generation function failed ({type(exc).__name__})",
                               "fix the scenario pack's generate") from None
-            return {"item_id": index, "seed": seed, "score": scorers.exact_match(prediction, item["label"])}
+            try:
+                value = score(prediction, item["label"])
+            except Exception as exc:       # a pack scorer's message may quote the label: class name only
+                raise _refuse("AN-8", "score", f"the scorer failed ({type(exc).__name__})",
+                              "fix the scorer of the scenario pack") from None
+            if not (_num(value) and math.isfinite(value) and lo <= value <= hi):
+                raise _refuse("AN-8", "score", f"the scorer {spec.name} returned a value that is not a number in its "
+                              f"range [{lo:g}, {hi:g}]", "fix the scorer of the scenario pack")
+            return {"item_id": index, "seed": seed, "score": float(value)}
 
         records.extend(ctx.trust.run_sealed(sealed, generate))
     return records
 
 
 class EvaluateSealed:
-    """AN-8: scores the sealed items with exactly the registered sampler and eval_seeds and exact match only. What
-    leaves the trust backend is one `{item_id, seed, score}` record per item and seed (`item_id` is the item's
+    """AN-8: scores the sealed items with exactly the registered sampler and eval_seeds and the registered scorer
+    only. What leaves the trust backend is one `{item_id, seed, score}` record per item and seed (`item_id` is the item's
     position in the backend's item order, counted by `_score_arm` for each seed, not a content hash). In step 1 the operator process can still read the sealed items; the
     guarantee is stated (`sealed_guarantee`), not enforced.
 
@@ -691,6 +783,7 @@ class EvaluateSealed:
         if problem:
             raise _refuse("AN-8", "registration.evaluators[0].manifest_hash", problem,
                           "register again with preregister, or restore the scorer")
+        spec, params = _registered_scorer(full)       # not None: `_evaluator_problem` passed
         seeds = _eval_seeds(full)
         item_set = full["eval_distribution"]["item_set_hash"]
         sealed = SealedRef(item_set)
@@ -744,7 +837,7 @@ class EvaluateSealed:
         out: dict[str, ArtifactRef] = {}
         for arm in ("baseline", "candidate"):
             ref = ctx.inputs[f"{arm}_model"]
-            records = _score_arm(ctx, sealed, fn, models[arm], full)
+            records = _score_arm(ctx, sealed, fn, models[arm], full, spec, params)
             doc = {**_meta(SCHEMA_SEALED_RECORDS), "arm": arm, "registration_hash": reg["hash"],
                    "item_set_hash": item_set, "n_items": len(records) // len(seeds), "eval_seeds": list(seeds),
                    "sampler": dict(full["sampler"]), "model_ref_sha256": ref.sha256, "records": records}
@@ -856,6 +949,10 @@ class Gate:
         base = _arm(ctx.project, ctx.inputs["baseline_records"], reg, seeds, n_sealed, ev_row)
         cand = _arm(ctx.project, ctx.inputs["candidate_records"], reg, seeds, n_sealed, ev_row)
         cand_model = (ev_row.get("input_sha256s") or {}).get("candidate_model")
+        found = _registered_scorer(full)
+        if found is None:
+            raise _refuse("AN-9", "registration.evaluators[0]", "the registered evaluator is not a scorer this build "
+                          "runs, so its score range is unknown", "register again with preregister")
         expected = {"baseline": registered_base(full), "candidate": cand_model}
         attempt_id = _attempt_key(ctx.project, ctx.stage or self.name)
         alpha = ctx.ledger.spend(attempt_id)                      # the ledger decides alpha, not the registration
@@ -865,7 +962,7 @@ class Gate:
             result = gates.evaluate_items(clause, base, cand, items=list(range(n_sealed)),
                                           seed=int(boot["seed"]), n_boot=int(boot["replicates"]),
                                           min_paired=min_paired(full), max_unpaired=max_unpaired(full),
-                                          score_range=(0.0, 1.0), expected_models=expected)
+                                          score_range=found[0].score_range, expected_models=expected)
         except Exception:
             ctx.ledger.record(attempt_id, False)
             raise
@@ -900,7 +997,6 @@ class Gate:
 
 
 _LOGGED_STAGES = ("evaluate_sealed", "gate")      # every attempt row (start, done, failed, refused) goes in the report
-METRIC_UNITS = {"exact_match": "share of items answered exactly (0 to 1)"}
 REPORT_MD = "report.md"
 
 
@@ -1007,7 +1103,11 @@ class Report:
 
     @staticmethod
     def _build(ctx: StageContext) -> dict:
-        reg, _ = _registered(ctx, "AN-10")
+        reg, full = _registered(ctx, "AN-10")
+        found = _registered_scorer(full)
+        if found is None:
+            raise _refuse("AN-10", "registration.evaluators[0]", "the registered evaluator is not a scorer this build "
+                          "runs, so the metric's unit is unknown", "register again with preregister")
         power = ctx.project.read_artifact(ctx.inputs["power"])
         gate = ctx.project.read_artifact(ctx.inputs["gate_result"])
         if gate.get("registration_hash") != reg["hash"] or gate.get("post_hoc") is not reg["post_hoc"]:
@@ -1019,7 +1119,7 @@ class Report:
                     for r in ctx.project.read_attempts() if r.get("stage") in _LOGGED_STAGES and r.get("event") != "stale"]
         return {**_meta(SCHEMA_REPORT),
                 "status": _effective_status(gate["status"], bool(reg["post_hoc"])),
-                "metric": {"scorer": reg["scorer"], "unit": METRIC_UNITS[reg["scorer"]]},
+                "metric": {"scorer": reg["scorer"], "unit": found[0].unit},
                 "n_sealed": power["n_sealed"],
                 "registration": {k: reg.get(k) for k in _REG_KEYS},
                 "power": {k: v for k, v in power.items() if k not in keep},

@@ -141,7 +141,8 @@ def _int(x: Any) -> bool:
 
 def resolved_evaluator_hash(evaluator: dict) -> str | None:
     """The evaluator hash the prototype resolves at run time (R10A-2): Tier B, the evaluator identity
-    hash (decision D-4, scorer included); Tier A, the stand-in identity hash. None for another id."""
+    hash (decision D-4, scorer included); AI-native, the scorer's manifest hash (AN-17, parameters included);
+    Tier A, the stand-in identity hash. None for another id."""
     if evaluator.get("id") == SCORER_EVALUATOR:
         from .tierb import evaluator_identity_hash
 
@@ -149,13 +150,19 @@ def resolved_evaluator_hash(evaluator: dict) -> str | None:
         return evaluator_identity_hash(scorer if isinstance(scorer, str) else None)
     from .ainative import scorers as ainative_scorers
 
-    if evaluator.get("id") == ainative_scorers.EVALUATOR_ID:
-        return ainative_scorers.manifest_hash()
+    # AI-native scorers (AN-17): a library id resolves without loading the scenario packs; a pack scorer is looked up
+    # after the external-run rows. The hash binds the scorer's code and the entry's parameters.
+    if evaluator.get("id") in {s.evaluator_id for s in ainative_scorers.library().values()}:
+        found = ainative_scorers.spec_for_evaluator(evaluator)
+        return ainative_scorers.manifest_hash(*found) if found else None
     from .ext.registry import EVALUATOR_ROWS, evaluator_identity_hash as ext_identity_hash
 
     if evaluator.get("id") in EVALUATOR_ROWS:
         # External-run evaluators (tests/README.md section 11.18, EXT-6): {evaluator, metric, direction, scorer}.
         return ext_identity_hash(evaluator["id"])
+    found = ainative_scorers.spec_for_evaluator(evaluator)
+    if found is not None:
+        return ainative_scorers.manifest_hash(*found)
     # Last, so external-run evaluators resolve without the Tier A extra (the stub imports torch).
     from .stubs import evaluator as stub_evaluator
 

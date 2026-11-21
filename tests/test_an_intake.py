@@ -599,7 +599,10 @@ class ScorerTest(unittest.TestCase):
         self.assertEqual(h, scorers.manifest_hash())
         self.assertRegex(h, r"^sha256:[0-9a-f]{64}$")
         from gatedtrain.canonical import file_sha256
-        self.assertIn(file_sha256(Path(scorers.__file__)), scorers.manifest_document()["code"].values())
+        # Step 2 (AN-17): exact match lives in scorers/exact.py; manifest_document takes the spec and parameters.
+        exact = scorers.library()["exact_match"]
+        self.assertIn(file_sha256(Path(scorers.__file__).with_name("exact.py")),
+                      scorers.manifest_document(exact, {})["code"].values())
 
 
 if __name__ == "__main__":
