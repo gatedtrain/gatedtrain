@@ -37,6 +37,7 @@ class SealedRef:
 
 class TrustBackend(Protocol):
     sealed_guarantee: str
+    mode: str                                                     # "in_process" here; the keeper has its own
 
     def seal(self, items: list[dict]) -> SealedRef: ...
 
@@ -56,6 +57,8 @@ class TrustBackend(Protocol):
 
 
 class AlphaLedger(Protocol):
+    planning_alpha: float                                         # the alpha intake plans power for
+
     def available(self) -> float: ...
 
     def spend(self, attempt_id: str) -> float: ...                # the alpha for this test
@@ -105,6 +108,7 @@ class InProcessTrust:
     """Step 1 stub: sealed items and registrations are files in the project's `trust/` directory."""
 
     sealed_guarantee = UNSEALED_GUARANTEE
+    mode = "in_process"
     LATEST = "trust/registrations/latest"
     SEALED_EVALUATION = "trust/sealed_evaluation"
 
@@ -225,6 +229,10 @@ class FixedAlphaLedger:
     def __init__(self, project: Project, alpha: float = 0.05) -> None:
         self.project = project
         self.alpha = alpha
+
+    @property
+    def planning_alpha(self) -> float:
+        return self.alpha
 
     def _lines(self) -> list[dict]:
         raw = _read_trust_file(self.project, self.REL)
