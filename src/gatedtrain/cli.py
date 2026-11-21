@@ -488,6 +488,30 @@ def _add_project(sub) -> None:
     c.set_defaults(func=cmd_project_report)
 
 
+# AN-12: `gatedtrain keeper serve` (the full keeper and setup commands follow in a later step of this change).
+
+def cmd_keeper_serve(args) -> int:
+    from .ainative.keeper.server import serve
+
+    command = f"keeper {args.keeper_cmd}"
+    try:
+        code = serve(Path(args.state).absolute(), Path(args.socket).absolute(), args.owner_uid)
+    except Refused as exc:
+        return emit(Result(command, False, EXIT_REFUSED, {}, exc.problems, []), as_json=_as_json(args), human="")
+    return emit(Result(command, True, code, {}, [], []), as_json=_as_json(args), human="")
+
+
+def _add_keeper(sub) -> None:
+    p = sub.add_parser("keeper", help="AI-native keeper daemon (Linux only)")
+    ks = p.add_subparsers(dest="keeper_cmd", required=True)
+    c = ks.add_parser("serve", help="serve the keeper on a Unix socket until SIGTERM")
+    c.add_argument("--state", required=True, metavar="DIR", help="the keeper's state directory")
+    c.add_argument("--socket", required=True, metavar="PATH", help="the Unix socket path (at most 107 bytes)")
+    c.add_argument("--owner-uid", required=True, type=int, metavar="UID",
+                   help="the uid allowed to connect besides the keeper's own")
+    c.set_defaults(func=cmd_keeper_serve)
+
+
 class _UsageError(Exception):
     pass
 
@@ -647,6 +671,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_ext_arm_fill)
 
     _add_project(sub)
+    _add_keeper(sub)
     return ap
 
 
@@ -669,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         if not _as_json(args):
             raise
-        name = _project_command(args) if args.command == "project" else args.command
+        name = (_project_command(args) if args.command == "project"
+                else f"keeper {args.keeper_cmd}" if args.command == "keeper" else args.command)
         problem = Problem("INTERNAL", "", f"unexpected {type(exc).__name__}; this is a bug", "report it")
         return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem], list(getattr(args, "ext_warnings", []))),
                     as_json=True, human="")

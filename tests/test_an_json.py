@@ -40,6 +40,7 @@ MINIMAL_ARGS = {
                      "--checkpoint", "c", "--out", "o", "run1"],
     "ext-arm-fill": ["--adapter", "a", "--checkpoint", "c", "--items", "i", "arm"],
     "project": ["status", "root"],
+    "keeper": ["serve", "--state", "s", "--socket", "k.sock", "--owner-uid", "1000"],
 }
 
 
