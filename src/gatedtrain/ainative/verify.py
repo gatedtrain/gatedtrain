@@ -2,7 +2,7 @@
 
 The project's copy of the keeper key (`trust/keeper.pub`) is a convenience, not an anchor: an agent running as the user
 can rewrite the project. The anchor is either the key the keeper serves over its socket (`keeper`; the keeper also
-confirms that it signed each envelope the project holds, `has_record`) or a key fingerprint the reader got out of band
+lists every envelope it signed for the project, `records`) or a key fingerprint the reader got out of band
 (`fingerprint`). Against the anchor `verify_project` checks:
 
 - the project's key copy and the fingerprint its binding names are the anchor's (preflight finding 10);
@@ -14,11 +14,17 @@ confirms that it signed each envelope the project holds, `has_record`) or a key 
 Without an anchor the same checks run against the project's own key copy and binding (anchor `none`): that proves the
 records are consistent with each other, not that the keeper made them. Any failure is refused (AN-14); the caller
 turns the anchor into the exit code (0 anchored, 1 consistency only).
+
+Only `--keeper` finds a deleted record: the project must hold exactly the envelopes the keeper's `records` op lists for
+it, no more and no fewer. Offline (`--fingerprint` or no anchor) a report is bound to this project through its
+registration hash and attempt ids, which must be among the project's signed receipts, but a record removed together
+with everything naming it cannot be seen (`OFFLINE_LIMIT`, stated in the output).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -32,6 +38,8 @@ from .project import Project, _refuse_links
 from .trust_stages import REPORT_MD, SCHEMA_GATE_RESULT, SCHEMA_REGISTRATION, SCHEMA_REPORT, render_markdown
 
 CONSISTENCY_ONLY = "checked consistency only: no keeper and no fingerprint"
+OFFLINE_LIMIT = ("offline verify cannot detect deleted records; verify against the keeper (--keeper) to check "
+                 "that the project holds every record the keeper signed for it")
 _FP = re.compile(r"sha256:[0-9a-f]{64}")
 _ENVELOPE_META = ("schema", "schema_version", "envelope_sha256")
 
@@ -99,16 +107,43 @@ def _anchor(project: Project, keeper: Path | None, fingerprint: str | None) -> t
     return kind, fp, public
 
 
+_NAMED = {"registration.json": SCHEMA_REGISTRATION, "gate_result.json": SCHEMA_GATE_RESULT,
+          "report.json": SCHEMA_REPORT}
+
+
 def _records(project: Project) -> list[tuple[str, dict]]:
-    """(path, record) of every registration, gate result and report record under `stages/`."""
+    """(path, record) of every registration, gate result and report record under `stages/`: each file named
+    `registration.json`, `gate_result.json` or `report.json` must hold that record (a wrong schema is refused, never
+    skipped), and any other record of those schemas is checked too. A `report.md` needs its `report.json`."""
     out = []
     stages = project.root / "stages"
     for path in sorted(stages.glob("*/*.json")) if stages.is_dir() else []:
         rel = path.relative_to(project.root).as_posix()
         doc = _read_json(project, rel)
-        if isinstance(doc, dict) and doc.get("schema") in (SCHEMA_REGISTRATION, SCHEMA_GATE_RESULT, SCHEMA_REPORT):
+        schema = doc.get("schema") if isinstance(doc, dict) else None
+        want = _NAMED.get(path.name)
+        if want is not None and schema != want:
+            raise _bad(rel, f"the file does not hold a {want} record")
+        if schema in _NAMED.values():
             out.append((rel, doc))
+    for path in sorted(stages.glob(f"*/{REPORT_MD}")) if stages.is_dir() else []:
+        if not os.path.lexists(path.with_name("report.json")):
+            raise _bad(path.relative_to(project.root).as_posix(), "report.md has no report.json next to it, so it "
+                       "cannot be checked against a signed report")
     return out
+
+
+def _cross_bind(by_sha: dict[str, dict], rel: str, report: dict) -> None:
+    """The report's registration and attempts must be this project's: its signed registration and claim receipts
+    (the report record names no project; review finding 1)."""
+    hashes = {e["record"].get("hash") for e in by_sha.values() if e["kind"] == "registration"}
+    attempts = {e["record"].get("attempt_id") for e in by_sha.values() if e["kind"] == "claim"}
+    if _dict(report.get("registration")).get("hash") not in hashes:
+        raise _bad(f"{rel}.registration.hash", "the report's registration is not one this project holds signed")
+    listed = report.get("attempts")
+    if not isinstance(listed, list) or not listed or \
+            any(_dict(a).get("attempt_id") not in attempts for a in listed):
+        raise _bad(f"{rel}.attempts", "the report lists an attempt this project holds no signed claim for")
 
 
 def _dict(value: Any) -> dict:
@@ -141,18 +176,31 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
         if "project_id" in record and record["project_id"] != pid:
             raise _bad(where, "the receipt was signed for another project")
         by_sha[signing.envelope_sha256(env)] = env
-    if kind == "keeper":
-        client = KeeperClient(Path(keeper).absolute(), timeout=protocol.LONG_OP_TIMEOUT_S)
-        for sha in by_sha:
-            if client.call("has_record", pid, {"sha256": sha}) is not True:
-                raise _bad(RECEIPTS, f"the keeper did not sign the receipt {sha}",
-                           "the receipt was made with the keeper's key but not by the keeper; do not trust it")
+    if kind == "keeper":                     # the keeper's own list of what it signed for this project, both ways
+        held = KeeperClient(Path(keeper).absolute(), timeout=protocol.LONG_OP_TIMEOUT_S).call("records", pid, {})
+        if not isinstance(held, list):
+            raise _bad("records", "the keeper's record list is malformed", "check the keeper")
+        signed = set()
+        for env in held:
+            signing.verify(env, public)
+            signed.add(signing.envelope_sha256(env))
+        foreign = [sha for sha in by_sha if sha not in signed]
+        if foreign:
+            raise _bad(RECEIPTS, f"the keeper did not sign the receipt {foreign[0]} for this project",
+                       "the receipt was made with the keeper's key but not by the keeper for this project; do not "
+                       "trust it")
+        missing = sorted(signed - set(by_sha))
+        if missing:
+            raise _bad(RECEIPTS, f"{len(missing)} record(s) the keeper signed for this project are missing from the "
+                       f"project, first {missing[0]}", "a record was deleted from the project; do not trust its "
+                       "report")
     checked = len(by_sha)
     for rel, doc in _records(project):
         schema = doc["schema"]
         if schema == SCHEMA_REPORT:
             if not any(e["kind"] == "report" and e["record"] == doc for e in by_sha.values()):
                 raise _bad(rel, "report.json is not a report the keeper signed")
+            _cross_bind(by_sha, rel, doc)
             if _dict(doc.get("keeper")).get("fingerprint") != fp:
                 raise _bad(f"{rel}.keeper.fingerprint", "the report names another key than the anchor's")
             md = str(Path(rel).with_name(REPORT_MD))

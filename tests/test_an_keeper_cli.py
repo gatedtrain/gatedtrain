@@ -33,6 +33,7 @@ from gatedtrain.ainative import scorers, signing
 from gatedtrain.ainative.keeper import texts
 from gatedtrain.ainative.keeper_trust import KEEPER_BINDING, KEEPER_PUB, RECEIPTS, KeeperAlphaLedger, KeeperTrust
 from gatedtrain.ainative.project import Project
+from gatedtrain.ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT
 from gatedtrain.testing import synthetic_pack as pack
 
 
@@ -44,6 +45,7 @@ def run(argv: list[str], stdin: str | None = None) -> tuple[int, dict]:
         code = cli.main(["--json", *argv])
     doc = json.loads(out.getvalue())
     assert doc["exit"] == code, doc
+    assert err.getvalue() == "", f"stderr under --json: {err.getvalue()!r}"       # AN-1
     return code, doc
 
 
@@ -201,11 +203,17 @@ class KeeperCliTest(KeeperProject, unittest.TestCase):
         proj = self.create()
         self.upto_base(proj)
         spec = scorers.resolve("exact_match")
+        argv = ["keeper", "confirm", str(proj.root), "--decision", self.decision()]
         for answer in ("no\n", "", "y\n"):
-            code, doc = run(["keeper", "confirm", str(proj.root), "--decision", self.decision()], stdin=answer)
-            self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-18"), (answer, doc))
+            code, text, err = run_text(argv, stdin=answer)
+            self.assertEqual((code, text), (3, ""), (answer, err))
+            self.assertIn("error[AN-18]", err)
+        code, doc = run(argv, stdin="yes\n")                          # --json never prompts (AN-1): refused
+        self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-18"), doc)
+        self.assertIn("--yes", doc["problems"][0]["fix"])
+        self.assertIn(spec.what, doc["problems"][0]["message"])        # the sentence, no sealed content
         self.assertFalse(any(e["kind"] == "metric_confirmation" for e in KeeperTrust(proj).receipts()))
-        code, doc = run(["keeper", "confirm", str(proj.root), "--decision", self.decision()], stdin="yes\n")
+        code, doc = run([*argv, "--yes"])
         self.assertEqual((code, doc["command"]), (0, "keeper confirm"), doc)
         self.assertEqual(set(doc["data"]), {"sentence", "envelope_sha256"})
         self.assertIn(spec.what, doc["data"]["sentence"])
@@ -237,7 +245,11 @@ class KeeperCliTest(KeeperProject, unittest.TestCase):
         self.assertEqual((code, doc["data"]["anchor"]), (0, "keeper"), doc)
         code, doc = run(["verify", root])
         self.assertEqual((code, doc["ok"], doc["data"]["anchor"]), (1, False, "none"), doc)
-        self.assertEqual(doc["warnings"], ["checked consistency only: no keeper and no fingerprint"])
+        self.assertEqual(doc["warnings"], [CONSISTENCY_ONLY, OFFLINE_LIMIT])
+        code, doc = run(["verify", root, "--fingerprint", fp])
+        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT])
+        code, text, err = run_text(["verify", root, "--fingerprint", fp])
+        self.assertIn(OFFLINE_LIMIT, err)
 
         other = signing.fingerprint(Ed25519PrivateKey.generate())
         code, doc = run(["verify", root, "--fingerprint", other])
@@ -268,6 +280,19 @@ class KeeperCliTest(KeeperProject, unittest.TestCase):
         tampered("stages/preregister/registration.json", lambda b: b.replace(b'"margin":0.05', b'"margin":0.01'))
         tampered("stages/report/report.json", lambda b: b.replace(b'"status":"PASS"', b'"status":"FAIL"'))
         tampered("stages/report/report.md", lambda b: b + b"\nextra\n")
+        for rel in ("stages/preregister/registration.json", "stages/gate/gate_result.json",
+                    "stages/report/report.json"):                       # a wrong schema is refused, never skipped
+            tampered(rel, lambda b: b.replace(b'"schema":"gatedtrain.ainative.', b'"schema":"gatedtrain.other.', 1))
+
+        report_json = proj.root / "stages" / "report" / "report.json"     # report.md without its report.json
+        saved = report_json.read_bytes()
+        report_json.unlink()
+        try:
+            for argv in (["--keeper", str(self.kp.socket)], ["--fingerprint", fp], []):
+                code, doc = run(["verify", root, *argv])
+                self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), (argv, doc))
+        finally:
+            report_json.write_bytes(saved)
 
         code, doc = run(["verify", root, "--keeper", str(self.kp.socket)])
         self.assertEqual(code, 0, doc)                                 # restored
@@ -284,6 +309,38 @@ class KeeperCliTest(KeeperProject, unittest.TestCase):
         self.assertEqual(code, 0, doc)                                # signed by the key: offline it checks
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), doc)
+
+    def test_verify_refuses_another_projects_report(self):           # review finding 1
+        a = self.create("a")
+        self.to_report(a)
+        b = self.create("b")                                            # same keeper, no attempts
+        fp = signing.fingerprint(self.public())
+        env = [e for e in KeeperTrust(a).receipts() if e["kind"] == "report"][-1]
+        (b.root / RECEIPTS).parent.mkdir(parents=True, exist_ok=True)
+        with open(b.root / RECEIPTS, "ab") as f:
+            f.write(json.dumps(env).encode() + b"\n")
+        (b.root / "stages" / "report").mkdir(parents=True)
+        for name in ("report.json", "report.md"):
+            (b.root / "stages" / "report" / name).write_bytes((a.root / "stages" / "report" / name).read_bytes())
+        for argv in (["--keeper", str(self.kp.socket)], ["--fingerprint", fp], []):
+            code, doc = run(["verify", str(b.root), *argv])
+            self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), (argv, doc))
+
+    def test_verify_with_the_keeper_finds_a_deleted_record(self):    # review finding 3
+        proj = self.create()
+        self.to_report(proj, until="gate")
+        fp = signing.fingerprint(self.public())
+        code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
+        self.assertEqual(code, 0, doc)
+        lines = (proj.root / RECEIPTS).read_bytes().splitlines(keepends=True)
+        kept = [x for x in lines if json.loads(x)["kind"] != "gate_summary"]
+        self.assertEqual(len(kept), len(lines) - 1)
+        (proj.root / RECEIPTS).write_bytes(b"".join(kept))
+        (proj.root / "stages" / "gate" / "gate_result.json").unlink()
+        code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
+        self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), doc)
+        code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
+        self.assertEqual((code, doc["warnings"]), (0, [OFFLINE_LIMIT]), doc)     # offline: stated, not detected
 
     def test_status_reads_the_keeper_ledger(self):                   # Task 10 carry: project_id and j
         proj, other = self.create(), self.create("other")             # same data: one sealed set, one ledger

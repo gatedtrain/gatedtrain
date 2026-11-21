@@ -579,6 +579,9 @@ def cmd_keeper_confirm(args) -> int:
         decision = _load_decision(args.decision)
         summary = trust.sealed_summary()
         values, sentence = keeper_confirmation(decision, summary.get("n"))
+        if not args.yes and _as_json(args):          # AN-1: under --json stdout is one object and stderr stays empty
+            raise Refused([Problem("AN-18", "--yes", f"--json cannot prompt; the sentence to confirm is: {sentence}",
+                                   "rerun without --json to read the sentence and type yes, or pass --yes")])
         if not args.yes:
             print(sentence, file=sys.stderr)
             print(CONFIRM_PROMPT, end="", file=sys.stderr, flush=True)
@@ -618,7 +621,7 @@ def cmd_setup_keeper(args) -> int:
 def cmd_verify(args) -> int:
     """AN-14: exit 0 when the project's signed records check against an anchor (the keeper's key or --fingerprint),
     1 when there is no anchor and only their consistency was checked, 3 on a bad signature or a mismatch."""
-    from .ainative.verify import CONSISTENCY_ONLY, verify_project
+    from .ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, verify_project
 
     try:
         out = verify_project(Path(args.root), keeper=Path(args.keeper) if args.keeper else None,
@@ -627,9 +630,10 @@ def cmd_verify(args) -> int:
         return _krefuse(args, exc.problems)
     if out["anchor"] == "none":
         return _kfinish(args, out, f"consistent: {out['checked']} records under key {out['fingerprint']}\n",
-                        ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY])
+                        ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY, OFFLINE_LIMIT])
+    warnings = [] if out["anchor"] == "keeper" else [OFFLINE_LIMIT]       # only the keeper sees a deleted record
     return _kfinish(args, out, f"verified against the {out['anchor']}: {out['checked']} records under key "
-                               f"{out['fingerprint']}\n")
+                               f"{out['fingerprint']}\n", warnings=warnings)
 
 
 def _add_keeper(sub) -> None:
