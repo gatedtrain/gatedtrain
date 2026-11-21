@@ -29,6 +29,13 @@ def _tmpdir(case: unittest.TestCase) -> Path:
     return tmp
 
 
+def _group_with_a_stranger():
+    """Every group appears to have a member with another uid (host-independent group-write tests)."""
+    stranger = mock.Mock(pw_name="agent", pw_uid=OTHER_UID, pw_gid=0)
+    return mock.patch.multiple(envcheck, grp=mock.Mock(getgrgid=lambda gid: mock.Mock(gr_gid=gid, gr_mem=["agent"])),
+                               pwd=mock.Mock(getpwnam=lambda name: stranger, getpwall=lambda: [stranger]))
+
+
 def _hex(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -49,7 +56,8 @@ class TestPathProblems(unittest.TestCase):
         d = self.tmp / "pkg"
         d.mkdir()
         os.chmod(d, 0o770)
-        problems = envcheck.path_problems([d], os.getuid())
+        with _group_with_a_stranger():
+            problems = envcheck.path_problems([d], os.getuid())
         self.assertEqual(len(problems), 1, problems)
         self.assertEqual(problems[0].rule, "AN-13")
         self.assertIn(str(d), problems[0].message)
@@ -71,7 +79,8 @@ class TestPathProblems(unittest.TestCase):
         f.write_text("x = 1\n", encoding="utf-8")
         os.chmod(f, 0o644)
         os.chmod(d, 0o775)
-        problems = envcheck.path_problems([f], os.getuid())
+        with _group_with_a_stranger():
+            problems = envcheck.path_problems([f], os.getuid())
         self.assertEqual(len(problems), 1, problems)
         self.assertIn(str(d), problems[0].message)
 
@@ -118,6 +127,87 @@ class TestPathProblems(unittest.TestCase):
         os.chmod(hop_dir, 0o777)                               # the middle link could be replaced
         problems = envcheck.path_problems([first], os.getuid())
         self.assertEqual([str(hop_dir) in p.message for p in problems], [True], problems)
+
+
+def _grp_entry(gid: int, members: list[str]):
+    return mock.Mock(gr_gid=gid, gr_mem=members)
+
+
+def _pw_entry(name: str, uid: int, gid: int):
+    return mock.Mock(pw_name=name, pw_uid=uid, pw_gid=gid)
+
+
+@skip_unless_linux
+class TestGroupWrite(unittest.TestCase):
+    """A group-write bit refuses only when the group has a member outside the allowed uids (the keeper's, root);
+    the group database is patched so the tests do not depend on the host."""
+
+    GID = 4242
+
+    def setUp(self):
+        self.tmp = _tmpdir(self)
+        os.chmod(self.tmp, 0o700)
+        self.f = self.tmp / "mod.py"
+        self.f.write_text("x = 1\n", encoding="utf-8")
+        os.chmod(self.f, 0o664)
+        real_lstat = os.lstat
+        f = str(self.f)
+
+        def lstat(path, *a, **kw):                             # the file appears to belong to group GID
+            st = real_lstat(path, *a, **kw)
+            if str(path) != f:
+                return st
+            fields = list(st)
+            fields[stat.ST_GID] = self.GID
+            return os.stat_result(fields)
+        patcher = mock.patch.object(envcheck.os, "lstat", lstat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _problems(self, members: list[str], users: list, *, missing: bool = False) -> list:
+        def getgrgid(gid):
+            if missing or gid != self.GID:
+                raise KeyError(gid)
+            return _grp_entry(gid, members)
+        names = {u.pw_name: u for u in users}
+
+        def getpwnam(name):
+            return names[name]
+        with mock.patch.object(envcheck.grp, "getgrgid", getgrgid), \
+                mock.patch.object(envcheck.pwd, "getpwnam", getpwnam), \
+                mock.patch.object(envcheck.pwd, "getpwall", lambda: list(users)):
+            return envcheck.path_problems([self.f], os.getuid())
+
+    def test_group_of_only_the_keeper_is_accepted(self):
+        users = [_pw_entry("keeper", os.getuid(), self.GID), _pw_entry("root", 0, 0)]
+        self.assertEqual(self._problems(["keeper", "root"], users), [])
+
+    def test_group_with_another_member_refused(self):
+        users = [_pw_entry("keeper", os.getuid(), self.GID), _pw_entry("agent", OTHER_UID, 100)]
+        problems = self._problems(["agent"], users)
+        self.assertEqual([p.rule for p in problems], ["AN-13"])
+        self.assertIn(str(self.f), problems[0].message)
+        self.assertIn("0664", problems[0].message)
+        self.assertIn(f"gid {self.GID}", problems[0].message)
+
+    def test_primary_group_member_refused(self):
+        users = [_pw_entry("keeper", os.getuid(), 100), _pw_entry("agent", OTHER_UID, self.GID)]
+        self.assertEqual(len(self._problems([], users)), 1)
+
+    def test_unresolvable_group_refused(self):
+        users = [_pw_entry("keeper", os.getuid(), self.GID)]
+        self.assertEqual(len(self._problems([], users, missing=True)), 1)
+
+    def test_unresolvable_member_name_refused(self):
+        users = [_pw_entry("keeper", os.getuid(), self.GID)]
+        self.assertEqual(len(self._problems(["ghost"], users)), 1)
+
+    def test_other_write_refused_even_for_a_private_group(self):
+        os.chmod(self.f, 0o666)
+        users = [_pw_entry("keeper", os.getuid(), self.GID)]
+        problems = self._problems([], users)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("0666", problems[0].message)
 
 
 @skip_unless_linux

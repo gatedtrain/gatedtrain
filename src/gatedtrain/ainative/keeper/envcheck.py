@@ -1,10 +1,20 @@
 """AN-13: the keeper runs only code, and keeps only state, that no other uid can change; model files are data only.
 
 Code running as the keeper user can read every sealed set and the signing key, so `serve` refuses to start when any
-file it runs, or any directory above one, is owned by a uid other than the keeper's and root, or is writable by group
-or other (a root-owned directory with the sticky bit, such as `/tmp`, excepted). The files checked are those of the
-interpreter, `sys.path`, every imported module, gatedtrain, the installed scenario packs and gatedtrain's runtime
-dependencies (followed through their requirements, extras left out, so an optional torch is not hashed at start).
+file it runs, or any directory above one, is writable by another uid (spec section 5.1). Precisely, a path is refused
+when:
+- its owner is neither the keeper's uid nor root (0);
+- it has the other-write bit;
+- it has the group-write bit and its group has a member whose uid is not allowed. The members are the group's
+  supplementary members in the group database plus every user whose primary group it is; the allowed uids are the
+  keeper's uid (which is the owner uid when the keeper runs as the user) and root. A group, or a member name, that
+  cannot be resolved counts as having another member.
+A root-owned directory with the sticky bit (such as `/tmp`) is excepted from the write-bit rules. The state directory
+itself must be exactly 0700 (spec section 5.1); its ancestors follow the rules above.
+
+The files checked are those of the interpreter, `sys.path`, every imported module, gatedtrain, the installed scenario
+packs and gatedtrain's runtime dependencies (followed through their requirements, extras left out, so an optional
+torch is not hashed at start).
 
 The environment record names those distributions with a hash of their files; the keeper signs it once at start.
 
@@ -14,8 +24,10 @@ link, or a hash that differs from the one the driver sent is refused before any 
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import os
+import pwd
 import re
 import stat
 import sys
@@ -56,7 +68,43 @@ def _chain(path: Path) -> list[Path]:
     return chain
 
 
-def _one_path_problems(path: Path, st: os.stat_result, keeper_uid: int) -> list[Problem]:
+class _Groups:
+    """Whether a group has a member outside the allowed uids; the user and group databases are read once per check."""
+
+    def __init__(self, allowed: frozenset[int]) -> None:
+        self.allowed = allowed
+        self._users: list | None = None
+        self._cache: dict[int, bool] = {}
+
+    def _all_users(self) -> list:
+        if self._users is None:
+            self._users = list(pwd.getpwall())
+        return self._users
+
+    def _uid_of(self, name: str) -> int | None:
+        try:
+            return pwd.getpwnam(name).pw_uid
+        except KeyError:
+            return None
+
+    def has_other_member(self, gid: int) -> bool:
+        if gid not in self._cache:
+            self._cache[gid] = self._lookup(gid)
+        return self._cache[gid]
+
+    def _lookup(self, gid: int) -> bool:
+        try:
+            group = grp.getgrgid(gid)
+        except KeyError:
+            return True                      # an unknown group: its members cannot be known
+        for name in group.gr_mem:
+            uid = self._uid_of(name)
+            if uid is None or uid not in self.allowed:
+                return True
+        return any(u.pw_gid == gid and u.pw_uid not in self.allowed for u in self._all_users())
+
+
+def _one_path_problems(path: Path, st: os.stat_result, keeper_uid: int, groups: _Groups) -> list[Problem]:
     problems = []
     if st.st_uid not in (keeper_uid, 0):
         problems.append(_problem("environment", f"{path} is owned by uid {st.st_uid}, not the keeper (uid "
@@ -64,17 +112,24 @@ def _one_path_problems(path: Path, st: os.stat_result, keeper_uid: int) -> list[
     if stat.S_ISLNK(st.st_mode):             # a link's own mode bits mean nothing; its target is checked separately
         return problems
     mode = stat.S_IMODE(st.st_mode)
-    sticky_root_dir = stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and mode & stat.S_ISVTX
-    if mode & 0o022 and not sticky_root_dir:
-        problems.append(_problem("environment", f"{path} is writable by group or other (mode {mode:04o})",
-                                 f"remove the write bits: chmod go-w {path}"))
+    if stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and mode & stat.S_ISVTX:
+        return problems
+    if mode & 0o002:
+        problems.append(_problem("environment", f"{path} is writable by every user (mode {mode:04o})",
+                                 f"remove the write bit: chmod o-w {path}"))
+    if mode & 0o020 and groups.has_other_member(st.st_gid):
+        problems.append(_problem("environment", f"{path} is writable by its group (mode {mode:04o}, gid "
+                                 f"{st.st_gid}), which has a member other than the keeper and root",
+                                 f"remove the write bit (chmod g-w {path}) or the other members from the group"))
     return problems
 
 
 def path_problems(paths: Iterable[Path], keeper_uid: int) -> list[Problem]:
-    """Every path, or ancestor up to `/`, that a uid other than the keeper's or root could change; a symbolic link on
+    """Every path, or ancestor up to `/`, that a uid other than the keeper's or root could change (the rules in the
+    module docstring; the keeper's uid is the owner uid in same-user mode, so it covers both); a symbolic link on
     the way is followed hop by hop, so the directory holding each link is checked too. A path that does not exist is
     skipped: creating it needs a write to its parent, which is checked."""
+    groups = _Groups(frozenset({keeper_uid, 0}))
     seen: set[Path] = set()
     problems: list[Problem] = []
     todo = deque(p for path in paths for p in _chain(Path(path)))
@@ -91,7 +146,7 @@ def path_problems(paths: Iterable[Path], keeper_uid: int) -> list[Problem]:
             problems.append(_problem("environment", f"cannot inspect {p}",
                                      "make the keeper's code readable by the keeper user"))
             continue
-        problems += _one_path_problems(p, st, keeper_uid)
+        problems += _one_path_problems(p, st, keeper_uid, groups)
         if stat.S_ISLNK(st.st_mode):
             try:
                 todo.extend(_chain(p.parent / os.readlink(p)))
