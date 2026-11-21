@@ -435,7 +435,8 @@ def split_steps(chain: list[Segment], records: list[dict]) -> tuple[list[dict], 
     orphaned records are excluded from every rollup and would hide consumption. Every step 1..max_steps (the last segment's end) must have
     kept records from exactly one attempt; a record of an attempt outside the chain refuses."""
     problems: list[Problem] = []
-    fix = "collect a run whose kept records cover every step exactly once"
+    fix = ("collect a run whose kept records cover every step exactly once; a run that trained past its last cut "
+           "records its real max_steps in run_args.json and saves a cut at that step")
     seg = {s.attempt: s for s in chain}
     kept: list[dict] = []
     orphaned: list[dict] = []
@@ -453,7 +454,8 @@ def split_steps(chain: list[Segment], records: list[dict]) -> tuple[list[dict], 
             unknown.add(a)
             continue
         if st > max_steps:
-            bad.append(f"record {i} (attempt {a}): step {st} is beyond max_steps {max_steps}")
+            bad.append(f"record {i} (attempt {a}): step {st} is beyond max_steps {max_steps} (run_args.json "
+                       f"`max_steps`, or the last committed cut when it records none)")
         elif st <= (s.branch_step or 0):
             bad.append(f"record {i} (attempt {a}): step {st} is not above the attempt's branch step "
                        f"{s.branch_step or 0}")

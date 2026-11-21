@@ -13,14 +13,15 @@ non-final attempt's last cut (steps a later attempt ran again); each row carries
 does the split. An adapter whose `consumption` takes no `chain` keyword is called as before for a run with one
 non-empty attempt, and ext-collect refuses a run with more (EXT-RES-3: "this adapter does not support resumed runs").
 
-The chain's last segment ends at run_args.json `max_steps` (design 5.2); without `max_steps` (absent or null) at the
-last cut. A `max_steps` that is not an integer or is below the last cut refuses, and so does a record of the final
+The chain's last segment ends at run_args.json `max_steps` (design 5.2), the number of steps the run trains (a
+sentinel such as -1 for "train by epochs" is not one: write null or omit it); without `max_steps` (absent or null)
+at the last cut. A `max_steps` that is not an integer or is below the last cut refuses, and so does a record of the final
 attempt beyond the segment's end (`split_steps`, EXT-RES-4): such records are never dropped. ext-collect stamps
 `status`, `controller_epoch` and `parent_ref` (`<run_id>.<A-1>:<branch_step>`, none for attempt 1; an adapter's own
 `parent_ref` is replaced) on the rows itself, and refuses (EXT-RES-4) a row whose `attempt_id` or `controller_epoch`
 names no segment, a kept row outside its segment's steps, an orphaned row not after a non-final segment's end, and
 kept rows that do not cover steps 1..max_steps from one attempt each (only a `stage`-precision result may return no
-rows). An adapter may define `chain_problems(stage_out, data, cuts, chain) -> list[Problem]`, run before anything is
+rows; the check reads each row's `step`, so a resumed run's rows are one per step, not one per range of steps). An adapter may define `chain_problems(stage_out, data, cuts, chain) -> list[Problem]`, run before anything is
 written, and should split its records with `split_steps` before any precision fallback so a multi-attempt run is
 checked at every precision. `steps_redone` in the report is the result's own `steps_redone` (a non-negative integer;
 anything else refuses), else the distinct (attempt, step) of its `orphaned` rows; for more than one attempt and
