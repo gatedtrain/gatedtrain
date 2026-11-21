@@ -9,8 +9,9 @@ and ledger envelopes in `result` alongside `ok: false` (preflight finding 9); th
 holding them, so the driver logs the spend.
 
 Client deadlines: the keeper serves one connection at a time, and a client's deadline starts before it connects. The
-ops that score or gate (`LONG_OPS`) get `LONG_OP_TIMEOUT_S`, longer than any request the keeper is expected to spend
-on the synthetic pack and on a CPU scorer; every other op keeps `SOCKET_TIMEOUT_S`. A client that gives up while
+ops that split, score or gate (`LONG_OPS`: intake of up to 64 MiB, evaluate, gate, report) get `LONG_OP_TIMEOUT_S`,
+longer than any request the keeper is expected to spend on the synthetic pack and on a CPU scorer; every other op
+keeps `SOCKET_TIMEOUT_S`. A client that gives up while
 its request waits behind another is not served: the keeper drops a request whose peer has already closed. A client
 that gives up during its own evaluation can send the identical request again and gets the stored claim.
 
@@ -33,7 +34,7 @@ from ...errors import Problem, Refused
 MAX_REQUEST_BYTES = 96 * 1024 * 1024          # a 64 MiB data file in base64 plus the envelope
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 SOCKET_TIMEOUT_S = 60.0
-LONG_OPS = frozenset({"evaluate", "gate", "report"})
+LONG_OPS = frozenset({"intake", "evaluate", "gate", "report"})
 LONG_OP_TIMEOUT_S = 3600.0
 MAX_SOCKET_PATH = 107                         # sun_path is 108 bytes including the terminating NUL
 

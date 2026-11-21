@@ -356,6 +356,20 @@ class TestServeRefusals(unittest.TestCase):
         self.assertTrue(sock.is_symlink())
         self.assertFalse(target.exists())
 
+    def test_socket_directory_writable_by_another_uid_refused(self):   # final review 6a (AN-13)
+        run = self.tmp / "run"
+        run.mkdir()
+        os.chmod(run, 0o777)                                # other-write: anyone could replace the socket
+        stop = threading.Event()
+        stop.set()                                          # never serve, even if the refusal were missing
+        with self.assertRaises(Refused) as cm:
+            server.serve(self.state, run / "keeper.sock", os.getuid(), stop=stop)
+        problems = cm.exception.problems
+        self.assertEqual({p.rule for p in problems}, {"AN-13"})
+        self.assertTrue(any(str(run) in p.message for p in problems), problems)
+        self.assertEqual(list(self.state.iterdir()), [])     # refused before the state is opened
+        self.assertEqual(list(run.iterdir()), [])
+
 
 class TestClient(unittest.TestCase):
     def test_unreachable_socket(self):
@@ -373,6 +387,12 @@ class TestClient(unittest.TestCase):
         with mock.patch.object(protocol, "MAX_REQUEST_BYTES", 64), self.assertRaises(Refused) as cm:
             KeeperClient(tmp / "missing.sock").call("hello", None, {"x": "y" * 100})
         self.assertEqual((cm.exception.problems[0].rule, cm.exception.problems[0].field), ("AN-12", "request"))
+
+    def test_intake_waits_with_the_long_op_deadline(self):     # final review 6c: a 64 MiB split is not a short op
+        self.assertEqual(protocol.LONG_OPS, frozenset({"intake", "evaluate", "gate", "report"}))
+        client = KeeperClient(Path("unused.sock"))
+        self.assertEqual(client.timeout_for("intake"), protocol.LONG_OP_TIMEOUT_S)
+        self.assertEqual(client.timeout_for("hello"), protocol.SOCKET_TIMEOUT_S)
 
 
 @skip_unless_linux

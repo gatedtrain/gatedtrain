@@ -10,7 +10,8 @@ keeper can change the code the keeper runs), the unit file, `systemctl daemon-re
 band (AN-14, `gatedtrain verify --fingerprint`).
 
 Nothing here starts a process, creates a file or reads more than the installed distributions' metadata; every value
-is printed as text, shell-quoted.
+is printed as text, shell-quoted. A path holding `%`, `$`, whitespace, a quote or a backslash is refused, since the
+unit's `ExecStart=` would not pass it through unchanged.
 """
 
 from __future__ import annotations
@@ -56,10 +57,18 @@ def installed_packs() -> list[str]:
     return sorted(pins)
 
 
+# systemd rewrites `%` (specifiers) and `$` (environment variables) in a unit's ExecStart=, and splits it on
+# whitespace and quotes; a path holding one of these would not be the path the keeper is started with.
+_UNIT_UNSAFE = re.compile(r"[%$\s'\"\\]")
+
+
 def _absolute(field: str, value: str) -> PurePosixPath:
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or "\n" in value:
         raise _refuse(field, "the path is not an absolute path without `..`", "pass an absolute path")
+    if _UNIT_UNSAFE.search(value):
+        raise _refuse(field, "the path holds a character systemd rewrites or splits in a unit (`%`, `$`, whitespace, "
+                      "a quote or a backslash)", "pass a path of letters, digits, `/`, `.`, `_` and `-`")
     return path
 
 

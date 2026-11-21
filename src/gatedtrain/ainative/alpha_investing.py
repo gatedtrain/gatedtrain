@@ -2,7 +2,8 @@
 
 Three alpha quantities, kept distinct everywhere:
 
-- `alpha`  = alpha_j, the test level the bid grants (W_{j-1} / 2); the gate tests at this level.
+- `alpha`  = alpha_j, the test level the bid grants (W_{j-1} / 2, capped at W_{j-1} / (1 + W_{j-1}) so that the cost
+  never exceeds the wealth; the cap binds only above W = 1); the gate tests at this level.
 - `cost`   = the wealth charged: alpha_j / (1 - alpha_j) when the attempt did not pass, 0.0 on a PASS.
 - `earned` = the payout: PAYOUT on a PASS, 0.0 otherwise.
 
@@ -24,8 +25,9 @@ GUARANTEE = ("alpha-investing (Foster-Stine) over the gate attempts on this seal
 
 
 def bid(wealth: float) -> float:
-    """alpha_j: half of the current wealth."""
-    return wealth / 2
+    """alpha_j: half of the current wealth, and at most W / (1 + W), whose cost alpha_j / (1 - alpha_j) is W itself, so
+    a bid never costs more than the wealth. The two are equal at W = 1, so below it the bid is W / 2 exactly."""
+    return min(wealth / 2, wealth / (1 + wealth))
 
 
 def can_bid(wealth: float) -> bool:

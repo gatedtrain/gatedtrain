@@ -42,6 +42,14 @@ class AlphaInvestingTest(unittest.TestCase):
         self.assertEqual(set(row), {"wealth_before", "alpha", "passed", "cost", "earned", "wealth_after"})
         self.assertEqual((row["wealth_before"], row["alpha"], row["passed"]), (0.0475, 0.02375, True))
 
+    def test_bid_never_costs_more_than_the_wealth(self) -> None:     # final review 6d
+        self.assertEqual(ai.bid(3.0), 0.75)                            # W / (1 + W) above W = 1, not W / 2
+        row = ai.settle(3.0, ai.bid(3.0), False)
+        self.assertEqual(row["cost"], 3.0)
+        self.assertEqual(row["wealth_after"], 0.0)
+        for w in (0.0475, 0.0975, 0.5, 1.0):                           # unchanged up to W = 1
+            self.assertEqual(ai.bid(w), w / 2)
+
     def test_fail_cost(self) -> None:
         row = ai.settle(0.0475, 0.02375, False)
         self.assertAlmostEqual(row["cost"], 0.024327784891165175)

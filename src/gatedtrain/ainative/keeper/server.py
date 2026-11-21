@@ -5,8 +5,8 @@ connection at a time, one request per connection. The peer's uid is checked befo
 gets one problem line and the connection closes. Each request must arrive whole within `SOCKET_TIMEOUT_S` and within
 `MAX_REQUEST_BYTES`. Nothing a peer sends is logged. `SIGTERM` stops the loop, closes and unlinks the socket.
 
-Before it binds, `serve` checks its own environment and state directory (AN-13, `envcheck`) and refuses to start on
-any problem; on a clean start it opens the keeper state (`state.KeeperState`: the state lock, so a second keeper on
+Before it binds, `serve` checks its own environment, its state directory and the socket's directory (AN-13,
+`envcheck`) and refuses to start on any problem; on a clean start it opens the keeper state (`state.KeeperState`: the state lock, so a second keeper on
 one state directory is refused, and the Ed25519 signing key `keeper.key`, created on first start) and signs the
 environment record once.
 
@@ -255,12 +255,15 @@ def _capped(problems: list[Problem]) -> list[Problem]:
         "fix the ones above and start again to see the rest")]
 
 
-def check_start(state_dir: Path, keeper_uid: int) -> None:
-    """AN-13: refuse a state directory or a code path that another uid could change (at most `MAX_START_PROBLEMS`
-    problems, then a count)."""
+def check_start(state_dir: Path, keeper_uid: int, socket_dir: Path | None = None) -> None:
+    """AN-13: refuse a state directory, a socket directory or a code path that another uid could change (at most
+    `MAX_START_PROBLEMS` problems, then a count). A socket directory another uid can write lets it replace the socket
+    with its own and answer the driver in the keeper's place."""
     state_dir = Path(os.path.abspath(state_dir))
     problems = envcheck.state_dir_problems(state_dir, keeper_uid)
     problems += envcheck.path_problems([state_dir.parent], keeper_uid)
+    if socket_dir is not None:
+        problems += envcheck.path_problems([socket_dir], keeper_uid)
     problems += envcheck.path_problems(envcheck.keeper_code_paths(), keeper_uid)
     if problems:
         raise Refused(_capped(problems))
@@ -272,8 +275,8 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
     if sys.platform != "linux":
         raise protocol.refused("platform", "the keeper runs on Linux only (Unix socket, SO_PEERCRED)",
                                "run the keeper on a Linux host")
-    check_start(state_dir, os.geteuid())
     socket_path = Path(socket_path)
+    check_start(state_dir, os.geteuid(), Path(os.path.abspath(socket_path)).parent)
     state = KeeperState(state_dir, owner_uid=owner_uid)       # refuses a second keeper on this state (AN-12)
     try:
         _prepare_socket_path(socket_path)
