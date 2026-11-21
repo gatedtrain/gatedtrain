@@ -15,7 +15,10 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -25,7 +28,7 @@ from _support import FIXTURES
 
 from test_an_synthetic_pack import fixture_rows, inject_pack, jsonl
 from gatedtrain.ainative import alpha_investing as ai, machine, scorers, signing, trust_stages
-from gatedtrain.ainative.keeper import texts
+from gatedtrain.ainative.keeper import protocol, texts
 from gatedtrain.ainative.keeper_trust import (KEEPER_BINDING, KEEPER_PUB, RECEIPTS, KeeperAlphaLedger, KeeperTrust,
                                               bind_project, project_id)
 from gatedtrain.ainative.machine import backends, run_stage, status
@@ -355,6 +358,65 @@ class RefusalAfterSpendTest(KeeperProject, unittest.TestCase):
         self.assertFalse([s for s in sealed if s in text])
         self.assert_no_sealed_input(proj, sealed)
         self.assertAlmostEqual(KeeperAlphaLedger(KeeperTrust(proj)).available(), BID2)
+
+
+@skip_unless_linux
+class BusyKeeperTest(KeeperProject, unittest.TestCase):
+    """The key check (`hello`) before each op waits behind another client's long op with the long-op deadline: the
+    wait is queueing, not work (Task 10 review). Every candidate call sleeps 5 ms in the keeper, so an evaluation
+    takes a few seconds; the client's short deadline is patched to 0.5 s in this process (the keeper subprocess keeps
+    its own)."""
+
+    env = {"GATEDTRAIN_TEST_GENERATOR": "slow:0.005"}
+
+    def setUp(self):
+        self.start()
+        patcher = mock.patch.object(protocol, "SOCKET_TIMEOUT_S", 0.5)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_key_check_waits_behind_a_long_op(self):
+        a = self.make("a")
+        b = self.make("b", jsonl([{**r, "input": f"b{r['input']}"} for r in fixture_rows()]))   # no toy input
+        self.upto_train(a, {"noise_override": 1.0})                  # not a PASS, so a second attempt is allowed
+        errors: list[BaseException] = []
+
+        def evaluate() -> None:
+            try:
+                self.go(a, "evaluate_sealed")
+            except BaseException as exc:                             # noqa: BLE001  (reported below)
+                errors.append(exc)
+
+        worker = threading.Thread(target=evaluate)
+        worker.start()
+        self.addCleanup(worker.join, 120)
+        time.sleep(1.0)                                              # the keeper is scoring a's candidate
+        self.assertTrue(worker.is_alive(), "the evaluation ended before the second client called")
+        began = time.monotonic()
+        KeeperTrust(b).check()                                       # queued behind a's evaluate
+        self.assertGreater(time.monotonic() - began, 0.5)
+        worker.join(120)
+        self.assertEqual(errors, [])
+        self.assertEqual(status(a)["evaluate_sealed"]["status"], "done")
+
+        worker = threading.Thread(target=evaluate)                   # a stage run of b, queued the same way
+        self.go(a, "train", {"rerun": True})
+        worker.start()
+        time.sleep(1.0)
+        self.assertTrue(worker.is_alive())
+        self.go(b, "intake_seal")
+        worker.join(120)
+        self.assertEqual(errors, [])
+        self.assertEqual(status(b)["intake_seal"]["status"], "done")
+
+    def test_a_stopped_keeper_still_fails_fast(self):
+        proj = self.make()
+        self.kp.stop()
+        began = time.monotonic()
+        with self.assertRaises(Refused) as cm:
+            KeeperTrust(proj).check()
+        self.assertEqual(rule_of(cm.exception), "AN-12")
+        self.assertLess(time.monotonic() - began, 5.0)
 
 
 if __name__ == "__main__":

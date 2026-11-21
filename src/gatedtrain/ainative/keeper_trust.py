@@ -30,6 +30,7 @@ from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
 from . import signing
 from .alpha_investing import PLANNING_ALPHA
+from .keeper import protocol
 from .keeper.protocol import KeeperClient, RefusedAfterSpend
 from .project import Project, _refuse_links, _write_atomic
 from .trust import SealedRef
@@ -182,8 +183,13 @@ class KeeperTrust:
     # ---- transport ------------------------------------------------------------------------------------------------
 
     def check(self) -> dict:
-        """Ask the keeper's key (`hello`) and refuse (AN-14) another key than the binding's; returns the hello."""
-        hello = self.client.call("hello", None, {})
+        """Ask the keeper's key (`hello`) and refuse (AN-14) another key than the binding's; returns the hello.
+
+        The keeper serves one connection at a time, so this `hello` may queue behind another client's evaluation: it
+        waits with the long-op deadline (`protocol.LONG_OP_TIMEOUT_S`, read at call time) unless the client has an
+        explicit timeout. A keeper that is not running still fails at once (the connect is refused, AN-12)."""
+        timeout = self.client.timeout if self.client.timeout is not None else protocol.LONG_OP_TIMEOUT_S
+        hello = KeeperClient(self.client.socket_path, timeout=timeout).call("hello", None, {})
         fp, _ = _hello_key(hello)
         if fp != self.binding.fingerprint:
             raise _anchor("keeper", "the keeper at the socket serves another key than the one this project was bound "
