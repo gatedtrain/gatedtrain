@@ -57,7 +57,17 @@ def _drop_signature(env: dict) -> dict:
     return env
 
 
+def _non_canonical_base64(env: dict) -> dict:
+    # The last data character of a 64-byte signature carries 4 unused bits; b64decode ignores them.
+    sig = env["signature"]
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    env["signature"] = sig[:-3] + alphabet[alphabet.index(sig[-3]) ^ 1] + "=="
+    assert base64.b64decode(env["signature"], validate=True) == base64.b64decode(sig)
+    return env
+
+
 TAMPERS = {
+    "signature non-canonical base64": _non_canonical_base64,
     "record value": _record_value,
     "record extra field": _record_extra,
     "kind": _set("kind", "report"),

@@ -151,6 +151,9 @@ def verify(envelope: object, public: Ed25519PublicKey, *, kind: str | None = Non
         if not isinstance(sig_text, str):
             raise ValueError("signature is not text")
         signature = base64.b64decode(sig_text.encode("ascii"), validate=True)
+        # One canonical text per signature: reject unused trailing bits and wrong lengths (malleability).
+        if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != sig_text:
+            raise ValueError("signature is not canonical base64 of 64 bytes")
         public.verify(signature, body)
     except (ValueError, binascii.Error, InvalidSignature):
         raise _refuse("signature", "the signature does not match the record",
