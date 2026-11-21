@@ -61,6 +61,7 @@ the report fields and control runs, or the [Tier B runbook](docs/tier-b-runbook.
 | `ext-from-nel`, `ext-merge-eval`, `ext-arm-fill` | Build and verify the per-item results for each side of the evaluation. |
 | `ext-collect` | Compare the candidate and baseline on the same evaluation items, then write the gate report, consumption ledger and checkpoint lineage. |
 | `project` | AI-native projects (preview): `create`, `plan`, `run`, `status`, `report`. See below. |
+| `keeper`, `setup keeper`, `verify` | AI-native keeper (preview, Linux only): `keeper serve`, `keeper fingerprint`, `keeper confirm`; print the install commands; check a keeper project's signed records. See below. |
 | `impact` | Look up a shard across recorded runs. Each answer reports its precision as `row`, `iteration` or `stage`. |
 
 Gates support superiority, non-inferiority and equivalence. The registration fixes the margin, alpha, target
@@ -94,7 +95,7 @@ object per call.
 items, but in step 1 they sit in plain files under `<root>/trust/` that the operator and any stage can read and
 rewrite, as can the attempt log; the report's `sealed_guarantee` says so ("unsealed (step 1): the operator process
 can read the sealed items, and every stage can read and rewrite the trust records and the attempt log").
-Enforcement arrives with the step-2 keeper. In step 1 the alpha is per project: a new project on the same data
+A project bound to a keeper (below) moves these records out of the operator's reach. In step 1 the alpha is per project: a new project on the same data
 would get a fresh alpha and the same sealed split, so a new test needs new sealed data. The report's known limits
 list these points, the model-reference rule, that the metric confirmation is the decision flag `metric_confirmed` set by whoever runs the
 stages, and how many `evaluate_sealed` attempts the project made.
@@ -103,6 +104,58 @@ stages, and how many `evaluate_sealed` attempts the project made.
 that was changed. To use another pipeline, create a new project. A stage that refuses in `run` before it writes any
 record, spends alpha or claims a trust record is logged as `refused` and changes no stage state; a refusal after any
 of these, or from the output checks, is `failed`.
+
+### The keeper (step 2)
+
+The keeper is a daemon under its own OS user (Linux only: a Unix socket with a peer-credential check). It alone holds
+the sealed items, the registrations, the claims, the per-item records, the alpha ledger and an Ed25519 signing key;
+the stages of a bound project become requests to it, and it signs every record it returns. Only the owner's uid and
+its own may connect.
+
+```sh
+gatedtrain setup keeper [--owner-uid UID] [--packages NAME==VERSION ...]   # prints sudo commands; runs nothing
+gatedtrain keeper fingerprint --socket /run/gatedtrain-keeper/keeper.sock    # keep the fingerprint out of band
+gatedtrain project create ./proj --goal "..." --data labelled.jsonl --pipeline pipeline.yaml \
+    --keeper /run/gatedtrain-keeper/keeper.sock
+gatedtrain keeper confirm ./proj --decision preregister.json [--yes]          # before `run ./proj preregister`
+gatedtrain verify ./proj --keeper /run/gatedtrain-keeper/keeper.sock          # or --fingerprint sha256:...
+```
+
+`setup keeper` prints the commands that create the keeper user, its 0700 state directory, a root-owned virtual
+environment with gatedtrain and the scenario packs pinned to versions, and a systemd unit running `gatedtrain keeper
+serve`; it writes nothing. The keeper refuses to start when its code, environment or state directory can be changed
+by another user (AN-13). `project create --keeper` binds the project to the key the keeper serves (`trust/keeper.json`,
+`trust/keeper.pub`); a bound project never falls back to step 1: an unreachable keeper (AN-12) or one serving another
+key (AN-14) is refused. `keeper confirm` shows the sentence that says what the scorer counts and the margin, and
+records it in the keeper only after you type `yes` (or pass `--yes`; under `--json` it never prompts); `preregister`
+refuses a registration without a matching confirmation (AN-18). The scorer comes from the library (`exact_match`,
+`numeric_match`, `normalised_match`, `set_f1`, `field_f1`) or from a pack by reference (AN-17).
+
+**Alpha rule.** Under the keeper the alpha is not per project but per sealed set, by alpha-investing (Foster-Stine):
+the initial wealth is W0 = 0.05 * (1 - 0.05) = 0.0475; attempt j bids alpha_j = W_{j-1} / 2; a FAIL, INCONCLUSIVE,
+MISSING or crashed attempt costs alpha_j / (1 - alpha_j); a PASS earns the payout 0.05; an attempt whose bid would
+be below 0.005 is refused. Intake plans power at W0 / 2 = 0.02375. Each `evaluate_sealed` spends its alpha before any
+item is scored, so a project may gate several candidates (rerun `train`, then `evaluate_sealed` and `gate`)
+until one passes; a PASS ends the project's attempts. A new project on byte-identical data shares the sealed set and its wealth;
+other data holding a sealed item are refused (AN-16). The report lists every attempt with its alpha, cost and payout
+and states the guarantee: "alpha-investing (Foster-Stine) over the gate attempts on this sealed set controls the
+marginal false discovery rate (mFDR) at level 0.05". A report closes the sealed set: no further attempt on it, from any
+project, and a new project on the same data is refused at intake.
+
+**Guarantee.** With the keeper under its own user, the report's `sealed_guarantee` reads: "the sealed items,
+registrations, claims, ledger and per-item records are held by a separate OS user running code the user's account
+cannot change, and every record is signed; the candidate runs inside the keeper process, not in a container (a model
+format that executes code is refused); the original data file and the metric confirmation are only as strong as the
+user's own account; a root user or the keeper's own account can break all of it." A keeper running as the owner's own
+user (as in the tests) says so instead: "the keeper runs as the owner's own OS user, so anything running as the user
+can read its state and signing key: the records are signed, but nothing is sealed (a test or development setup)".
+
+**`verify`.** `verify ./proj --keeper SOCKET` checks every signed record in the project (the registration, each
+receipt in `trust/keeper/records.jsonl`, the gate result, `report.json` and `report.md`) against the key the keeper
+serves, and that the project holds every record the keeper signed for it; `--fingerprint` checks against a
+fingerprint held out of band, offline, and cannot detect a deleted record (it says so). It exits 0 when every record
+checks, 3 on a bad signature, an edited record, a replaced `trust/keeper.pub` or another fingerprint (AN-14), and 1
+without either anchor (consistency only).
 
 ## Adapter plugins
 
