@@ -30,6 +30,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -e '.[tier-a]'
+      # The keeper refuses to start when a file it runs, or a directory above one, is writable by group or other
+      # (AN-13). The toolcache Python and the checkout belong to the runner user, so it clears those bits without sudo;
+      # the second step lists what is still open (at most 20 lines) and never fails on its own.
+      - run: chmod -R go-w "$pythonLocation" "$GITHUB_WORKSPACE"
+      - run: >-
+          python -c "import os; from gatedtrain.ainative.keeper import envcheck as e;
+          [print(p.line()) for p in e.path_problems(e.keeper_code_paths(), os.getuid())[:20]]"
       # The CPU model and instruction sets of the runner, to match a demo result with the hardware it ran on.
       - run: grep -m1 'model name' /proc/cpuinfo; grep -o -m1 -w -E 'avx512f|avx2' /proc/cpuinfo | sort -u
       # As the runner user: the launch fixtures run the container as the user running the tests (EXT-63). That user

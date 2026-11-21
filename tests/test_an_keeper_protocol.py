@@ -300,8 +300,9 @@ class TestInProcessServer(unittest.TestCase):
 
     def test_response_over_the_cap_refused(self):
         # the cap check is on the server side: a big result becomes one AN-12 problem line
-        with serving(MAX_RESPONSE_BYTES=256) as sock, \
-                mock.patch.dict(server.OPS, {"big": lambda k, pr, a, peer: {"x": "y" * 1000}}):
+        # the cap leaves room for `hello` (fingerprint, public key, environment hash), which the helper waits on
+        with serving(MAX_RESPONSE_BYTES=1024) as sock, \
+                mock.patch.dict(server.OPS, {"big": lambda k, pr, a, peer: {"x": "y" * 4000}}):
             p = problem_of(raw_roundtrip(sock, b'{"op":"big","project":null,"args":{}}\n'))
             self.assertEqual((p["rule"], p["field"]), ("AN-12", "response"))
 

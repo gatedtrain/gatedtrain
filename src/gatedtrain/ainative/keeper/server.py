@@ -5,6 +5,10 @@ connection at a time, one request per connection. The peer's uid is checked befo
 gets one problem line and the connection closes. Each request must arrive whole within `SOCKET_TIMEOUT_S` and within
 `MAX_REQUEST_BYTES`. Nothing a peer sends is logged. `SIGTERM` stops the loop, closes and unlinks the socket.
 
+Before it binds, `serve` checks its own environment and state directory (AN-13, `envcheck`) and refuses to start on
+any problem; on a clean start it creates the Ed25519 signing key `keeper.key` in the state directory (first start
+only) and signs the environment record once.
+
 `OPS` maps an op name to its handler `(keeper, project, args, peer_uid) -> result`; this module registers `hello`,
 later modules register the state and attempt ops.
 """
@@ -21,18 +25,26 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from ... import __version__
 from ...errors import Problem, Refused
-from . import protocol
+from .. import signing
+from . import envcheck, protocol
 
 _ACCEPT_POLL_S = 0.2             # how often the idle loop checks for a stop request
+KEY_FILE = "keeper.key"
+MAX_START_PROBLEMS = 20          # start-up problems printed; the rest are counted in one more line
 
 
 class Keeper:
-    def __init__(self, state_dir: Path, owner_uid: int) -> None:
+    def __init__(self, state_dir: Path, owner_uid: int, *, key: Ed25519PrivateKey | None = None,
+                 environment: dict | None = None) -> None:
         self.state_dir = Path(state_dir)
         self.owner_uid = owner_uid
         self.keeper_uid = os.geteuid()
+        self.key = key
+        self.environment = environment       # the signed environment envelope (kind `environment`)
 
     def handle(self, line: bytes, peer: int) -> dict:
         """The response to one request line. Never raises: an unexpected exception becomes a problem with rule
@@ -55,12 +67,13 @@ def _internal(exc: BaseException) -> Problem:
 
 
 def _hello(keeper: Keeper, project: str | None, args: dict, peer: int) -> dict:
+    key, env = keeper.key, keeper.environment
     return {
         "keeper_version": __version__,
-        "fingerprint": None,                 # the signing key (Task 8)
-        "public_pem": None,
+        "fingerprint": signing.fingerprint(key) if key is not None else None,
+        "public_pem": signing.public_pem(key).decode("ascii") if key is not None else None,
         "sealed_guarantee": None,
-        "environment_sha256": None,          # the environment record (Task 7)
+        "environment_sha256": envcheck.environment_sha256(env["record"]) if env is not None else None,
         "same_user": keeper.keeper_uid == keeper.owner_uid,
     }
 
@@ -150,16 +163,46 @@ def _prepare_socket_path(socket_path: Path) -> None:
     os.unlink(socket_path)
 
 
+def _capped(problems: list[Problem]) -> list[Problem]:
+    if len(problems) <= MAX_START_PROBLEMS:
+        return problems
+    rest = len(problems) - MAX_START_PROBLEMS
+    return problems[:MAX_START_PROBLEMS] + [Problem(
+        envcheck.RULE, "environment", f"and {rest} more problems of the same kind",
+        "fix the ones above and start again to see the rest")]
+
+
+def check_start(state_dir: Path, keeper_uid: int) -> None:
+    """AN-13: refuse a state directory or a code path that another uid could change (at most `MAX_START_PROBLEMS`
+    problems, then a count)."""
+    state_dir = Path(os.path.abspath(state_dir))
+    problems = envcheck.state_dir_problems(state_dir, keeper_uid)
+    problems += envcheck.path_problems([state_dir.parent], keeper_uid)
+    problems += envcheck.path_problems(envcheck.keeper_code_paths(), keeper_uid)
+    if problems:
+        raise Refused(_capped(problems))
+
+
+def _signing_key(state_dir: Path) -> Ed25519PrivateKey:
+    path = Path(state_dir) / KEY_FILE
+    if not os.path.lexists(path):
+        signing.generate_key(path)
+    return signing.load_private_key(path)
+
+
 def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading.Event | None = None) -> int:
     """Serve until SIGTERM (or until `stop` is set, for an in-process server); 0 on a clean stop. A start that cannot
-    proceed raises Refused (AN-12)."""
+    proceed raises Refused (AN-12; AN-13 for the environment and the state directory)."""
     if sys.platform != "linux":
         raise protocol.refused("platform", "the keeper runs on Linux only (Unix socket, SO_PEERCRED)",
                                "run the keeper on a Linux host")
+    check_start(state_dir, os.geteuid())
     socket_path = Path(socket_path)
     _prepare_socket_path(socket_path)
     stop = stop if stop is not None else threading.Event()
-    keeper = Keeper(state_dir, owner_uid)
+    key = _signing_key(state_dir)
+    environment = signing.sign(key, "environment", envcheck.environment_record())
+    keeper = Keeper(state_dir, owner_uid, key=key, environment=environment)
 
     previous = None
     if threading.current_thread() is threading.main_thread():

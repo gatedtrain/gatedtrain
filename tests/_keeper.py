@@ -1,9 +1,9 @@
 """Test fixture: the keeper as a subprocess of the test user (tests/README.md section 13).
 
-`KeeperProcess` makes a fresh temporary directory holding `state/` (mode 0700) and `keeper.sock`, starts
-`tests/fixtures/ainative/run_cli.py keeper serve --state ... --socket ... --owner-uid <os.getuid()>` (so the synthetic
-pack is injected as in step 1) and waits for `hello`. Leaving the context stops the process and removes the directory;
-a start that fails cleans up before it raises.
+`KeeperProcess` makes a fresh temporary directory holding `state/` (mode 0700, or `state_mode`) and `keeper.sock`,
+starts `tests/fixtures/ainative/run_cli.py keeper serve --state ... --socket ... --owner-uid <os.getuid()>` (so the
+synthetic pack is injected as in step 1) and waits for `hello`. Leaving the context stops the process and removes the
+directory; a start that fails cleans up before it raises.
 """
 
 from __future__ import annotations
@@ -41,8 +41,10 @@ class KeeperStartError(AssertionError):
 
 
 class KeeperProcess:
-    def __init__(self, *, owner_uid: int | None = None, env: dict[str, str] | None = None) -> None:
+    def __init__(self, *, owner_uid: int | None = None, env: dict[str, str] | None = None,
+                 state_mode: int = 0o700) -> None:
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
+        self.state_mode = state_mode
         self.env = dict(env or {})
         self.tmp: Path | None = None
         self.proc: subprocess.Popen | None = None
@@ -76,7 +78,7 @@ class KeeperProcess:
         self.tmp = Path(tempfile.mkdtemp(prefix="gk-"))
         try:
             self.state.mkdir(mode=0o700)
-            os.chmod(self.state, 0o700)
+            os.chmod(self.state, self.state_mode)
             self.start()
         except BaseException:
             self._cleanup()
