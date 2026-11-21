@@ -12,7 +12,7 @@ import test_an_intake as ti
 from gatedtrain.ainative import scorers, trust_stages
 from gatedtrain.ainative.scorers import (PLANNING_SD_BOUND, ScorerSpec, bind, evaluator_entry, library,
                                          manifest_document, manifest_hash, resolve, spec_for_evaluator)
-from gatedtrain.ainative.trust import InProcessTrust, SealedRef
+from gatedtrain.ainative.trust import FixedAlphaLedger, InProcessTrust, SealedRef
 from gatedtrain.canonical import file_sha256
 from gatedtrain.errors import Refused
 from gatedtrain.registration import check_contents, resolved_evaluator_hash
@@ -320,6 +320,91 @@ class PreregisterScorerTest(tg.GateBase):
         self.assertEqual(p.rule, "AN-17")
         self.assertEqual(p.fix, f"the sealed set was sized for a planning SD of {math.sqrt(0.5)}; pick a library "
                                 "scorer or run intake again with new data")
+
+
+def raising_scorer(prediction, label) -> float:
+    """A test-only pack scorer whose exception message quotes the sealed label."""
+    raise ValueError(f"cannot score label {label!r}")
+
+
+def out_of_range_scorer(prediction, label) -> float:
+    return 2.0
+
+
+def nan_scorer(prediction, label) -> float:
+    return float("nan")
+
+
+def ten_point_scorer(prediction, label) -> float:
+    """A test-only pack scorer on [0, 10]: 10.0 when equal, else 0.0."""
+    return 10.0 if prediction == label else 0.0
+
+
+class PackScorerEvaluationTest(tg.GateBase):
+    """evaluate_sealed and gate with a pack scorer: the no-leak refusals and the score range (AN-8, AN-9, AN-17)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        inject_pack(self)
+
+    def upto_scoring(self, fn, *, rng=(0.0, 1.0), project: str = "pack"):
+        TEST_SCORERS["pk"] = pack_decl(id="pk.t17@0.1", fn=fn, range=list(rng))
+        trust_stages._reset_scenario_snapshot()
+        with mock.patch.object(tg, "unique_rows", lambda n: scorer_rows("exact_match", n)):
+            proj = self.make(name=project)
+        self.run_(proj, "intake_seal")
+        self.run_(proj, "choose_x")
+        self.run_(proj, "preregister", {"metric_confirmed": True, "scorer": "pk"})
+        self.run_(proj, "train_x")
+        return proj
+
+    def test_a_raising_pack_scorer_is_refused_without_the_label(self) -> None:
+        proj = self.upto_scoring(raising_scorer)
+        with self.assertRaises(Refused) as cm:
+            self.run_(proj, "evaluate_sealed")
+        problems = cm.exception.problems
+        self.assertEqual({p.rule for p in problems}, {"AN-8"})
+        self.assertIn("ValueError", problems[0].message)
+        for p in problems:
+            for text in (p.field, p.message, p.fix):
+                self.assertNotIn("label-", text)                   # no sealed label echoed
+                self.assertNotIn("cannot score", text)             # nor the scorer's own message
+
+    def test_out_of_range_and_non_finite_scores_are_refused(self) -> None:
+        for i, fn in enumerate((out_of_range_scorer, nan_scorer)):
+            with self.subTest(fn=fn.__name__):
+                tg.LABELS.clear()
+                trust_stages._reset_scenario_snapshot()
+                proj = self.upto_scoring(fn, project=f"range{i}")
+                with self.assertRaises(Refused) as cm:
+                    self.run_(proj, "evaluate_sealed")
+                p = cm.exception.problems[0]
+                self.assertEqual(p.rule, "AN-8")
+                self.assertIn("range", p.message)
+
+    def test_gate_uses_the_pack_scorers_score_range(self) -> None:
+        proj = self.upto_scoring(ten_point_scorer, rng=(0.0, 10.0))
+        out = self.run_(proj, "evaluate_sealed").outputs
+        cand = proj.read_artifact(out["candidate_records"])["records"]
+        self.assertTrue(all(r["score"] == 10.0 for r in cand))
+        gate = proj.read_artifact(self.run_(proj, "gate").outputs["gate_result"])
+        self.assertEqual(gate["status"], "PASS")                   # (0, 1) would count every 10.0 as missing
+        self.assertEqual(gate["candidate_score"], 10.0)
+        self.assertTrue(3.0 < gate["baseline_score"] < 7.0)
+        rep = proj.read_artifact(self.run_(proj, "report").outputs["report"])
+        self.assertEqual(rep["metric"]["unit"], pack_decl()["unit"])
+
+    def test_gate_refuses_before_the_spend_when_the_scorer_is_gone(self) -> None:
+        proj = self.upto_scoring(pack_iou)
+        self.run_(proj, "evaluate_sealed")
+        before = FixedAlphaLedger(proj).entries()
+        TEST_SCORERS.clear()
+        trust_stages._reset_scenario_snapshot()
+        with self.assertRaises(Refused) as cm:
+            self.run_(proj, "gate")
+        self.assertEqual({p.rule for p in cm.exception.problems}, {"AN-9"})
+        self.assertEqual(FixedAlphaLedger(proj).entries(), before)
+        self.assertEqual(FixedAlphaLedger(proj).available(), 0.05)  # no alpha spent
 
 
 class ListLabelIntakeTest(ti.Base):
