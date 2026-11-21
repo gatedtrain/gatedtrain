@@ -25,7 +25,9 @@ Counts (05 section 12.4, 05:424; the impact join reports them, 05:463; R10A-9):
 no rollup. `superseded` is 0: a skeleton run is one attempt and one segment.
 A resumed external run (EXT-RES-5) also keeps its orphaned rows in the ledger with `status` `orphaned`; the
 first-use query reads only rows whose status is `kept` (or absent), and the run's lineage/orphaned.parquet
-carries the same rows for the counts and ranges.
+carries the same rows for the counts and ranges. Only such a run (its ledger holds a row with `status`
+`orphaned`) contributes to the `orphaned` section of the answer (impact_orphaned); a Skeleton or Tier B run's
+records after its last cut (attempt "0", lineage/orphaned.parquet only) stay in the counts and ranges.
 
 Design revision 11 (tests/README.md section 11.16):
 - R11-18 (R11A-18): each result carries `derivation`, `reconstructed` if any contributing ledger record is,
@@ -186,26 +188,44 @@ def impact_counts(shard: str, *, run_dir: Path | None = None, runs_root: Path | 
 
 
 STEPS_QUERY = """
-SELECT DISTINCT o.attempt_id, o.step
+SELECT o.run_id, o.attempt_id, o.step, COUNT(*) AS records
 FROM read_parquet($orphaned, union_by_name = true) AS o
 JOIN (SELECT DISTINCT run_id, stage_id, snapshot, shard FROM read_parquet($shards) WHERE shard_sha256 = $target) AS t
   ON o.run_id = t.run_id AND o.stage_id = t.stage_id AND o.snapshot = t.snapshot AND o.shard = t.shard
-ORDER BY o.attempt_id, o.step
+GROUP BY o.run_id, o.attempt_id, o.step
+ORDER BY o.run_id, o.attempt_id, o.step
 """
 
 
-def impact_orphaned(shard: str, *, run_dir: Path | None = None, runs_root: Path | None = None) -> dict[str, Any]:
-    """The `orphaned` section of an impact answer for a resumed run (EXT-RES-5; 05 section 12.4: orphaned records
-    enter no rollup). Empty (`{}`) when the queried shard has no orphaned record, so the JSON answer of a
-    single-attempt or old-layout run keeps its keys.
+def _resumed(d: Path) -> bool:
+    """Whether run directory `d` is a resumed external run with orphaned records: its ledger has the `status` column
+    (EXT-RES-5) and a row whose status is `orphaned`. Skeleton and Tier B ledgers have no such row."""
+    path = d / "ledger" / "consumption.parquet"
+    if "status" not in pq.read_schema(path).names:
+        return False
+    return "orphaned" in set(pq.read_table(path, columns=["status"]).column("status").to_pylist())
 
-    Otherwise `{"count": N, "attempts": {attempt_id: [[first, last], ...]}}`: `count` is the number of orphaned
-    ConsumptionRecords of the shard (the same figure as impact_counts), and each attempt lists the contiguous
-    runs of orphaned steps of the shard as inclusive `[first, last]` pairs in ascending order. Attribution to
-    checkpoints is separate and reads kept rows only (impact_query), so a shard consumed only in orphaned steps
-    has no checkpoint in the answer and an `orphaned` section here."""
+
+def _attempt_key(run_id: str, attempt_id: str) -> str:
+    """A run-qualified attempt id: ext attempt ids are `<run_id>.<A>` already; any other is prefixed with its run."""
+    return attempt_id if attempt_id.startswith(f"{run_id}.") else f"{run_id}.{attempt_id}"
+
+
+def impact_orphaned(shard: str, *, run_dir: Path | None = None, runs_root: Path | None = None) -> dict[str, Any]:
+    """The `orphaned` section of an impact answer, over the resumed external runs among the selected runs (EXT-RES-5;
+    05 section 12.4: orphaned records enter no rollup). Empty (`{}`) when no such run has an orphaned record of the
+    queried shard, so the JSON answer of a single-attempt, old-layout, Skeleton or Tier B run keeps its keys (their
+    records after the last cut stay in `counts` and `ranges` only).
+
+    Otherwise `{"count": N, "attempts": {attempt_id: [[first, last], ...]}}`: each run-qualified attempt id
+    (`<run_id>.<A>`) lists the contiguous runs of its orphaned steps of the shard as inclusive `[first, last]` pairs
+    in ascending order, and `count` is the number of orphaned ConsumptionRecords of the shard in those same runs
+    (one per (attempt, step, shard), so with one shard file per name it equals the number of steps listed).
+    Attribution to checkpoints is separate and reads kept rows only (impact_query), so a shard consumed only in
+    orphaned steps has no checkpoint in the answer and an `orphaned` section here."""
     target = resolve_target(shard)
-    dirs = [d for d in run_dirs(run_dir=run_dir, runs_root=runs_root) if (d / "lineage" / "orphaned.parquet").is_file()]
+    dirs = [d for d in run_dirs(run_dir=run_dir, runs_root=runs_root)
+            if (d / "lineage" / "orphaned.parquet").is_file() and _resumed(d)]
     if not dirs:
         return {}
     con = duckdb.connect(":memory:")
@@ -218,13 +238,14 @@ def impact_orphaned(shard: str, *, run_dir: Path | None = None, runs_root: Path 
     finally:
         con.close()
     attempts: dict[str, list[list[int]]] = {}
-    for attempt_id, step in rows:
-        runs = attempts.setdefault(str(attempt_id), [])
+    count = 0
+    for run_id, attempt_id, step, records in rows:
+        count += int(records)
+        runs = attempts.setdefault(_attempt_key(str(run_id), str(attempt_id)), [])
         if runs and int(step) == runs[-1][1] + 1:
             runs[-1][1] = int(step)
         else:
             runs.append([int(step), int(step)])
-    count = impact_counts(target, run_dir=run_dir, runs_root=runs_root)["orphaned"]
     return {"count": count, "attempts": attempts} if count else {}
 
 

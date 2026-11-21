@@ -21,7 +21,9 @@ Only steps covered by a saved checkpoint are written: a record not covered
 by any committed cut is orphaned and excluded (05:409). `orphaned_rows`
 lists those records, one per (step, shard), for the impact query's counts
 (05 section 12.4, 05:424; R10A-9); the runner keeps them in lineage, never
-in the ledger. `consumed_samples`
+in the ledger. (A resumed external run's ledger, written by ext-collect, does
+hold its orphaned records, with `status` `orphaned`; EXT-RES-5, schema 1.1.)
+`consumed_samples`
 of each checkpoint must equal the samples logged up to its step; a mismatch
 is an error, not a guess.
 
@@ -70,13 +72,15 @@ SCHEMA = pa.schema([
     ("sampler_config_hash", pa.string()), ("seed_inputs", SEED_INPUTS), ("chunk", CHUNK),
     ("precision", pa.string()), ("derivation", pa.string()), ("writer_id", pa.string()),
     # Resumed external runs (EXT-RES-1, EXT-RES-5): the attempt number and `kept` | `orphaned`. A ledger written
-    # before them has neither column, and a row without them is a kept row of attempt 0.
+    # before them (schema 1.0) has neither column, and a row without them (or with null) is a kept row.
     ("controller_epoch", pa.int64()), ("status", pa.string()),
 ], metadata={
     b"schema": b"gatedtrain.consumption_record",
-    b"schema_version": b"1.0",
+    b"schema_version": b"1.1",
     b"note": b"prototype extension (interim rule G-1): precision 'iteration', data_ref.row null; "
-             b"05 section 12.2 allows row or step_range only",
+             b"05 section 12.2 allows row or step_range only. 1.1 adds controller_epoch and status (EXT-RES-5): "
+             b"a resumed external run's ledger also holds its orphaned records (outcome 'consumed', status "
+             b"'orphaned'), which enter no rollup; a null or absent status is 'kept'",
     b"tags": ",".join(TAGS).encode(),
 })
 

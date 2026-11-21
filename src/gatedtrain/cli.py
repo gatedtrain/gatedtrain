@@ -97,7 +97,7 @@ def cmd_impact(args) -> int:
     query = {"shard": args.shard, "shard_sha256": target, "run_dir": args.run_dir, "runs_root": args.runs_root,
              "outcome": "consumed", "include_exposed": False}
     obj = {"query": query, "results": results, "counts": counts, "ranges": ranges}
-    if orphaned:                                             # EXT-RES-5: only a resumed run has the section
+    if orphaned:                                             # EXT-RES-5: only a resumed ext run's orphaned rows
         obj["orphaned"] = orphaned
     if _as_json(args):                                       # the AN-1 envelope; `data` is the impact object
         return _finish(args, obj)
@@ -118,6 +118,9 @@ def cmd_impact(args) -> int:
             for g in ranges[kind]:
                 lines.append(f"{kind}_range: attempt {g['attempt_id']} shard {g['shard']} steps "
                              f"{g['first_step']}-{g['last_step']}")
+        for attempt_id, runs in (orphaned.get("attempts") or {}).items():   # EXT-RES-5: the JSON section's runs
+            lines.append(f"orphaned_steps: attempt {attempt_id} steps "
+                         + ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in runs))
     return _finish(args, obj, "".join(line + "\n" for line in lines))
 
 

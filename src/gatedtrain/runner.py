@@ -243,7 +243,8 @@ def write_lineage(wf: Workflow, run_dir: Path, *, base: Path, data: Path, cfg_pa
 
     `orphaned` (from ledger.orphaned_rows) are the ConsumptionRecords after the attempt's last
     committed cut (05 section 12.4, 05:424); they are kept in lineage/orphaned.parquet for the
-    impact query's counts (R10A-9) and never enter the ledger or a rollup."""
+    impact query's counts (R10A-9) and never enter this runner's ledger or a rollup. (ext-collect of a resumed
+    external run also writes its orphaned records to the ledger, with `status` `orphaned`; EXT-RES-5.)"""
     run_id, stage_id, gate_id = run_dir.name, wf.stage["id"], wf.gate["id"]
     snapshot = manifest_hash(data)
     known = known_hashes or {}

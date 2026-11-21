@@ -109,6 +109,14 @@ class TestOrphanRanges(unittest.TestCase):
             "superseded": []})
         self.assertEqual(out["counts"], {"orphaned": 2, "superseded": 0}, "R10A-9 counts unchanged")
 
+    def test_tail_records_add_no_orphaned_section(self):
+        # EXT-RES-5's `orphaned` section belongs to resumed external runs; a Tier B run's records after its last cut
+        # (attempt "0", lineage/orphaned.parquet) keep the R10A-9 / R11A-19 answer shape.
+        out = self.impact("shard-00002.jsonl")
+        self.assertEqual(out["counts"]["orphaned"], 2)
+        self.assertEqual(set(out), {"query", "results", "counts", "ranges"})
+        self.assertNotIn("orphaned_steps", self.impact("shard-00002.jsonl", as_json=False))
+
     def test_covered_shard_has_no_ranges(self):
         out = self.impact("shard-00001.jsonl")
         self.assertEqual(out["ranges"], {"orphaned": [], "superseded": []})

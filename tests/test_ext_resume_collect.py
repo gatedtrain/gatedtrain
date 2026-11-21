@@ -99,6 +99,30 @@ def one_attempt(sc: ExtScenario) -> None:
     ])
 
 
+def renamed_copy(src: Path, dst: Path, *, tail_style: bool = False) -> Path:
+    """A copy of run directory `src` as run `dst.name`. With `tail_style` it looks like a Skeleton or Tier B run with
+    records after its last cut: kept ledger rows only, and lineage/orphaned.parquet rows of attempt "0"."""
+    shutil.copytree(src, dst)
+    old, new = src.name, dst.name
+    for rel in ("ledger/consumption.parquet", "lineage/checkpoints.parquet", "lineage/shards.parquet",
+                "lineage/orphaned.parquet"):
+        table = pq.read_table(dst / rel)
+        rows, schema = table.to_pylist(), table.schema
+        for r in rows:
+            r["run_id"] = new
+            if isinstance(r.get("attempt_id"), str):
+                r["attempt_id"] = "0" if tail_style else r["attempt_id"].replace(old, new, 1)
+        if tail_style and rel.startswith("ledger"):
+            rows = [{k: v for k, v in r.items() if k not in ("status", "controller_epoch")}
+                    for r in rows if r["status"] == "kept"]
+            schema = pa.schema([f for f in schema if f.name not in ("status", "controller_epoch")],
+                               metadata=schema.metadata)
+        pq.write_table(pa.Table.from_pylist(rows, schema=schema), dst / rel)
+    edges = dst / "lineage" / "edges.json"
+    edges.write_text(edges.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+    return dst
+
+
 def ledger(run_dir: Path) -> list[dict]:
     return pq.read_table(run_dir / "ledger" / "consumption.parquet").to_pylist()
 
@@ -276,6 +300,28 @@ class TestThreeAttempts(Case):
         pq.write_table(pa.Table.from_pylist(rows + extra, schema=table.schema), path)
         got = self.impact(copy, "shard-00001.jsonl")["orphaned"]
         self.assertEqual(got, {"count": 4, "attempts": {f"{d.name}.1": [[5, 7], [9, 9]]}})
+        # The text answer prints the same contiguous runs (the R11A-19 range lines stay MIN-MAX).
+        text = run_cli(["impact", str(self.sc.train / "shard-00001.jsonl"), "--run-dir", str(copy)],
+                       cwd=self.sc.root).stdout.splitlines()
+        self.assertIn(f"orphaned_steps: attempt {d.name}.1 steps 5-7, 9", text)
+        self.assertIn(f"orphaned_range: attempt {d.name}.1 shard shard-00001.jsonl steps 5-9", text)
+
+    def test_orphaned_section_over_several_runs(self):
+        # Two resumed runs and two Skeleton/Tier B-like runs with tail records of attempt "0" under one runs root:
+        # the section lists the resumed runs' attempts only, and `count` is the number of orphaned steps listed.
+        d = self.run_dir()
+        root = self.tmp / "several"
+        root.mkdir()
+        shutil.copytree(d, root / d.name)
+        renamed_copy(d, root / "run-b")
+        renamed_copy(d, root / "run-c", tail_style=True)
+        renamed_copy(d, root / "run-d", tail_style=True)
+        proc = run_cli(["impact", str(self.sc.train / "shard-00001.jsonl"), "--runs-root", str(root), "--json"],
+                       cwd=self.sc.root)
+        self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["orphaned"], {"count": 2, "attempts": {f"{d.name}.1": [[5, 5]], "run-b.1": [[5, 5]]}})
+        self.assertEqual(doc["counts"]["orphaned"], 4, "the R10A-9 counts still cover every run")
 
     def test_final_attempt_tail_after_last_cut_is_attributed_to_no_checkpoint(self):
         d = self.run_dir()
@@ -304,6 +350,22 @@ class TestOldLayoutImpactUnchanged(Case):
         want = (Path(__file__).parent / "fixtures" / "ext_resume_old_layout_impact.json").read_text(encoding="utf-8")
         self.assertEqual(text, want)
         self.assertEqual(set(doc), {"query", "results", "counts", "ranges"})
+
+
+class TestLedgerSchema(Case):
+    def test_ledger_schema_version(self):
+        # The `status` and `controller_epoch` columns (EXT-RES-5) are schema 1.1; a 1.0 ledger without them stays
+        # readable (TestOldLayout.test_ledger_without_status_column_reads_as_kept).
+        from gatedtrain.ledger import SCHEMA
+
+        self.assertEqual(SCHEMA.metadata[b"schema_version"], b"1.1")
+        self.assertIn(b"status", SCHEMA.metadata[b"note"])
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        proc = sc.collect(self.runs())
+        self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
+        meta = pq.read_schema(parse_run_dir(proc.stdout) / "ledger" / "consumption.parquet").metadata
+        self.assertEqual(meta[b"schema_version"], b"1.1")
 
 
 class TestOneAttempt(Case):
