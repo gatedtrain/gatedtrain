@@ -132,11 +132,13 @@ def power_clause(planning_alpha: float) -> dict:
             "power": DEFAULT_POWER, "sigma_plan": "fixed"}
 
 
-def split_data(raw: bytes, digest: str, *, planning_alpha: float) -> dict:
+def split_data(raw: bytes, digest: str, *, planning_alpha: float, train_only: frozenset[str] = frozenset()) -> dict:
     """Dedup, size and split the data file's bytes (`digest` is their `sha256:<hex>`).
 
     The sealed size is the power plan's `n_required` at `planning_alpha`, capped at half the distinct rows; the
-    split orders the rows by sha256(`digest:ihash`) and seals the first ones. Returns `digest`, `n_unique`,
+    split orders the rows by sha256(`digest:ihash`) and seals the first ones. A row whose input hash is in
+    `train_only` (the keeper: inputs it released as training before) is never sealed; the sealed size is then also
+    capped at the number of the other rows. Returns `digest`, `n_unique`,
     `n_removed`, `n_needed`, `n_sealed`, `mde` (achieved), `conclusive`, `more` (rows still needed), `sealed` and
     `train` (`{input, label}` rows), `input_hashes` (sha256 of the canonical `input` of every distinct row, in
     first-occurrence order) and `sealed_input_hashes` (the same for the sealed rows, in sealed order)."""
@@ -149,8 +151,9 @@ def split_data(raw: bytes, digest: str, *, planning_alpha: float) -> dict:
     pilot = {"sigma": PILOT_SIGMA, "source": PILOT_SOURCE}
     clause = power_clause(planning_alpha)
     needed = gates.plan(clause, pilot, n_available=cap)["n_required"]
-    n_sealed = min(needed, cap)
-    order = sorted(unique, key=lambda r: hashlib.sha256(f"{digest}:{r['ihash']}".encode()).hexdigest())
+    eligible = [r for r in unique if r["ihash"] not in train_only] if train_only else unique
+    n_sealed = min(needed, cap, len(eligible))
+    order = sorted(eligible, key=lambda r: hashlib.sha256(f"{digest}:{r['ihash']}".encode()).hexdigest())
     sealed = order[:n_sealed]
     sealed_ids = {r["ihash"] for r in sealed}
     train = [r for r in unique if r["ihash"] not in sealed_ids]

@@ -6,15 +6,19 @@ gets one problem line and the connection closes. Each request must arrive whole 
 `MAX_REQUEST_BYTES`. Nothing a peer sends is logged. `SIGTERM` stops the loop, closes and unlinks the socket.
 
 Before it binds, `serve` checks its own environment and state directory (AN-13, `envcheck`) and refuses to start on
-any problem; on a clean start it creates the Ed25519 signing key `keeper.key` in the state directory (first start
-only) and signs the environment record once.
+any problem; on a clean start it opens the keeper state (`state.KeeperState`: the state lock, so a second keeper on
+one state directory is refused, and the Ed25519 signing key `keeper.key`, created on first start) and signs the
+environment record once.
 
-`OPS` maps an op name to its handler `(keeper, project, args, peer_uid) -> result`; this module registers `hello`,
-later modules register the state and attempt ops.
+`OPS` maps an op name to its handler `(keeper, project, args, peer_uid) -> result`: `hello`, and the state ops
+`open_project`, `intake`, `sealed_summary`, `confirm_metric`, `register`, `registration`, `latest_registration`,
+`records` and `has_record`, each taking exactly the args it names.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import signal
 import socket
@@ -30,21 +34,22 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ... import __version__
 from ...errors import Problem, Refused
 from .. import signing
-from . import envcheck, protocol
+from . import envcheck, protocol, texts
+from .state import KEY_FILE, KeeperState  # noqa: F401  (KEY_FILE: the key's name in the state directory)
 
 _ACCEPT_POLL_S = 0.2             # how often the idle loop checks for a stop request
-KEY_FILE = "keeper.key"
 MAX_START_PROBLEMS = 20          # start-up problems printed; the rest are counted in one more line
 
 
 class Keeper:
     def __init__(self, state_dir: Path, owner_uid: int, *, key: Ed25519PrivateKey | None = None,
-                 environment: dict | None = None) -> None:
+                 environment: dict | None = None, state: KeeperState | None = None) -> None:
         self.state_dir = Path(state_dir)
         self.owner_uid = owner_uid
         self.keeper_uid = os.geteuid()
         self.key = key
         self.environment = environment       # the signed environment envelope (kind `environment`)
+        self.state = state
 
     def handle(self, line: bytes, peer: int) -> dict:
         """The response to one request line. Never raises: an unexpected exception becomes a problem with rule
@@ -72,13 +77,64 @@ def _hello(keeper: Keeper, project: str | None, args: dict, peer: int) -> dict:
         "keeper_version": __version__,
         "fingerprint": signing.fingerprint(key) if key is not None else None,
         "public_pem": signing.public_pem(key).decode("ascii") if key is not None else None,
-        "sealed_guarantee": None,
+        "sealed_guarantee": texts.sealed_guarantee(keeper.keeper_uid, keeper.owner_uid),
         "environment_sha256": envcheck.environment_sha256(env["record"]) if env is not None else None,
         "same_user": keeper.keeper_uid == keeper.owner_uid,
     }
 
 
-OPS: dict[str, Callable[[Keeper, str | None, dict, int], object]] = {"hello": _hello}
+def _args(args: dict, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> dict:
+    """The op's args, refused (AN-12) when one is missing or unknown (named by key only)."""
+    unknown = sorted(set(args) - set(required) - set(optional))
+    if unknown:
+        raise protocol.refused(f"args.{unknown[0]}", "the op takes no such argument",
+                               f"send only: {', '.join(required + optional) or 'no arguments'}")
+    for key in required:
+        if key not in args:
+            raise protocol.refused(f"args.{key}", "a required argument is missing", f"send {key}")
+    return args
+
+
+def _state_op(fn: Callable[[KeeperState, str, dict, int], object], required: tuple[str, ...] = (),
+              optional: tuple[str, ...] = ()) -> Callable[[Keeper, str | None, dict, int], object]:
+    def handler(keeper: Keeper, project: str | None, args: dict, peer: int) -> object:
+        if keeper.state is None:
+            raise protocol.refused("state", "this keeper serves no state", "start the keeper with `keeper serve`")
+        if project is None:
+            raise protocol.refused("project", "the op needs a project id", "send the project id the driver computes")
+        return fn(keeper.state, project, _args(args, required, optional), peer)
+    return handler
+
+
+def _intake(state: KeeperState, project: str, args: dict, peer: int) -> dict:
+    text = args["data_b64"]
+    try:
+        if not isinstance(text, str):
+            raise ValueError("not text")
+        raw = base64.b64decode(text.encode("ascii"), validate=True)
+    except (ValueError, binascii.Error, UnicodeEncodeError):
+        raise protocol.refused("args.data_b64", "the data are not standard base64 text",
+                               "send the data file's bytes in standard base64") from None
+    return state.intake(project, raw, args["data_sha256"])
+
+
+def _confirm(state: KeeperState, project: str, args: dict, peer: int) -> dict:
+    values = {k: args[k] for k in ("scorer", "scorer_params", "direction", "margin") if k in args}
+    return state.confirm_metric(project, values, args["sentence"], peer)
+
+
+OPS: dict[str, Callable[[Keeper, str | None, dict, int], object]] = {
+    "hello": _hello,
+    "open_project": _state_op(lambda st, pr, a, peer: st.open_project(pr)),
+    "intake": _state_op(_intake, ("data_b64", "data_sha256")),
+    "sealed_summary": _state_op(lambda st, pr, a, peer: st.sealed_summary(pr)),
+    "confirm_metric": _state_op(_confirm, ("scorer", "direction", "margin", "sentence"), ("scorer_params",)),
+    "register": _state_op(lambda st, pr, a, peer: st.register(pr, a["registration"]), ("registration",)),
+    "registration": _state_op(lambda st, pr, a, peer: st.registration(pr, a["hash"]), ("hash",)),
+    "latest_registration": _state_op(lambda st, pr, a, peer: st.latest_registration(pr)),
+    "records": _state_op(lambda st, pr, a, peer: st.records(pr)),
+    "has_record": _state_op(lambda st, pr, a, peer: st.has_record(a["sha256"]), ("sha256",)),
+}
 
 
 # ---- transport ----------------------------------------------------------------------------------------------------
@@ -183,13 +239,6 @@ def check_start(state_dir: Path, keeper_uid: int) -> None:
         raise Refused(_capped(problems))
 
 
-def _signing_key(state_dir: Path) -> Ed25519PrivateKey:
-    path = Path(state_dir) / KEY_FILE
-    if not os.path.lexists(path):
-        signing.generate_key(path)
-    return signing.load_private_key(path)
-
-
 def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading.Event | None = None) -> int:
     """Serve until SIGTERM (or until `stop` is set, for an in-process server); 0 on a clean stop. A start that cannot
     proceed raises Refused (AN-12; AN-13 for the environment and the state directory)."""
@@ -198,12 +247,18 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
                                "run the keeper on a Linux host")
     check_start(state_dir, os.geteuid())
     socket_path = Path(socket_path)
-    _prepare_socket_path(socket_path)
-    stop = stop if stop is not None else threading.Event()
-    key = _signing_key(state_dir)
-    environment = signing.sign(key, "environment", envcheck.environment_record())
-    keeper = Keeper(state_dir, owner_uid, key=key, environment=environment)
+    state = KeeperState(state_dir, owner_uid=owner_uid)       # refuses a second keeper on this state (AN-12)
+    try:
+        _prepare_socket_path(socket_path)
+        stop = stop if stop is not None else threading.Event()
+        environment = signing.sign(state.key, "environment", envcheck.environment_record())
+        keeper = Keeper(state_dir, owner_uid, key=state.key, environment=environment, state=state)
+        return _serve_loop(keeper, socket_path, stop)
+    finally:
+        state.close()
 
+
+def _serve_loop(keeper: Keeper, socket_path: Path, stop: threading.Event) -> int:
     previous = None
     if threading.current_thread() is threading.main_thread():
         previous = signal.signal(signal.SIGTERM, lambda _sig, _frame: stop.set())
