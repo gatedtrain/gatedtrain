@@ -18,12 +18,13 @@ that a pluggable stage before it produces, and copies the sampler and the evalua
 
 Both stages take no pipeline params: their behaviour comes from the project's data, the user's decision and the
 registration, never from pipeline configuration.
+
+The split, the scoring, the gate statistics and the shared report pieces are in `sealed_eval`, which the keeper
+calls too; the stages here add the project, the trust backend and the ledger around them.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Mapping
 from importlib import metadata
@@ -32,13 +33,19 @@ from types import MappingProxyType
 from typing import Any, Callable
 
 from .. import ANALYSIS_CODE_VERSION, gates
-from ..canonical import canonical_json, file_sha256, sha256_bytes
+from ..canonical import sha256_bytes
 from ..errors import Problem, Refused
-from ..registration import check_contents, max_unpaired, min_paired, resolved_evaluator_hash
-from . import scorers
+from ..registration import check_contents, resolved_evaluator_hash
+from . import scorers, sealed_eval
 from .project import ArtifactRef, Project, _refuse_links, _utc_now, _write_atomic
 from .stage import Proposal, StageContext
 from .trust import NEW_TEST_FIX, SealedRef
+# The split, scoring, gate statistics and report pieces are shared with the keeper (`sealed_eval`); the step 1
+# names stay importable from here.
+from .sealed_eval import (DEFAULT_ALPHA, DEFAULT_MDE, DEFAULT_POWER, LIMIT_ALPHA_PER_PROJECT,  # noqa: F401
+                          LIMIT_METRIC_CONFIRMATION, LIMIT_MODEL_REFERENCE, MAX_SEALED_FRACTION, PILOT_SIGMA,
+                          PILOT_SOURCE, _num, display_block, known_limits)
+from .sealed_eval import effective_status as _effective_status, eval_seeds as _eval_seeds, headline as _headline
 
 SCHEMA_VERSION = 1
 SCHEMA_TRAIN_PART = "gatedtrain.ainative.train_part"
@@ -52,17 +59,6 @@ SCHEMA_GATE_RESULT = "gatedtrain.ainative.gate_result"
 SCHEMA_REPORT = "gatedtrain.ainative.report"
 
 MAX_DATA_BYTES = 64 * 1024 * 1024
-DEFAULT_MDE = 0.10
-DEFAULT_ALPHA = 0.05
-DEFAULT_POWER = 0.8
-# Planning SD of the paired per-item difference (candidate minus base) of two 0/1 scores: the bound when the two
-# scores are independent and each has the largest SD of a 0/1 score, 0.5, so sqrt(0.5^2 * 2) (design 05 §18.4;
-# user decision, 2026-11-20). Positively correlated arms have a smaller SD, so the plan does not under-size the
-# sealed part for them.
-PILOT_SIGMA = math.sqrt(0.5)
-PILOT_SOURCE = ("the independence bound for the SD of the paired difference of two 0/1 scores (exact match): "
-                "sqrt(0.5^2 * 2)")
-MAX_SEALED_FRACTION = 0.5
 SEALED_TEST_USED = "this project's sealed test is used; testing another candidate needs new sealed data"
 
 
@@ -77,10 +73,6 @@ def _meta(schema: str) -> dict:
 # ---------------------------------------------------------------------------
 # intake_seal
 # ---------------------------------------------------------------------------
-
-def _num(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
-
 
 def _read_data(project: Project) -> tuple[bytes, str]:
     path = Path(project.data["path"])
@@ -105,105 +97,10 @@ def _read_data(project: Project) -> tuple[bytes, str]:
     return raw, digest
 
 
-def _parse_rows(raw: bytes) -> list[tuple[int, Any, Any]]:
-    if not raw.strip():
-        raise _refuse("AN-6", "data", "the data file is empty", "add labelled rows, one JSON object per line")
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise _refuse("AN-6", "data", "the data file is not valid UTF-8", "save the file as UTF-8") from None
-    out: list[tuple[int, Any, Any]] = []
-    for n, line in enumerate(text.split("\n"), 1):
-        line = line.rstrip("\r")
-        if not line.strip():
-            continue
-        field = f"data line {n}"
-        try:
-            row = json.loads(line)
-        except ValueError:
-            raise _refuse("AN-6", field, "the line is not valid JSON", "write one JSON object per line") from None
-        if not isinstance(row, dict):
-            raise _refuse("AN-6", field, "the line is not a JSON object", 'use {"input": ..., "label": ...}')
-        extra = sorted(set(row) - {"input", "label"})
-        if extra:
-            raise _refuse("AN-6", field, f"the row has fields other than input and label ({', '.join(extra)})",
-                          'keep only "input" and "label"')
-        if "input" not in row:
-            raise _refuse("AN-6", field, "the row has no `input`", 'add an "input" (text or object)')
-        if row.get("label") is None:
-            raise _refuse("AN-6", field, "the row has no `label`; every example needs a verifiable answer or label",
-                          'add a "label" (text, number, list or object); unlabelled data cannot be sealed')
-        if not isinstance(row["input"], (str, dict)):
-            raise _refuse("AN-6", field, "`input` is neither text nor an object", "use text or an object as input")
-        # A list label is for set_f1 (design rev-23 AN-6, extended in step 2).
-        if not (isinstance(row["label"], (str, dict, list)) or _num(row["label"])):
-            raise _refuse("AN-6", field, "`label` is not text, a number, a list or an object",
-                          "use text, a number, a list or an object as label")
-        out.append((n, row["input"], row["label"]))
-    if not out:
-        raise _refuse("AN-6", "data", "the data file is empty", "add labelled rows, one JSON object per line")
-    return out
-
-
-def _canon(value: Any, field: str) -> bytes:
-    """The refusal names the row only: the encoder's own message can quote a key or a number of the data."""
-    try:
-        return canonical_json(value)
-    except ValueError:
-        raise _refuse("AN-6", field, "the row holds a value canonical JSON cannot encode (a non-finite number, an "
-                      "integer beyond 2^53 - 1, or a key or text with a character it refuses)",
-                      "use plain JSON values") from None
-
-
-def _dedup(rows: list[tuple[int, Any, Any]]) -> tuple[list[dict], int]:
-    """Unique rows in first-occurrence order, keyed by the sha256 of the canonical `input`; the same input with a
-    different label is refused. Returns (rows with `ihash`, number of exact duplicates removed)."""
-    seen: dict[str, dict] = {}
-    conflicts: list[tuple[int, int]] = []
-    removed = 0
-    for n, inp, label in rows:
-        ihash = sha256_bytes(_canon(inp, f"data line {n}"))
-        lcanon = _canon(label, f"data line {n}")
-        prior = seen.get(ihash)
-        if prior is None:
-            seen[ihash] = {"ihash": ihash, "input": inp, "label": label, "lcanon": lcanon, "line": n}
-        elif prior["lcanon"] == lcanon:
-            removed += 1
-        else:
-            conflicts.append((prior["line"], n))
-    if conflicts:
-        shown = ", ".join(f"{a} and {b}" for a, b in conflicts[:5])
-        raise _refuse("AN-6", "data", f"the same input has different labels (lines {shown}"
-                      f"{', ...' if len(conflicts) > 5 else ''})", "keep one label per distinct input")
-    return list(seen.values()), removed
-
-
-def _power_clause() -> dict:
-    return {"type": "superiority", "margin": 0.0, "planning_effect": DEFAULT_MDE, "alpha": DEFAULT_ALPHA,
-            "power": DEFAULT_POWER, "sigma_plan": "fixed"}
-
-
-def _split(project: Project) -> dict:
+def _split(project: Project, planning_alpha: float = DEFAULT_ALPHA) -> dict:
+    """`sealed_eval.split_data` of the project's data file."""
     raw, digest = _read_data(project)
-    unique, removed = _dedup(_parse_rows(raw))
-    n = len(unique)
-    if n < 2:
-        raise _refuse("AN-6", "data", "the data has fewer than 2 distinct examples, so it cannot be split",
-                      "add more labelled examples")
-    cap = int(n * MAX_SEALED_FRACTION)
-    pilot = {"sigma": PILOT_SIGMA, "source": PILOT_SOURCE}
-    needed = gates.plan(_power_clause(), pilot, n_available=cap)["n_required"]
-    n_sealed = min(needed, cap)
-    order = sorted(unique, key=lambda r: hashlib.sha256(f"{digest}:{r['ihash']}".encode()).hexdigest())
-    sealed = order[:n_sealed]
-    sealed_ids = {r["ihash"] for r in sealed}
-    train = [r for r in unique if r["ihash"] not in sealed_ids]
-    achieved = gates.plan(_power_clause(), pilot, n_available=n_sealed)["mde"]
-    return {"digest": digest, "n_unique": n, "n_removed": removed, "n_needed": needed, "n_sealed": n_sealed,
-            "mde": achieved, "conclusive": n_sealed >= needed,
-            "more": max(0, int(round(needed / MAX_SEALED_FRACTION)) - n),
-            "sealed": [{"input": r["input"], "label": r["label"]} for r in sealed],
-            "train": [{"input": r["input"], "label": r["label"]} for r in train]}
+    return sealed_eval.split_data(raw, digest, planning_alpha=planning_alpha)
 
 
 class IntakeSeal:
@@ -216,7 +113,8 @@ class IntakeSeal:
     trains = False
 
     def plan(self, ctx: StageContext) -> Proposal:
-        s = _split(ctx.project)
+        planning_alpha = ctx.ledger.planning_alpha
+        s = _split(ctx.project, planning_alpha)
         if s["conclusive"]:
             summary = (f"{s['n_unique']} distinct labelled examples: {s['n_sealed']} will be sealed for the final "
                        f"test and {len(s['train'])} are for training; the test can detect a gain of "
@@ -228,11 +126,12 @@ class IntakeSeal:
         estimate = {"n_needed": s["n_needed"], "n_sealed": s["n_sealed"], "mde": s["mde"],
                     "conclusive_expected": s["conclusive"], "n_more_examples": s["more"]}
         choices = {"n_unique": s["n_unique"], "n_duplicates_removed": s["n_removed"], "n_train": len(s["train"]),
-                   "n_needed": s["n_needed"], "mde": DEFAULT_MDE, "alpha": DEFAULT_ALPHA, "power": DEFAULT_POWER}
+                   "n_needed": s["n_needed"], "mde": DEFAULT_MDE, "alpha": planning_alpha, "power": DEFAULT_POWER}
         return Proposal(self.name, summary, choices, estimate, None if s["conclusive"] else "data_too_small")
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
-        s = _split(ctx.project)
+        planning_alpha = ctx.ledger.planning_alpha
+        s = _split(ctx.project, planning_alpha)
         if not s["conclusive"] and decision.get("accept_inconclusive") is not True:
             raise _refuse("AN-6", "decision.accept_inconclusive",
                           f"the data are too small: the final test will most likely be INCONCLUSIVE "
@@ -250,10 +149,7 @@ class IntakeSeal:
         sealed = {**_meta(SCHEMA_SEALED_SUMMARY), "n": summary["n"], "manifest_sha256": summary["manifest_sha256"],
                   "label_counts": counts, "label_counts_other": summary["n"] - sum(counts.values()),
                   "guarantee": trust.sealed_guarantee}
-        power = {**_meta(SCHEMA_POWER), "n_unique": s["n_unique"], "n_sealed": s["n_sealed"],
-                 "n_needed": s["n_needed"], "mde": s["mde"], "target_mde": DEFAULT_MDE, "alpha": DEFAULT_ALPHA,
-                 "power": DEFAULT_POWER, "sigma": PILOT_SIGMA, "conclusive_expected": s["conclusive"],
-                 "n_more_examples": s["more"]}
+        power = {**_meta(SCHEMA_POWER), **sealed_eval.power_record(s, planning_alpha=planning_alpha)}
         return {"train_part": project.write_artifact(ctx.stage or self.name, "train_part", train, SCHEMA_TRAIN_PART),
                 "sealed_summary": project.write_artifact(ctx.stage or self.name, "sealed_summary", sealed, SCHEMA_SEALED_SUMMARY),
                 "power": project.write_artifact(ctx.stage or self.name, "power", power, SCHEMA_POWER)}
@@ -710,50 +606,22 @@ def _evaluator_problem(full: dict) -> str | None:
     return None
 
 
-def _eval_seeds(full: dict) -> list:
-    seeds = (full.get("clause") or {}).get("eval_seeds")
-    if not (isinstance(seeds, list) and seeds):
-        raise _refuse("AN-8", "registration.clause.eval_seeds", "the registration has no eval_seeds",
-                      "rerun preregister")
-    return seeds
-
-
 def _score_arm(ctx: StageContext, sealed: SealedRef, fn: Callable[..., Any], model: dict, full: dict,
                spec: scorers.ScorerSpec, params: dict) -> list[dict]:
-    """Per-item records of one arm, scored with the registered scorer (`spec` bound to `params`)."""
-    sampler = full["sampler"]
+    """Per-item records of one arm, scored with the registered scorer (`spec` bound to `params`): the
+    `sealed_eval.item_scorer` of each registered seed, run by the trust backend over the sealed items."""
     score = scorers.bind(spec, params)
-    lo, hi = spec.score_range
     records: list[dict] = []
     for seed in _eval_seeds(full):
-        counter = [0]
-
-        def generate(item: dict, seed=seed) -> dict:
-            index = counter[0]
-            counter[0] += 1
-            try:
-                prediction = fn(dict(model), {"input": item["input"]}, sampler=dict(sampler), seed=seed)
-            except Exception as exc:       # never carry the item (or the pack's message about it) out
-                raise _refuse("AN-8", "generate", f"the generation function failed ({type(exc).__name__})",
-                              "fix the scenario pack's generate") from None
-            try:
-                value = score(prediction, item["label"])
-            except Exception as exc:       # a pack scorer's message may quote the label: class name only
-                raise _refuse("AN-8", "score", f"the scorer failed ({type(exc).__name__})",
-                              "fix the scorer of the scenario pack") from None
-            if not (_num(value) and math.isfinite(value) and lo <= value <= hi):
-                raise _refuse("AN-8", "score", f"the scorer {spec.name} returned a value that is not a number in its "
-                              f"range [{lo:g}, {hi:g}]", "fix the scorer of the scenario pack")
-            return {"item_id": index, "seed": seed, "score": float(value)}
-
-        records.extend(ctx.trust.run_sealed(sealed, generate))
+        records.extend(ctx.trust.run_sealed(sealed, sealed_eval.item_scorer(
+            fn, model, full, score, seed, score_range=spec.score_range, scorer_name=spec.name)))
     return records
 
 
 class EvaluateSealed:
     """AN-8: scores the sealed items with exactly the registered sampler and eval_seeds and the registered scorer
     only. What leaves the trust backend is one `{item_id, seed, score}` record per item and seed (`item_id` is the item's
-    position in the backend's item order, counted by `_score_arm` for each seed, not a content hash). In step 1 the operator process can still read the sealed items; the
+    position in the backend's item order, counted by `sealed_eval.item_scorer` for each seed, not a content hash). In step 1 the operator process can still read the sealed items; the
     guarantee is stated (`sealed_guarantee`), not enforced.
 
     A project has one sealed scoring: before scoring, `run` claims it in the trust store for the candidate's model
@@ -880,19 +748,6 @@ def _attempt_key(project: Project, stage: str) -> str:
     return key
 
 
-def _convert(rec: Any, seeds: list) -> Any:
-    """A sealed record as an `evaluate_items` record. A row that is not a well formed record is passed on as it is
-    (or with the fields it lacks left out), so the gate counts it as missing instead of dropping it."""
-    if not isinstance(rec, dict):
-        return rec
-    out = {k: v for k, v in rec.items() if k != "item_id"}
-    if "item_id" in rec:
-        out["item"] = rec["item_id"]
-    seed = rec.get("seed")
-    out["repeat"] = seeds.index(seed) if isinstance(seed, int) and seed in seeds else -1
-    return out
-
-
 def _arm(project: Project, ref: ArtifactRef, reg: dict, seeds: list, n_sealed: int, ev_row: dict | None) -> dict:
     rec = project.read_artifact(ref)
     if not isinstance(rec, dict) or not isinstance(rec.get("records"), list):
@@ -910,7 +765,7 @@ def _arm(project: Project, ref: ArtifactRef, reg: dict, seeds: list, n_sealed: i
     if rec.get("n_items") != n_sealed:
         raise _refuse("AN-9", f"inputs.{ref.name}", "the records do not cover the registered sealed set size",
                       "rerun evaluate_sealed")
-    return {"records": [_convert(r, seeds) for r in rec["records"]], "model_manifest_hash": rec.get("model_ref_sha256")}
+    return {"records": rec["records"], "model_ref_sha256": rec.get("model_ref_sha256")}
 
 
 class Gate:
@@ -956,18 +811,12 @@ class Gate:
         expected = {"baseline": registered_base(full), "candidate": cand_model}
         attempt_id = _attempt_key(ctx.project, ctx.stage or self.name)
         alpha = ctx.ledger.spend(attempt_id)                      # the ledger decides alpha, not the registration
-        clause["alpha"] = alpha
-        boot = full["bootstrap"]
         try:
-            result = gates.evaluate_items(clause, base, cand, items=list(range(n_sealed)),
-                                          seed=int(boot["seed"]), n_boot=int(boot["replicates"]),
-                                          min_paired=min_paired(full), max_unpaired=max_unpaired(full),
-                                          score_range=found[0].score_range, expected_models=expected)
+            result = sealed_eval.decide(full, base, cand, alpha=alpha, n_sealed=n_sealed, expected_models=expected,
+                                        score_range=found[0].score_range)
         except Exception:
             ctx.ledger.record(attempt_id, False)
             raise
-        if reg["post_hoc"] is True:
-            result = gates.apply_post_hoc(result)
         ctx.ledger.record(attempt_id, result["status"] == gates.PASS)
         doc = {**_meta(SCHEMA_GATE_RESULT), **result, "alpha": alpha, "attempt_id": attempt_id,
                "registration_hash": reg["hash"], "post_hoc": bool(reg["post_hoc"])}
@@ -998,48 +847,6 @@ class Gate:
 
 _LOGGED_STAGES = ("evaluate_sealed", "gate")      # every attempt row (start, done, failed, refused) goes in the report
 REPORT_MD = "report.md"
-
-
-LIMIT_ALPHA_PER_PROJECT = ("the alpha is per project in step 1: a new project on the same data gets a fresh alpha "
-                           "and the same sealed split, so its test would not be independent of this one (step 2 keys "
-                           "the alpha by the sealed set)")
-LIMIT_MODEL_REFERENCE = ("a model reference must content-address its weights; step 1 does not check this, so after a "
-                         "retrain the gate records may describe weights the reference no longer points to")
-LIMIT_METRIC_CONFIRMATION = ("the metric confirmation is the decision flag metric_confirmed, set by whoever runs the "
-                             "stages; step 1 has no separate channel that shows the sentence to the user")
-
-
-def known_limits(guarantee: str, attempts: list[dict]) -> list[dict]:
-    """The report's known limits, from constants and records: the backend's guarantee, the per-project alpha, the
-    metric confirmation flag, that model references must content-address their weights, and the number of
-    `evaluate_sealed` attempts in the attempt log (refused ones too)."""
-    n = sum(1 for a in attempts if a.get("stage") == "evaluate_sealed" and a.get("event") == "start")
-    return [{"id": "sealed_guarantee", "text": guarantee},
-            {"id": "alpha_per_project", "text": LIMIT_ALPHA_PER_PROJECT},
-            {"id": "metric_confirmation", "text": LIMIT_METRIC_CONFIRMATION},
-            {"id": "model_reference", "text": LIMIT_MODEL_REFERENCE},
-            {"id": "sealed_evaluations", "attempts": n,
-             "text": f"the sealed set was scored in {n} evaluate_sealed attempt{'' if n == 1 else 's'} (refused "
-                     "attempts included); one project allows one scoring of the sealed set"}]
-
-
-def _round(x: Any) -> Any:
-    return round(x, 4) if isinstance(x, float) else x
-
-
-def _effective_status(status: str, post_hoc: bool) -> str:
-    return "INCONCLUSIVE" if post_hoc and status == gates.PASS else status
-
-
-def _headline(status: str, post_hoc: bool) -> str:
-    status = _effective_status(status, post_hoc)
-    if post_hoc:
-        return f"# {status}: post hoc, not a confirmed gain"
-    said = {gates.PASS: "the new model beats the base model by more than the registered margin",
-            gates.FAIL: "the new model does not beat the base model by the registered margin",
-            gates.INCONCLUSIVE: "the sealed test cannot tell whether the new model is better",
-            gates.MISSING: "the sealed records are incomplete, so no verdict"}
-    return f"# {status}: {said.get(status, 'no verdict')}"
 
 
 def render_markdown(report: dict) -> str:
@@ -1124,10 +931,7 @@ class Report:
                 "registration": {k: reg.get(k) for k in _REG_KEYS},
                 "power": {k: v for k, v in power.items() if k not in keep},
                 "gate_result": {k: v for k, v in gate.items() if k not in keep},
-                "display": {"effect": _round(gate["delta_hat_natural"]), "ci_lower": _round(gate["ci_lower_natural"]),
-                            "ci_upper": _round(gate["ci_upper_natural"]), "ci_level": _round(gate["ci_level"]),
-                            "baseline_score": _round(gate["baseline_score"]),
-                            "candidate_score": _round(gate["candidate_score"]), "mde_planned": _round(power["mde"])},
+                "display": display_block(gate, power),
                 "ledger": ctx.ledger.entries(), "attempts": attempts,
                 "sealed_guarantee": ctx.trust.sealed_guarantee,
                 "known_limits": known_limits(ctx.trust.sealed_guarantee, attempts)}
