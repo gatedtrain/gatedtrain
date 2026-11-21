@@ -259,7 +259,11 @@ class Smoke(_Base):
 
 
 class Train(_Base):
-    """Declares the `gpu` need (to exercise the order rule) and `trains`, but fits a table on the CPU."""
+    """Declares the `gpu` need (to exercise the order rule) and `trains`, but fits a table on the CPU.
+
+    Test only: the decision key `noise_override` (a number from 0 to 1) fits with that noise instead of the recipe's,
+    so a test can make a second candidate in one project without editing the pipeline, whose hash the project pins
+    (preflight finding 1). A real pack has no such key."""
 
     name = "train"
     inputs = {"train_set": SCHEMA_TRAIN_PART, "recipe": SCHEMA_RECIPE, "smoke": SCHEMA_SMOKE}
@@ -277,9 +281,13 @@ class Train(_Base):
             raise _refuse("MM-38", "inputs.smoke", "the smoke run did not pass", "rerun smoke")
         recipe = _read(ctx, "recipe")
         rows = _rows(_read(ctx, "train_set"), "train_set")
+        noise = decision.get("noise_override", recipe["noise"])
+        if isinstance(noise, bool) or not isinstance(noise, (int, float)) or not 0 <= noise <= 1:
+            raise _refuse("SYN-1", "decision.noise_override", f"noise_override {noise!r} is not a number from 0 to 1",
+                          "leave it out, or give the share of training labels to corrupt")
         model = {**_meta(SCHEMA_MODEL_REF), "generator": GENERATOR, "label": "candidate",
-                 "noise": recipe["noise"], "n_train": len(rows),
-                 "table": fit(rows, recipe["noise"], recipe["noise_seed"])}
+                 "noise": noise, "n_train": len(rows),
+                 "table": fit(rows, noise, recipe["noise_seed"])}
         return {"model": ctx.project.write_artifact(ctx.stage or self.name, "model", model, SCHEMA_MODEL_REF)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:

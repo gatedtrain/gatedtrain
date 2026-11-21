@@ -21,6 +21,16 @@ registration, never from pipeline configuration.
 
 The split, the scoring, the gate statistics and the shared report pieces are in `sealed_eval`, which the keeper
 calls too; the stages here add the project, the trust backend and the ledger around them.
+
+Keeper mode (`ctx.trust.mode == "keeper"`, AN-8 to AN-10, AN-14): each stage becomes a request to the keeper and
+writes the same schema ids at `schema_version` 2. `intake_seal` sends the data file and writes the training part,
+sealed summary and power record the keeper returned (the user's `accept_inconclusive` decision goes with it);
+`preregister` registers at the fixed planning alpha with the alpha rule named in `signed_by` (the test level of each
+attempt is set by alpha-investing; a registration takes no new key) and adds the registration's `envelope_sha256`;
+`evaluate_sealed` asks the keeper for a sealed attempt and writes per-arm receipts (no records: they stay in the
+keeper); `gate` copies the keeper's signed gate summary (status and alpha only) with its `envelope_sha256`; `report`
+verifies every receipt, copies the keeper's signed report and renders `report.md` from it. The in-process path is
+unchanged.
 """
 
 from __future__ import annotations
@@ -36,7 +46,8 @@ from .. import ANALYSIS_CODE_VERSION, gates
 from ..canonical import sha256_bytes
 from ..errors import Problem, Refused
 from ..registration import check_contents, resolved_evaluator_hash
-from . import scorers, sealed_eval
+from . import alpha_investing, scorers, sealed_eval, signing
+from .keeper import texts as keeper_texts
 from .project import ArtifactRef, Project, _refuse_links, _utc_now, _write_atomic
 from .stage import Proposal, StageContext
 from .trust import NEW_TEST_FIX, SealedRef
@@ -48,6 +59,12 @@ from .sealed_eval import (DEFAULT_ALPHA, DEFAULT_MDE, DEFAULT_POWER, LIMIT_ALPHA
 from .sealed_eval import effective_status as _effective_status, eval_seeds as _eval_seeds, headline as _headline
 
 SCHEMA_VERSION = 1
+KEEPER_SCHEMA_VERSION = 2          # the keeper-mode records of the same schema ids
+# The registration field that names the alpha rule in keeper mode (preflight finding 13): `signed_by` names the signer,
+# which under the keeper is the keeper, and the rule it sets each attempt's test level by.
+KEEPER_SIGNED_BY = f"gatedtrain-keeper (alpha rule: {alpha_investing.RULE})"
+RECEIPT_KEYS = frozenset({"schema", "schema_version", "arm", "held_by", "attempt_id", "registration_hash",
+                          "item_set_hash", "model_ref_sha256", "claim_sha256"})
 SCHEMA_TRAIN_PART = "gatedtrain.ainative.train_part"
 SCHEMA_SEALED_SUMMARY = "gatedtrain.ainative.sealed_summary"
 SCHEMA_POWER = "gatedtrain.ainative.power"
@@ -66,8 +83,12 @@ def _refuse(rule: str, field: str, message: str, fix: str) -> Refused:
     return Refused([Problem(rule, field, message, fix)])
 
 
-def _meta(schema: str) -> dict:
-    return {"schema": schema, "schema_version": SCHEMA_VERSION}
+def _meta(schema: str, version: int = SCHEMA_VERSION) -> dict:
+    return {"schema": schema, "schema_version": version}
+
+
+def _keeper(ctx: StageContext) -> bool:
+    return getattr(ctx.trust, "mode", None) == "keeper"
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +151,8 @@ class IntakeSeal:
         return Proposal(self.name, summary, choices, estimate, None if s["conclusive"] else "data_too_small")
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
+        if _keeper(ctx):
+            return self._run_keeper(ctx, decision)
         planning_alpha = ctx.ledger.planning_alpha
         s = _split(ctx.project, planning_alpha)
         if not s["conclusive"] and decision.get("accept_inconclusive") is not True:
@@ -154,6 +177,26 @@ class IntakeSeal:
                 "sealed_summary": project.write_artifact(ctx.stage or self.name, "sealed_summary", sealed, SCHEMA_SEALED_SUMMARY),
                 "power": project.write_artifact(ctx.stage or self.name, "power", power, SCHEMA_POWER)}
 
+    def _run_keeper(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
+        """The keeper splits and seals (AN-6, AN-16); the records are the ones it returned. Too small data are refused
+        by the keeper unless the user accepted an INCONCLUSIVE test."""
+        raw, digest = _read_data(ctx.project)
+        res = ctx.trust.intake(raw, digest, accept_inconclusive=decision.get("accept_inconclusive") is True)
+        rows = res.get("train_rows") if isinstance(res, dict) else None
+        summary, power = (res.get("sealed_summary"), res.get("power")) if isinstance(res, dict) else (None, None)
+        if not (isinstance(rows, list) and isinstance(summary, dict) and isinstance(power, dict)
+                and summary.get("schema") == SCHEMA_SEALED_SUMMARY and power.get("schema") == SCHEMA_POWER
+                and summary.get("schema_version") == power.get("schema_version") == KEEPER_SCHEMA_VERSION
+                and summary.get("manifest_sha256") == res.get("sealed_id")):
+            raise _refuse("AN-6", "intake", "the keeper's intake result is malformed", "check the keeper")
+        _, removed = sealed_eval.dedup(sealed_eval.parse_rows(raw))
+        train = {**_meta(SCHEMA_TRAIN_PART, KEEPER_SCHEMA_VERSION), "n": len(rows), "n_duplicates_removed": removed,
+                 "data_sha256": digest, "rows": rows}
+        stage = ctx.stage or self.name
+        return {"train_part": ctx.project.write_artifact(stage, "train_part", train, SCHEMA_TRAIN_PART),
+                "sealed_summary": ctx.project.write_artifact(stage, "sealed_summary", summary, SCHEMA_SEALED_SUMMARY),
+                "power": ctx.project.write_artifact(stage, "power", power, SCHEMA_POWER)}
+
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         problems: list[Problem] = []
 
@@ -176,6 +219,10 @@ class IntakeSeal:
             bad("sealed_summary.manifest_sha256", "the manifest hash is not sha256:<64 hex>")
         if power.get("conclusive_expected") != (power.get("n_sealed", 0) >= power.get("n_needed", 1)):
             bad("power.conclusive_expected", "the flag does not match n_sealed and n_needed")
+        if _keeper(ctx) and ({r.get("schema_version") for r in (train, sealed, power)} != {KEEPER_SCHEMA_VERSION}
+                             or power.get("alpha") != ctx.ledger.planning_alpha
+                             or sealed.get("guarantee") != ctx.trust.sealed_guarantee):
+            bad("outputs", "the records are not the keeper's intake at the planning alpha with its guarantee")
         return problems
 
 
@@ -226,7 +273,9 @@ def _values(ctx: StageContext, decision: dict) -> dict:
     if not _num(margin) or not 0 <= margin <= MAX_MARGIN:
         raise _refuse7("decision.margin", f"margin {margin!r} is not a number from 0 to {MAX_MARGIN}",
                        "give the smallest gain that counts, as a fraction of the score (0.05 is 5 points)")
-    alpha = ctx.ledger.available()
+    # Under the keeper the registration carries the fixed planning alpha: the test level of each attempt is set by
+    # alpha-investing at the gate, so a rerun after an attempt registers the same content (preflight finding 13).
+    alpha = ctx.ledger.planning_alpha if _keeper(ctx) else ctx.ledger.available()
     if not _num(alpha) or not 0 < alpha < 0.5:
         raise _refuse7("alpha", f"no alpha is available to register (available: {alpha!r})",
                        NEW_TEST_FIX)
@@ -261,8 +310,12 @@ def _intake_sigma(ctx: StageContext) -> float:
     return float(sigma)
 
 
-def _sentence(v: dict, n_sealed: int) -> str:
+def _sentence(v: dict, n_sealed: int, keeper: bool = False) -> str:
     points = f"{v['margin'] * 100:g}"
+    if keeper:
+        return (f"I will count {scorers.resolve(v['scorer']).what}; the new model must beat the base model by more "
+                f"than {points} points on {n_sealed} sealed items; the test level of each attempt is set by "
+                f"alpha-investing ({alpha_investing.GUARANTEE}), {v['alpha']:g} for the first attempt.")
     return (f"I will count {scorers.resolve(v['scorer']).what}; the new model must beat the base model by more than "
             f"{points} points, tested at the {v['alpha']:g} significance level on {n_sealed} sealed items.")
 
@@ -284,14 +337,15 @@ def registered_base(full: dict) -> str | None:
 
 
 def _registration(v: dict, item_set_hash: str, dep: dict, base_sha: str, served: tuple[str, str] | None = None,
-                  evaluator: dict | None = None) -> dict:
-    """`evaluator` is the `scorers.evaluator_entry` of the scorer; absent, exact match without parameters."""
+                  evaluator: dict | None = None, signed_by: str = "prototype-unsigned") -> dict:
+    """`evaluator` is the `scorers.evaluator_entry` of the scorer; absent, exact match without parameters.
+    `signed_by` is `KEEPER_SIGNED_BY` in keeper mode."""
     if evaluator is None:
         evaluator = scorers.evaluator_entry(scorers.library()[DEFAULT_SCORER], {})
     return {
         "registration_version": 1,
         "registration_id": f"ainative-{item_set_hash.removeprefix('sha256:')[:16]}",
-        "signed_by": "prototype-unsigned",
+        "signed_by": signed_by,
         "workflow": "ainative",
         "gate": "quality_gate",
         "clause": {"type": "superiority", "metric": v["scorer"], "direction": v["direction"], "margin": v["margin"],
@@ -360,7 +414,7 @@ class Preregister:
         v = _values(ctx, {})
         n = _sealed_summary(ctx)["n"]
         choices = {**v, "available_scorers": _available_scorers(), "n_sealed": n}
-        return Proposal(self.name, _sentence(v, n), choices, {}, "confirm_metric")
+        return Proposal(self.name, _sentence(v, n, _keeper(ctx)), choices, {}, "confirm_metric")
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
         if decision.get("metric_confirmed") is not True:
@@ -393,7 +447,8 @@ class Preregister:
             raise _refuse7("inputs.base_model.generator", f"no installed scenario pack serves the generator {gen!r}",
                            "install the scenario pack that serves the base model, or fix the model reference")
         base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, (pack, gen),
-                             scorers.evaluator_entry(spec, params))
+                             scorers.evaluator_entry(spec, params),
+                             KEEPER_SIGNED_BY if _keeper(ctx) else "prototype-unsigned")
         problems = check_contents(base)
         if problems:
             raise Refused(problems)
@@ -412,6 +467,9 @@ class Preregister:
         out = {**_meta(SCHEMA_REGISTRATION), "hash": digest, "scorer": v["scorer"], "direction": v["direction"],
                "margin": v["margin"], "alpha": v["alpha"], "item_set_hash": item_hash, "post_hoc": post_hoc,
                "amends": amends}
+        if _keeper(ctx):                     # the keeper signed it (AN-14); the project keeps the envelope's hash
+            out = {**out, "schema_version": KEEPER_SCHEMA_VERSION,
+                   "envelope_sha256": signing.envelope_sha256(ctx.trust.registration_envelope(digest))}
         return {"registration": ctx.project.write_artifact(ctx.stage or self.name, "registration", out, SCHEMA_REGISTRATION)}
 
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
@@ -442,6 +500,9 @@ class Preregister:
             bad("registration.base_model", "the registered base model is not the base model input")
         if bool(full.get("post_hoc", False)) != out.get("post_hoc"):
             bad("registration.post_hoc", "the output record and the registration disagree on post_hoc")
+        if _keeper(ctx) and (out.get("schema_version") != KEEPER_SCHEMA_VERSION or out.get("envelope_sha256") !=
+                             signing.envelope_sha256(ctx.trust.registration_envelope(out["hash"]))):
+            bad("registration.envelope_sha256", "the record does not name the keeper's signed registration")
         return problems
 
 
@@ -642,6 +703,11 @@ class EvaluateSealed:
     def plan(self, ctx: StageContext) -> Proposal:
         _, full = _registered(ctx, "AN-8")
         n_seeds = len(_eval_seeds(full))
+        if _keeper(ctx):
+            return Proposal(self.name, f"ask the keeper to score the sealed items for both models with the registered "
+                            f"sampler on {n_seeds} evaluation seeds; the keeper first spends alpha "
+                            f"{ctx.ledger.available():g} on this attempt, and the per-item records stay in the keeper",
+                            {}, {})
         return Proposal(self.name, f"score the sealed items for both models with the registered sampler on "
                         f"{n_seeds} evaluation seeds; only per-item scores leave the trust backend", {}, {})
 
@@ -669,6 +735,8 @@ class EvaluateSealed:
         if served is None:
             raise _refuse("AN-8", "registration.base_model", "the registration names no scenario pack and generator",
                           "register again with preregister, with a base model whose `generator` a scenario pack serves")
+        if _keeper(ctx):
+            return self._run_keeper(ctx, reg, served[1], item_set)
         fn = scenario_generators().get(served[1])
         if fn is None or scenario_pack_of(served[1]) != served[0]:
             raise _refuse("AN-8", "registration.base_model.generator",
@@ -713,12 +781,43 @@ class EvaluateSealed:
                                                                 SCHEMA_SEALED_RECORDS)
         return out
 
+    def _run_keeper(self, ctx: StageContext, reg: dict, generator: str, item_set: str) -> dict[str, ArtifactRef]:
+        """One sealed attempt in the keeper (AN-8, AN-15): it spends alpha, signs the claim and scores; the project
+        gets a receipt per arm that names the claim, never a record."""
+        models: dict[str, tuple[dict, str]] = {}
+        for arm in ("baseline", "candidate"):
+            ref = ctx.inputs[f"{arm}_model"]
+            model = ctx.project.read_artifact(ref)
+            if not isinstance(model, dict):
+                raise _refuse("AN-8", f"inputs.{arm}_model", "the model reference is malformed", "rerun its stage")
+            if model.get("generator") != generator:
+                raise _refuse("AN-8", f"inputs.{arm}_model.generator",
+                              f"the {arm} model names the generator {model.get('generator')!r}, not the registered "
+                              f"{generator!r}", "both models must be served by the registered generator")
+            models[arm] = (model, ref.sha256)
+        claim = ctx.trust.evaluate(reg["hash"], models["baseline"], models["candidate"])
+        env = ctx.trust.receipt("claim", attempt_id=claim["attempt_id"])
+        out: dict[str, ArtifactRef] = {}
+        for arm in ("baseline", "candidate"):
+            doc = {**_meta(SCHEMA_SEALED_RECORDS, KEEPER_SCHEMA_VERSION), "arm": arm, "held_by": "keeper",
+                   "attempt_id": claim["attempt_id"], "registration_hash": reg["hash"], "item_set_hash": item_set,
+                   "model_ref_sha256": models[arm][1], "claim_sha256": signing.envelope_sha256(env)}
+            out[f"{arm}_records"] = ctx.project.write_artifact(ctx.stage or self.name, f"{arm}_records", doc,
+                                                                SCHEMA_SEALED_RECORDS)
+        return out
+
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         problems: list[Problem] = []
 
         def bad(field: str, message: str) -> None:
             problems.append(Problem("AN-8", field, message, "rerun evaluate_sealed"))
 
+        if _keeper(ctx):
+            try:
+                _receipts(ctx, outputs["baseline_records"], outputs["candidate_records"], None)
+            except Refused as exc:
+                problems.extend(exc.problems)
+            return problems
         counts = set()
         for arm in ("baseline", "candidate"):
             rec = ctx.project.read_artifact(outputs[f"{arm}_records"])
@@ -734,6 +833,35 @@ class EvaluateSealed:
         if len(counts) > 1:
             bad("n_items", "the two arms have different numbers of items")
         return problems
+
+
+def _receipts(ctx: StageContext, base_ref: ArtifactRef, cand_ref: ArtifactRef, reg: dict | None) -> dict:
+    """Keeper mode: the claim record the two arm receipts name, checked (AN-8, AN-14): exactly the receipt keys, one
+    attempt and claim, the claim envelope among the project's receipts with the same registration and models, and,
+    with `reg`, the registered item set and registration."""
+    recs = {}
+    for arm, ref in (("baseline", base_ref), ("candidate", cand_ref)):
+        rec = ctx.project.read_artifact(ref)
+        if not (isinstance(rec, dict) and set(rec) == RECEIPT_KEYS and rec["arm"] == arm and rec["held_by"] == "keeper"
+                and rec["schema_version"] == KEEPER_SCHEMA_VERSION):
+            raise _refuse("AN-8", f"{arm}_records", "the record is not a keeper receipt of this arm",
+                          "rerun evaluate_sealed")
+        recs[arm] = rec
+    base, cand = recs["baseline"], recs["candidate"]
+    if any(base[k] != cand[k] for k in ("attempt_id", "registration_hash", "item_set_hash", "claim_sha256")):
+        raise _refuse("AN-8", "candidate_records", "the two receipts name different attempts", "rerun evaluate_sealed")
+    if reg is not None and (cand["registration_hash"] != reg["hash"] or cand["item_set_hash"] != reg["item_set_hash"]):
+        raise _refuse("AN-9", "candidate_records", "the receipts were not made for the registered item set",
+                      "rerun evaluate_sealed on the latest registration")
+    env = ctx.trust.receipt("claim", attempt_id=cand["attempt_id"])
+    claim = env["record"] if env is not None else {}
+    if env is None or signing.envelope_sha256(env) != cand["claim_sha256"] or \
+            claim.get("registration_hash") != cand["registration_hash"] or \
+            claim.get("baseline_model_sha256") != base["model_ref_sha256"] or \
+            claim.get("candidate_model_sha256") != cand["model_ref_sha256"]:
+        raise _refuse("AN-14", "candidate_records.claim_sha256", "the receipts do not name a claim the keeper signed "
+                      "for these models", "rerun evaluate_sealed; do not edit the receipts")
+    return claim
 
 
 def _attempt_key(project: Project, stage: str) -> str:
@@ -783,10 +911,16 @@ class Gate:
 
     def plan(self, ctx: StageContext) -> Proposal:
         reg, _ = _registered(ctx, "AN-9")
+        if _keeper(ctx):
+            return Proposal(self.name, "ask the keeper to test the new model against the base model at the alpha it "
+                            "granted the attempt; the project gets the signed status and alpha",
+                            {"registration": reg["hash"]}, {})
         return Proposal(self.name, f"test the new model against the base model on the sealed records at alpha "
                         f"{ctx.ledger.available():g}; this spends the alpha budget", {"registration": reg["hash"]}, {})
 
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
+        if _keeper(ctx):
+            return self._run_keeper(ctx)
         available = ctx.ledger.available()
         if not (_num(available) and available > 0):
             raise _refuse("AN-9", "gate", "the alpha budget is spent: step 1 allows one gate test per project",
@@ -822,6 +956,29 @@ class Gate:
                "registration_hash": reg["hash"], "post_hoc": bool(reg["post_hoc"])}
         return {"gate_result": ctx.project.write_artifact(ctx.stage or self.name, "gate_result", doc, SCHEMA_GATE_RESULT)}
 
+    def _run_keeper(self, ctx: StageContext) -> dict[str, ArtifactRef]:
+        """The keeper gates the attempt the receipts name at the alpha it granted and settles the ledger (AN-9,
+        AN-15); the project gets the signed summary: status and alpha only."""
+        reg, _ = _registered(ctx, "AN-9")
+        ev_row = _done_row(ctx.project, "evaluate_sealed")
+        if ev_row is None:
+            raise _refuse("AN-9", "inputs", "evaluate_sealed has no done record", "run evaluate_sealed first")
+        for arm in ("baseline", "candidate"):
+            ref = ctx.inputs[f"{arm}_records"]
+            recorded = (ev_row.get("outputs") or {}).get(ref.name)
+            if not isinstance(recorded, dict) or recorded.get("sha256") != ref.sha256:
+                raise _refuse("AN-9", f"inputs.{ref.name}", "the receipts are not the ones evaluate_sealed recorded",
+                              "wire the records from the evaluate_sealed stage and rerun it")
+        claim = _receipts(ctx, ctx.inputs["baseline_records"], ctx.inputs["candidate_records"], reg)
+        summary = ctx.trust.gate(claim["attempt_id"])
+        if summary.get("registration_hash") != reg["hash"] or summary.get("post_hoc") is not reg["post_hoc"]:
+            raise _refuse("AN-9", "gate", "the keeper gated the attempt under another registration",
+                          "rerun evaluate_sealed on the latest registration")
+        env = ctx.trust.receipt("gate_summary", attempt_id=claim["attempt_id"])
+        doc = {**_meta(SCHEMA_GATE_RESULT, KEEPER_SCHEMA_VERSION), **summary,
+               "envelope_sha256": signing.envelope_sha256(env)}
+        return {"gate_result": ctx.project.write_artifact(ctx.stage or self.name, "gate_result", doc, SCHEMA_GATE_RESULT)}
+
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         res = ctx.project.read_artifact(outputs["gate_result"])
         reg, _ = _registered(ctx, "AN-9")
@@ -838,6 +995,12 @@ class Gate:
             bad("gate_result.post_hoc", "the result disagrees with the registration on post_hoc")
         if reg["post_hoc"] is True and res.get("status") == gates.PASS:
             bad("gate_result.status", "a post hoc registration cannot PASS")
+        if _keeper(ctx):
+            env = ctx.trust.receipt("gate_summary", attempt_id=res.get("attempt_id"))
+            body = {k: v for k, v in res.items() if k not in ("schema", "schema_version", "envelope_sha256")}
+            if env is None or signing.envelope_sha256(env) != res.get("envelope_sha256") or env["record"] != body:
+                bad("gate_result.envelope_sha256", "the result is not the gate summary the keeper signed")
+            return problems
         entry = [e for e in ctx.ledger.entries() if e["attempt_id"] == res.get("attempt_id")]
         if len(entry) != 1 or entry[0]["alpha"] != res.get("alpha") or \
                 entry[0]["passed"] is not (res.get("status") == gates.PASS):
@@ -974,8 +1137,24 @@ class Report:
                 "sealed_guarantee": ctx.trust.sealed_guarantee,
                 "known_limits": known_limits(ctx.trust.sealed_guarantee, attempts)}
 
+    @staticmethod
+    def _build_keeper(ctx: StageContext) -> dict:
+        """The keeper's signed report (`schema_version` 2), after every receipt in the project verified (AN-14)."""
+        reg, _ = _registered(ctx, "AN-10")
+        gate = ctx.project.read_artifact(ctx.inputs["gate_result"])
+        if gate.get("registration_hash") != reg["hash"] or gate.get("post_hoc") is not reg["post_hoc"]:
+            raise _refuse("AN-10", "inputs.gate_result", "the gate result is not for the latest registration",
+                          "rerun report with the gate result of the latest registration")
+        ctx.trust.receipts()
+        report = ctx.trust.report()
+        if report.get("schema") != SCHEMA_REPORT or report.get("schema_version") != KEEPER_SCHEMA_VERSION or \
+                gate.get("attempt_id") not in [a.get("attempt_id") for a in report.get("attempts") or []]:
+            raise _refuse("AN-10", "report", "the keeper's report does not cover this project's gate result",
+                          "check the keeper")
+        return report
+
     def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
-        report = self._build(ctx)
+        report = self._build_keeper(ctx) if _keeper(ctx) else self._build(ctx)
         ref = ctx.project.write_artifact(ctx.stage or self.name, "report", report, SCHEMA_REPORT)
         rel = f"stages/{ctx.stage or self.name}/{REPORT_MD}"
         _refuse_links(ctx.project.root, rel)
@@ -1000,8 +1179,16 @@ class Report:
             problems.append(Problem("AN-10", "report.status", "the report status differs from the gate result",
                                     "rerun report"))
         limits = report.get("known_limits")
+        if _keeper(ctx):
+            env = ctx.trust.receipt("report")
+            if env is None or env["record"] != report:
+                problems.append(Problem("AN-10", "report", "report.json is not the report the keeper signed",
+                                        "rerun report; do not edit report.json"))
+            want = keeper_texts.known_limits(ctx.trust.sealed_guarantee, len(report.get("ledger") or []))
+        else:
+            want = known_limits(ctx.trust.sealed_guarantee, report.get("attempts") or [])
         if report.get("sealed_guarantee") != ctx.trust.sealed_guarantee or not isinstance(limits, list) or \
-                limits != known_limits(ctx.trust.sealed_guarantee, report.get("attempts") or []):
+                limits != want:
             problems.append(Problem("AN-10", "report.sealed_guarantee",
                                     "the report does not state the trust backend's guarantee and the known limits "
                                     "built from the records", "rerun report"))

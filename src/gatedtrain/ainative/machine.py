@@ -24,6 +24,12 @@ stage that is stale only because of upstream changes reruns without the flag.
 
 The alpha ledger claims its single spend before it writes the ledger line; a crash in between leaves the budget
 spent (`available()` stays 0.0) instead of risking a second spend.
+
+The trust backend and the ledger come from `backends(project)` unless the caller passes them: the keeper pair
+(`KeeperTrust`, `KeeperAlphaLedger`) when the project has a keeper binding, else the step 1 pair. They are resolved
+before the `start` line, so a refused binding (a keeper that is unreachable or serves another key, or keeper records
+without a binding) leaves no attempt behind. A keeper's spend shows as new lines in the project's keeper receipts,
+which count as a side effect like the step 1 ledger.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from ..errors import Problem, Refused
 from .pipeline import PipelineSpec, StageRef, _is_training, load_pipeline, pipeline_problems
 from .project import ArtifactRef, Project, _utc_now
 from .stage import Proposal, StageContext, stage_registry
+from .keeper_trust import KEEPER_BINDING, RECEIPTS, KeeperAlphaLedger, KeeperTrust, keeper_records
 from .trust import AlphaLedger, FixedAlphaLedger, InProcessTrust, TrustBackend
 
 
@@ -213,10 +220,33 @@ def _key(sref: StageRef, version: str, inputs: dict[str, ArtifactRef], decision:
                       "use plain JSON values") from None
 
 
-def _context(project: Project, sref: StageRef, inputs: dict[str, ArtifactRef], trust: TrustBackend | None,
-             ledger: AlphaLedger | None) -> StageContext:
-    return StageContext(project, inputs, dict(sref.params), trust if trust is not None else InProcessTrust(project),
-                        ledger if ledger is not None else FixedAlphaLedger(project), sref.name)
+def backends(project: Project) -> tuple[TrustBackend, AlphaLedger]:
+    """The trust backend and alpha ledger of the project: the keeper pair when `trust/keeper.json` exists (its keeper
+    must answer with the bound key: an unreachable keeper refuses, AN-12, another key refuses, AN-14; never a fall
+    back), else the step 1 pair. A project that holds keeper-mode records but no binding refuses (AN-14): running it
+    in process would silently drop the keeper's guarantee."""
+    if (project.root / KEEPER_BINDING).exists() or (project.root / KEEPER_BINDING).is_symlink():
+        trust = KeeperTrust(project)
+        trust.check()
+        return trust, KeeperAlphaLedger(trust)
+    if keeper_records(project):
+        raise Refused([Problem("AN-14", KEEPER_BINDING, "the project holds keeper records but its keeper binding is "
+                               "missing, so it cannot go on in process",
+                               "restore trust/keeper.json; a keeper project stays with its keeper")])
+    return InProcessTrust(project), FixedAlphaLedger(project)
+
+
+def _resolve(project: Project, trust: TrustBackend | None,
+             ledger: AlphaLedger | None) -> tuple[TrustBackend, AlphaLedger]:
+    if trust is None and ledger is None:
+        return backends(project)
+    return (trust if trust is not None else InProcessTrust(project),
+            ledger if ledger is not None else FixedAlphaLedger(project))
+
+
+def _context(project: Project, sref: StageRef, inputs: dict[str, ArtifactRef], trust: TrustBackend,
+             ledger: AlphaLedger) -> StageContext:
+    return StageContext(project, inputs, dict(sref.params), trust, ledger, sref.name)
 
 
 def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, registry: dict | None = None,
@@ -226,6 +256,7 @@ def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, 
     states = _states(project, spec, registry)
     _check_ready(spec, states, i)
     sref = spec.stages[i]
+    trust, ledger = _resolve(project, trust, ledger)
     ctx = _context(project, sref, _inputs(project, spec, states, sref), trust, ledger)
     return registry[sref.stage]().plan(ctx)
 
@@ -235,9 +266,10 @@ def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, 
 _TRUST_MARKERS = ("trust/spent", "trust/registrations/latest", "trust/sealed_evaluation")
 
 
-def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, dict[str, str | None]]:
+def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, int, dict[str, str | None]]:
     """What a stage's `run` may have changed: the hash of every file under `stages/<stage>/`, the number of lines
-    in the alpha ledger (a spend is a side effect) and the hash of each trust marker file (`_TRUST_MARKERS`)."""
+    in the alpha ledger and in the keeper receipts (a spend is a side effect) and the hash of each trust marker file
+    (`_TRUST_MARKERS`)."""
     files: dict[str, str] = {}
     base = project.root / "stages" / stage
     if base.is_dir():
@@ -248,13 +280,17 @@ def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, di
         lines = (project.root / "trust" / "ledger.jsonl").read_bytes().count(b"\n")
     except OSError:
         lines = 0
+    try:
+        receipts = (project.root / RECEIPTS).read_bytes().count(b"\n")
+    except OSError:
+        receipts = 0
     markers: dict[str, str | None] = {}
     for rel in _TRUST_MARKERS:
         try:
             markers[rel] = sha256_bytes((project.root / rel).read_bytes())
         except OSError:
             markers[rel] = None
-    return files, lines, markers
+    return files, lines, receipts, markers
 
 
 def done_output(project: Project, stage: str, name: str, *, spec: PipelineSpec | None = None,
@@ -308,6 +344,7 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
         if not decision.get("rerun"):
             raise _refuse(f"stages[{i}]", f"stage {sref.name!r} is done with a different key (inputs, params or "
                           "decision changed)", 'pass decision["rerun"] = true to rerun it; later stages become stale')
+    trust, ledger = _resolve(project, trust, ledger)     # before any line is written: a refused binding leaves none
     if decision.get("rerun") and (cur["status"] == "done" or own_changed):
         for later in spec.stages[i + 1:]:        # audit trail only; status is derived from the key parts
             ls = states[later.name]
