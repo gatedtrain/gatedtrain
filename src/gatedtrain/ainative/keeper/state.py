@@ -12,10 +12,17 @@ Layout under the state directory (every file mode 0600, every directory 0700, ne
   sealed summary and power bodies, the first project that took it in, the sorted input hashes of the sealed rows and
   of the rows released as training.
 - `sets/<sealed hex>/items.json`: the sealed items (canonical JSON; the file's sha256 is the sealed set id);
-  `sets/<sealed hex>/closed`: present once a report closed the set.
+  `sets/<sealed hex>/closed`: present once a report closed the set;
+  `sets/<sealed hex>/attempts/<j>.json`: sealed attempt j on the set (from any project): its claim and ledger `grant`
+  envelopes, and once settled its gate record, gate summary and ledger `settle` envelopes. The attempt files are the
+  set's alpha-investing ledger; the grant is committed (this file written) before anything is scored;
+  `sets/<sealed hex>/baseline/<key hex>.json`: the baseline's per-item records, scored once per set and key
+  (baseline sha256, sampler, eval_seeds, evaluator entry); `sets/<sealed hex>/records/<j>.json`: the candidate's
+  per-item records of attempt j. Per-item records and gate records never leave the keeper.
 - `projects/<project hex>/project.json`: the project (opened time, its data and sealed set, the latest registration,
   its sealed attempts); `projects/<project hex>/registrations/<hash hex>.json`: each registration with its envelope;
-  `projects/<project hex>/records.jsonl`: every envelope the keeper signed for the project, in order.
+  `projects/<project hex>/records.jsonl`: every envelope the keeper signed for the project and showed its driver, in
+  order (not the gate records); `projects/<project hex>/report.json`: the project's signed report.
 
 Files are written by temp file plus rename, except `records.jsonl`, which is append-only: one `O_APPEND | O_NOFOLLOW`
 write per line, as step 1's ledger (a torn last line from a crash is dropped at the next start, before any append).
@@ -26,6 +33,14 @@ it); any other data holding an input that was ever sealed is refused, naming a c
 training is forced into the training part of every later split, so it is never sealed.
 
 No response, record or refusal holds a sealed input or label; an exception from scorer code is counted, never shown.
+
+Attempts (AN-8, AN-9, AN-10, AN-15; spec §5.4): `evaluate` settles the set's open attempt, checks, grants alpha_j
+(Foster-Stine, `alpha_investing`), commits and signs the claim, and only then scores; `gate` decides at alpha_j once
+and settles the ledger; `report` builds and signs `report.json` (`schema_version` 2) from keeper records and closes
+the set. An attempt still open at a restart is gated normally when its per-item records were stored, else it settles
+as not passed (MISSING); either happens on the next `evaluate`, `gate` or `report` on the set (preflight finding 8).
+At start, envelopes an attempt file or report holds but `records.jsonl` lacks (a crash between the two writes) are
+appended again.
 """
 
 from __future__ import annotations
@@ -34,7 +49,9 @@ import errno
 import fcntl
 import json
 import os
+import pwd
 import re
+import stat
 import threading
 from pathlib import Path
 from typing import Any
@@ -42,13 +59,16 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ...canonical import canonical_json, sha256_bytes
+from ... import gates
 from ...errors import Problem, Refused
 from ...registration import check_contents, resolved_evaluator_hash
-from .. import scorers, sealed_eval, signing
+from .. import alpha_investing as ai, scorers, sealed_eval, signing
 from ..alpha_investing import PLANNING_ALPHA
 from ..project import _utc_now, _write_atomic
-from ..trust_stages import MAX_DATA_BYTES, MAX_MARGIN, SCHEMA_POWER, SCHEMA_SEALED_SUMMARY
-from . import texts
+from ..trust_stages import (MAX_DATA_BYTES, MAX_MARGIN, SCHEMA_POWER, SCHEMA_REPORT, SCHEMA_SEALED_SUMMARY,
+                            registered_base, registered_generator, scenario_generators, scenario_pack_of)
+from . import envcheck, texts
+from .protocol import RefusedAfterSpend
 
 KEY_FILE = "keeper.key"
 LOCK_FILE = "lock"
@@ -57,7 +77,12 @@ ARTIFACT_SCHEMA_VERSION = 2        # keeper-mode bodies of the step 1 `sealed_su
 SCHEMA_INTAKE = "gatedtrain.ainative.keeper_intake"
 SCHEMA_PROJECT = "gatedtrain.ainative.keeper_project"
 SCHEMA_REGISTRATION = "gatedtrain.ainative.keeper_registration"
+SCHEMA_ATTEMPT = "gatedtrain.ainative.keeper_attempt"
+SCHEMA_ARM_RECORDS = "gatedtrain.ainative.keeper_arm_records"
+SCHEMA_STORED_REPORT = "gatedtrain.ainative.keeper_report"
+REPORT_SCHEMA_VERSION = 2
 NEW_DATA_FIX = "a new test needs new labelled data"
+PASSED_FIX = "this project passed; write its report"
 MAX_SENTENCE_CHARS = 4000
 CONFIRMED_KEYS = ("scorer", "scorer_params", "direction", "margin")
 
@@ -95,6 +120,7 @@ class KeeperState:
         self.owner_uid = self.keeper_uid if owner_uid is None else owner_uid
         self.guarantee = texts.sealed_guarantee(self.keeper_uid, self.owner_uid)
         self._mutex = threading.RLock()
+        self.environment_sha256: str | None = None     # set by `serve` once it signed the environment record
         self._lock_fd: int | None = self._take_lock()
         try:
             self.key = self._signing_key()
@@ -196,6 +222,7 @@ class KeeperState:
             self._drop_torn_line(rel)
             for env in self._read_records(rel):
                 self._signed.add(signing.envelope_sha256(env))
+        self._repair()
 
     def _index_intake(self, rec: dict) -> None:
         try:
@@ -549,6 +576,462 @@ class KeeperState:
     def _close_set(self, sealed_id: str) -> None:
         """Close the sealed set (a report on it was built): no reuse, no further claim (AN-16)."""
         self._write(f"sets/{_hex(sealed_id)}/closed", b"")
+
+    # ---- attempts: storage --------------------------------------------------------------------------------------
+
+    def _set_rel(self, sealed_id: str) -> str:
+        return f"sets/{_hex(sealed_id)}"
+
+    def _attempt_rel(self, sealed_id: str, j: int) -> str:
+        return f"{self._set_rel(sealed_id)}/attempts/{j:06d}.json"
+
+    def _raw_attempts(self, sealed_id: str) -> list[dict]:
+        """The attempt files of the set in j order, checked for shape and numbering only."""
+        d = self.dir / self._set_rel(sealed_id) / "attempts"
+        out = []
+        for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+            rel = f"{self._set_rel(sealed_id)}/attempts/{path.name}"
+            doc = self._read_json(rel, SCHEMA_ATTEMPT)
+            if doc is None or doc.get("j") != len(out) + 1 or path.name != f"{len(out) + 1:06d}.json" or \
+                    doc.get("sealed_id") != sealed_id or \
+                    not all(isinstance(doc.get(k), dict) for k in ("claim", "grant")):
+                raise _damaged(rel)
+            out.append(doc)
+        return out
+
+    def _attempts(self, sealed_id: str) -> list[dict]:
+        """The set's attempts with every envelope verified (AN-14) and the ledger replayed (AN-15): each grant is the
+        bid of the wealth the earlier settles leave, at most the last attempt is open, and every stored number equals
+        the recomputed one."""
+        public = self.key.public_key()
+        atts = self._raw_attempts(sealed_id)
+        settled: list[dict] = []
+        for att in atts:
+            kinds = {"claim": "claim", "grant": "ledger_entry", "gate_record": "gate_record",
+                     "summary": "gate_summary", "settle": "ledger_entry"}
+            recs = {}
+            for key, kind in kinds.items():
+                env = att.get(key)
+                if env is not None:
+                    recs[key] = signing.verify(env, public, kind=kind)
+            ident = (att["attempt_id"], att["j"], att["project_id"])
+            if any((r.get("attempt_id"), r.get("j"), r.get("project_id")) != ident for r in recs.values()) or \
+                    recs["grant"].get("entry") != "grant" or recs["claim"]["alpha"] != recs["grant"]["alpha"]:
+                raise _damaged(self._attempt_rel(sealed_id, att["j"]))
+            is_open = "settle" not in recs
+            if is_open != any(att.get(k) is None for k in ("gate_record", "summary", "settle")) or \
+                    (is_open and att is not atts[-1]):
+                raise _damaged(self._attempt_rel(sealed_id, att["j"]))
+            wealth = ai.replay(settled)
+            if recs["grant"]["wealth_before"] != wealth or not ai.can_bid(wealth) or \
+                    recs["grant"]["alpha"] != ai.bid(wealth):
+                raise _problem("AN-15", f"ledger[{att['j'] - 1}]", "the grant is not the bid of the replayed wealth",
+                               "the ledger was altered; start a new test on new sealed data")
+            if not is_open:
+                row = recs["settle"]
+                if row.get("entry") != "settle" or row["alpha"] != recs["grant"]["alpha"] or \
+                        row["passed"] is not (recs["summary"]["status"] == gates.PASS):
+                    raise _damaged(self._attempt_rel(sealed_id, att["j"]))
+                settled.append(row)
+        ai.replay(settled)
+        return atts
+
+    def _wealth(self, atts: list[dict]) -> float:
+        """The wealth after the settled attempts; an open attempt counts as not passed."""
+        wealth = ai.replay([a["settle"]["record"] for a in atts if a.get("settle") is not None])
+        for a in atts:
+            if a.get("settle") is None:
+                wealth = ai.settle(wealth, a["grant"]["record"]["alpha"], False)["wealth_after"]
+        return wealth
+
+    def _append_record(self, project_id: str, env: dict) -> None:
+        """Append an envelope to the project's records unless it is already there."""
+        digest = signing.envelope_sha256(env)
+        if digest not in self._signed:
+            self._append(f"{self._project_rel(project_id)}/records.jsonl", env)
+            self._signed.add(digest)
+
+    def _repair(self) -> None:
+        """After a crash between committing an attempt or report and appending to `records.jsonl`: append what is
+        missing and note the attempt in its project."""
+        sets = self.dir / "sets"
+        for d in sorted(sets.iterdir()) if sets.is_dir() else []:
+            sealed_id = f"sha256:{d.name}"
+            for att in self._raw_attempts(sealed_id):
+                doc = self._project(att["project_id"])
+                if att["attempt_id"] not in doc.get("attempts", []):
+                    self._record_attempt(att["project_id"], att["attempt_id"])
+                for key in ("claim", "grant", "summary", "settle"):
+                    if att.get(key) is not None:
+                        self._append_record(att["project_id"], att[key])
+        projects = self.dir / "projects"
+        for path in sorted(projects.iterdir()) if projects.is_dir() else []:
+            stored = self._read_json(f"projects/{path.name}/report.json", SCHEMA_STORED_REPORT)
+            if stored is not None:
+                self._close_set(stored["sealed_id"])
+                self._append_record(stored["project_id"], stored["envelope"])
+
+    def _read_arm(self, rel: str) -> list | None:
+        doc = self._read_json(rel, SCHEMA_ARM_RECORDS)
+        if doc is None:
+            return None
+        if not isinstance(doc.get("records"), list):
+            raise _damaged(rel)
+        return doc["records"]
+
+    def _write_arm(self, rel: str, model_sha: str, records: list) -> None:
+        self._write_json(rel, {"schema": SCHEMA_ARM_RECORDS, "schema_version": STATE_SCHEMA_VERSION,
+                               "model_ref_sha256": model_sha, "records": records})
+
+    # ---- attempts: checks before the spend ------------------------------------------------------------------------
+
+    def _owner_can_read(self, st: os.stat_result) -> bool:
+        if self.owner_uid == 0:
+            return True
+        if st.st_uid == self.owner_uid:
+            return bool(st.st_mode & stat.S_IRUSR)
+        try:
+            pw = pwd.getpwuid(self.owner_uid)
+            groups = set(os.getgrouplist(pw.pw_name, pw.pw_gid))
+        except (KeyError, OSError):
+            groups = set()
+        if st.st_gid in groups:
+            return bool(st.st_mode & stat.S_IRGRP)
+        return bool(st.st_mode & stat.S_IROTH)
+
+    def _model_files(self, arm: str, record: dict) -> None:
+        """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read
+        (the keeper is never a way to read a file the owner cannot), and pass `envcheck.check_model_files`."""
+        problems = []
+        entries = record.get("files", [])
+        state = os.path.realpath(self.dir)
+        for i, entry in enumerate(entries if isinstance(entries, list) else []):
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(path, str):
+                continue
+            field = f"{arm}.record.files[{i}]"
+            name = os.path.basename(path)
+            if not os.path.isabs(path):
+                problems.append(Problem(envcheck.RULE, field, f"{name}: the path is not absolute",
+                                        "list each model file by its absolute path"))
+                continue
+            real = os.path.realpath(path)
+            if real == state or real.startswith(state + os.sep):
+                problems.append(Problem(envcheck.RULE, field, f"{name} is inside the keeper's state directory",
+                                        "keep model files outside the keeper's state directory"))
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue                                  # check_model_files names it
+            if not self._owner_can_read(st):
+                problems.append(Problem(envcheck.RULE, field, f"{name} is not readable by the owner uid",
+                                        "pass a file the user the keeper serves can read"))
+        if problems:
+            raise Refused(problems)
+        try:
+            envcheck.check_model_files(record)
+        except Refused as exc:
+            raise Refused([Problem(p.rule, f"{arm}.record.{p.field}", p.message, p.fix) for p in exc.problems]) \
+                from None
+
+    def _arm_args(self, arm: str, value: Any) -> tuple[dict, str]:
+        if not (isinstance(value, dict) and set(value) == {"record", "sha256"} and isinstance(value["record"], dict)):
+            raise _problem("AN-8", arm, f"the {arm} is not {{record, sha256}} with a model record",
+                           "send the model reference record and its sha256")
+        sha = _check_sha(value["sha256"], f"{arm}.sha256", "AN-8")
+        try:
+            actual = sha256_bytes(canonical_json(value["record"]))
+        except (ValueError, TypeError, RecursionError):
+            raise _problem("AN-8", f"{arm}.record", "the model record is not canonical JSON",
+                           "send the model reference record as the stage wrote it") from None
+        if actual != sha:
+            raise _problem("AN-8", f"{arm}.sha256", f"the {arm} record does not have the sha256 that was sent",
+                           "send the record and the sha256 of its canonical JSON")
+        return value["record"], sha
+
+    # ---- attempts: ops ----------------------------------------------------------------------------------------------
+
+    def alpha(self, project_id: str) -> dict:
+        """The alpha-investing state of the project's sealed set (an open attempt counts as not passed)."""
+        with self._mutex:
+            doc, _ = self._taken_in(project_id)
+            atts = self._attempts(doc["sealed_id"])
+            wealth = self._wealth(atts)
+            entries = [e for a in atts for e in (a["grant"], a.get("settle")) if e is not None]
+            return {"sealed_id": doc["sealed_id"], "wealth": wealth,
+                    "available": ai.bid(wealth) if ai.can_bid(wealth) else 0.0, "planning_alpha": PLANNING_ALPHA,
+                    "rule": ai.RULE, "entries": entries}
+
+    @staticmethod
+    def _claim_response(att: dict) -> dict:
+        return {"attempt_id": att["attempt_id"], "j": att["j"], "alpha": att["grant"]["record"]["alpha"],
+                "claim": att["claim"], "ledger": att["grant"]}
+
+    def evaluate(self, project_id: str, registration_hash: str, baseline: dict, candidate: dict) -> dict:
+        """Grant, sign and commit a sealed attempt, then score both arms (AN-8, AN-15); see the module docstring."""
+        with self._mutex:
+            doc, _ = self._taken_in(project_id)
+            sealed_id = doc["sealed_id"]
+            self._settle_open(sealed_id)
+            if self._closed(sealed_id):
+                raise _problem("AN-16", "sealed set", "a report closed this sealed set; no further attempt is allowed "
+                               "on it from any project", NEW_DATA_FIX)
+            _check_sha(registration_hash, "registration_hash", "AN-8")
+            base_rec, base_sha = self._arm_args("baseline", baseline)
+            cand_rec, cand_sha = self._arm_args("candidate", candidate)
+            atts = self._attempts(sealed_id)
+            mine = [a for a in atts if a["project_id"] == project_id]
+            if mine and mine[-1]["registration_hash"] == registration_hash and \
+                    mine[-1]["candidate_model_sha256"] == cand_sha:
+                return self._claim_response(mine[-1])        # the same request again: the stored claim
+            if any(a["summary"] is not None and a["summary"]["record"]["status"] == gates.PASS for a in mine):
+                raise _problem("AN-9", "project", "this project has a PASS attempt; a PASS ends the project's "
+                               "attempts", PASSED_FIX)
+            if registration_hash != doc.get("latest_registration"):
+                raise _problem("AN-8", "registration_hash", "the registration is not the project's latest",
+                               "send the hash of the project's latest registration")
+            full = self._stored_registration(project_id, registration_hash)["registration"]
+            if base_sha != registered_base(full):
+                raise _problem("AN-8", "baseline.sha256", "the baseline is not the base model that was registered",
+                               "send the registered base model's record")
+            if cand_sha == base_sha:
+                raise _problem("AN-8", "candidate", "the candidate and the baseline are the same model",
+                               "send the trained candidate's record")
+            served = registered_generator(full)
+            fn = scenario_generators().get(served[1]) if served else None
+            if fn is None or scenario_pack_of(served[1]) != served[0]:
+                raise _problem("AN-8", "registration.base_model.generator", "the keeper does not serve the registered "
+                               "scenario pack and generator", "install the registered scenario pack in the keeper")
+            for arm, rec in (("baseline", base_rec), ("candidate", cand_rec)):
+                if rec.get("generator") != served[1]:
+                    raise _problem("AN-8", f"{arm}.record.generator", f"the {arm} model names another generator than "
+                                   "the registered one", "both models must be served by the registered generator")
+            evs = full.get("evaluators")
+            ev = evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict) else {}
+            found = scorers.spec_for_evaluator(ev)
+            if found is None or ev.get("manifest_hash") != resolved_evaluator_hash(ev):
+                raise _problem("AN-8", "registration.evaluators[0]", "the registered evaluator is not the scorer the "
+                               "keeper runs", "register again with the scorer the keeper serves")
+            for arm, rec in (("baseline", base_rec), ("candidate", cand_rec)):
+                self._model_files(arm, rec)
+            wealth = self._wealth(atts)
+            if not ai.can_bid(wealth):
+                raise _problem("AN-15", "alpha", f"the next bid {ai.bid(wealth):.6g} is below the smallest allowed "
+                               f"{ai.MIN_BID}: the alpha-investing wealth of this sealed set is spent", NEW_DATA_FIX)
+            att = self._grant(project_id, sealed_id, registration_hash, base_sha, cand_sha, wealth, len(atts) + 1,
+                              full, ev)
+            try:
+                self._score(att, full, found, fn, base_rec, cand_rec, ev)
+            except Refused as exc:                          # pack code failed: the attempt settles, not passed
+                settled = self._settle(att)
+                raise RefusedAfterSpend(exc.problems, {**self._claim_response(settled),
+                                                       "summary": settled["summary"],
+                                                       "settle": settled["settle"]}) from None
+            return self._claim_response(att)
+
+    def _baseline_key(self, base_sha: str, full: dict, ev: dict) -> str:
+        return sha256_bytes(canonical_json({"baseline_model_sha256": base_sha, "sampler": full.get("sampler"),
+                                            "eval_seeds": (full.get("clause") or {}).get("eval_seeds"),
+                                            "evaluator": ev}))
+
+    def _grant(self, project_id: str, sealed_id: str, registration_hash: str, base_sha: str, cand_sha: str,
+               wealth: float, j: int, full: dict, ev: dict) -> dict:
+        alpha = ai.bid(wealth)
+        attempt_id = f"{_hex(sealed_id)[:16]}.{j}"
+        utc = _utc_now()
+        ident = {"attempt_id": attempt_id, "j": j, "project_id": project_id, "sealed_id": sealed_id}
+        claim = signing.sign(self.key, "claim", {**ident, "registration_hash": registration_hash,
+                                                 "baseline_model_sha256": base_sha, "candidate_model_sha256": cand_sha,
+                                                 "alpha": alpha, "utc": utc})
+        grant = signing.sign(self.key, "ledger_entry", {"entry": "grant", **ident, "alpha": alpha,
+                                                        "wealth_before": wealth, "utc": utc})
+        att = {"schema": SCHEMA_ATTEMPT, "schema_version": STATE_SCHEMA_VERSION, **ident,
+               "registration_hash": registration_hash, "baseline_model_sha256": base_sha,
+               "candidate_model_sha256": cand_sha, "baseline_key": self._baseline_key(base_sha, full, ev),
+               "claim": claim, "grant": grant, "gate_record": None, "summary": None, "settle": None}
+        self._write_json(self._attempt_rel(sealed_id, j), att)            # the commit point of the spend
+        self._record_attempt(project_id, attempt_id)
+        self._append_record(project_id, claim)
+        self._append_record(project_id, grant)
+        return att
+
+    def _score(self, att: dict, full: dict, found: tuple[scorers.ScorerSpec, dict], fn: Any, base_rec: dict,
+               cand_rec: dict, ev: dict) -> None:
+        spec, params = found
+        score = scorers.bind(spec, params)
+        items = self._items(att["sealed_id"])
+        generate = _canonical_output(fn)
+        set_rel = self._set_rel(att["sealed_id"])
+        base_rel = f"{set_rel}/baseline/{_hex(att['baseline_key'])}.json"
+        if self._read_arm(base_rel) is None:                  # scored once per set and key
+            records = sealed_eval.score_arm(items, generate, base_rec, full, score, score_range=spec.score_range,
+                                            scorer_name=spec.name)
+            self._write_arm(base_rel, att["baseline_model_sha256"], records)
+        records = sealed_eval.score_arm(items, generate, cand_rec, full, score, score_range=spec.score_range,
+                                        scorer_name=spec.name)
+        self._write_arm(f"{set_rel}/records/{att['j']:06d}.json", att["candidate_model_sha256"], records)
+
+    # ---- attempts: gate and settle ----------------------------------------------------------------------------------
+
+    def _settle_open(self, sealed_id: str) -> None:
+        for att in self._attempts(sealed_id):
+            if att.get("settle") is None:
+                self._settle(att)
+
+    def _decide(self, att: dict, full: dict) -> dict:
+        """The gate result at the claim's alpha; missing per-item records (a crash, a kill during scoring) make it
+        MISSING."""
+        alpha = att["grant"]["record"]["alpha"]
+        set_rel = self._set_rel(att["sealed_id"])
+        evs = full.get("evaluators")
+        found = scorers.spec_for_evaluator(evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict)
+                                           else {})
+        score_range = found[0].score_range if found else (0.0, 1.0)
+        base = self._read_arm(f"{set_rel}/baseline/{_hex(att['baseline_key'])}.json")
+        cand = self._read_arm(f"{set_rel}/records/{att['j']:06d}.json")
+        expected = {"baseline": att["baseline_model_sha256"], "candidate": att["candidate_model_sha256"]}
+        n_sealed = len(self._items(att["sealed_id"]))
+
+        def run(b: list | None, c: list | None) -> dict:
+            return sealed_eval.decide(full, {"records": b or [], "model_ref_sha256": expected["baseline"]},
+                                      {"records": c or [], "model_ref_sha256": expected["candidate"]},
+                                      alpha=alpha, n_sealed=n_sealed, expected_models=expected,
+                                      score_range=score_range)
+        if found is None or base is None or cand is None:
+            return run(None, None)
+        try:
+            return run(base, cand)
+        except Exception:                                    # never leave a granted attempt unsettled
+            return run(None, None)
+
+    def _settle(self, att: dict) -> dict:
+        """Gate the open attempt once, sign the gate record, summary and ledger settle, commit them in the attempt
+        file, then append the driver-visible ones to the project's records. Returns the settled attempt."""
+        pid = att["project_id"]
+        full = self._stored_registration(pid, att["registration_hash"])["registration"]
+        grant = att["grant"]["record"]
+        alpha = grant["alpha"]
+        post_hoc = bool(full.get("post_hoc", False))
+        result = self._decide(att, full)
+        gate_result = {**result, "alpha": alpha, "attempt_id": att["attempt_id"],
+                       "registration_hash": att["registration_hash"], "post_hoc": post_hoc}
+        status = result["status"]
+        row = ai.settle(grant["wealth_before"], alpha, status == gates.PASS)
+        ident = {"attempt_id": att["attempt_id"], "j": att["j"], "project_id": pid, "sealed_id": att["sealed_id"]}
+        utc = _utc_now()
+        gate_record = signing.sign(self.key, "gate_record", {
+            **ident, "registration_hash": att["registration_hash"],
+            "candidate_model_sha256": att["candidate_model_sha256"], "result": gate_result, "utc": utc})
+        summary = signing.sign(self.key, "gate_summary", {
+            **ident, "registration_hash": att["registration_hash"], "status": status, "alpha": alpha,
+            "alpha_spent": row["cost"], "alpha_earned": row["earned"], "wealth_after": row["wealth_after"],
+            "post_hoc": post_hoc})
+        settle = signing.sign(self.key, "ledger_entry", {"entry": "settle", **ident, **row, "utc": utc})
+        att = {**att, "gate_record": gate_record, "summary": summary, "settle": settle}
+        self._write_json(self._attempt_rel(att["sealed_id"], att["j"]), att)     # the commit point of the settle
+        self._append_record(pid, summary)
+        self._append_record(pid, settle)
+        return att
+
+    def gate(self, project_id: str, attempt_id: str) -> dict:
+        """The attempt's gate summary and ledger settle envelopes (AN-9); computed once, then the stored ones."""
+        with self._mutex:
+            doc, _ = self._taken_in(project_id)
+            found = [a for a in self._attempts(doc["sealed_id"])
+                     if a["attempt_id"] == attempt_id and a["project_id"] == project_id]
+            if not found:
+                raise _problem("AN-9", "attempt_id", "this project has no sealed attempt with this id",
+                               "pass the attempt_id that evaluate returned for this project")
+            att = found[0]
+            if att.get("settle") is None:
+                att = self._settle(att)
+            return {"summary": att["summary"], "ledger": att["settle"]}
+
+    # ---- report (AN-10, AN-16) --------------------------------------------------------------------------------------
+
+    def report(self, project_id: str) -> dict:
+        """Settle the set's open attempt, build and sign `report.json` (`schema_version` 2) from keeper records, close
+        the sealed set (AN-16). A second call returns the stored envelope."""
+        with self._mutex:
+            doc, rec = self._taken_in(project_id)
+            sealed_id = doc["sealed_id"]
+            rel = f"{self._project_rel(project_id)}/report.json"
+            stored = self._read_json(rel, SCHEMA_STORED_REPORT)
+            if stored is not None:
+                signing.verify(stored["envelope"], self.key.public_key(), kind="report")
+                self._close_set(sealed_id)
+                self._append_record(project_id, stored["envelope"])
+                return {"report": stored["envelope"]}
+            self._settle_open(sealed_id)
+            atts = self._attempts(sealed_id)
+            mine = [a for a in atts if a["project_id"] == project_id]
+            if not mine:
+                raise _problem("AN-10", "project", "the project has no settled sealed attempt to report",
+                               "evaluate a candidate and gate it first")
+            report = self._build_report(project_id, rec, atts, mine)
+            env = signing.sign(self.key, "report", report)
+            self._close_set(sealed_id)              # before the report is stored: never a stored report on an open set
+            self._write_json(rel, {"schema": SCHEMA_STORED_REPORT, "schema_version": STATE_SCHEMA_VERSION,
+                                   "project_id": project_id, "sealed_id": sealed_id, "envelope": env})
+            self._append_record(project_id, env)
+            return {"report": env}
+
+    def _build_report(self, project_id: str, rec: dict, atts: list[dict], mine: list[dict]) -> dict:
+        passed = [a for a in mine if a["summary"]["record"]["status"] == gates.PASS]
+        head = passed[0] if passed else mine[-1]
+        stored = self._stored_registration(project_id, head["registration_hash"])
+        reg_record = signing.verify(stored["envelope"], self.key.public_key(), kind="registration")
+        if reg_record.get("registration") != stored["registration"]:
+            raise _damaged(self._registration_rel(project_id, head["registration_hash"]))
+        full = stored["registration"]
+        clause = full.get("clause") or {}
+        evs = full.get("evaluators")
+        found = scorers.spec_for_evaluator(evs[0] if isinstance(evs, list) and evs and isinstance(evs[0], dict)
+                                           else {})
+        if found is None:
+            raise _problem("AN-10", "registration.evaluators[0]", "the registered evaluator is not a scorer the "
+                           "keeper runs, so the metric's unit is unknown", "register again with a scorer it serves")
+        gate = head["gate_record"]["record"]["result"]
+        power = dict(rec["power"])
+        registration = {"hash": head["registration_hash"], "scorer": clause.get("metric"),
+                        "direction": clause.get("direction"), "margin": clause.get("margin"),
+                        "alpha": clause.get("alpha"),
+                        "item_set_hash": (full.get("eval_distribution") or {}).get("item_set_hash"),
+                        "post_hoc": bool(full.get("post_hoc", False)), "amends": full.get("amends")}
+        ledger = [{k: a["settle"]["record"][k] for k in ("attempt_id", "j", "project_id", "alpha", "passed", "cost",
+                                                         "earned", "wealth_after")} for a in atts]
+        attempts = [{"attempt_id": a["attempt_id"], "j": a["j"], "candidate_model_sha256": a["candidate_model_sha256"],
+                     "alpha": a["grant"]["record"]["alpha"], "status": a["summary"]["record"]["status"],
+                     "utc": a["claim"]["record"]["utc"]} for a in mine]
+        return {"schema": SCHEMA_REPORT, "schema_version": REPORT_SCHEMA_VERSION,
+                "status": sealed_eval.effective_status(gate["status"], registration["post_hoc"]),
+                "metric": {"scorer": clause.get("metric"), "unit": found[0].unit},
+                "n_sealed": power["n_sealed"],
+                "registration": registration,
+                "power": power,
+                "gate_result": gate,
+                "display": sealed_eval.display_block(gate, power),
+                "ledger": ledger, "attempts": attempts,
+                "sealed_guarantee": self.guarantee,
+                "known_limits": texts.known_limits(self.guarantee, len(atts)),
+                "alpha_rule": {"rule": ai.RULE, "initial_wealth": ai.INITIAL_WEALTH, "payout": ai.PAYOUT,
+                               "min_bid": ai.MIN_BID, "planning_alpha": PLANNING_ALPHA, "guarantee": ai.GUARANTEE},
+                "keeper": {"fingerprint": signing.fingerprint(self.key),
+                           "environment_sha256": self.environment_sha256}}
+
+
+def _canonical_output(fn: Any) -> Any:
+    """The generator with its output checked: a value canonical JSON cannot encode is a crash (ValueError), so the
+    attempt settles as not passed (Review Focus 2)."""
+    def generate(*args: Any, **kwargs: Any) -> Any:
+        out = fn(*args, **kwargs)
+        try:
+            canonical_json(out)
+        except (ValueError, TypeError, RecursionError):
+            raise ValueError("the generator returned a value that is not canonical JSON") from None
+        return out
+    return generate
 
 
 def _takes(spec: scorers.ScorerSpec, label: Any) -> bool:

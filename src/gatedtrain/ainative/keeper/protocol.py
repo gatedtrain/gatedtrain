@@ -4,6 +4,16 @@ Request line: `{"op": str, "project": "sha256:<64 hex>" | null, "args": object}`
 `{"ok": bool, "result": object | null, "problems": [{rule, field, message, fix}]}` (the AN-1 problem shape). One
 request per connection. Lines are capped while they are read, and a refusal never echoes what the peer sent.
 
+A refusal after the keeper granted alpha (a sealed evaluation whose scoring failed) still carries the signed claim
+and ledger envelopes in `result` alongside `ok: false` (preflight finding 9); the client raises `RefusedAfterSpend`
+holding them, so the driver logs the spend.
+
+Client deadlines: the keeper serves one connection at a time, and a client's deadline starts before it connects. The
+ops that score or gate (`LONG_OPS`) get `LONG_OP_TIMEOUT_S`, longer than any request the keeper is expected to spend
+on the synthetic pack and on a CPU scorer; every other op keeps `SOCKET_TIMEOUT_S`. A client that gives up while
+its request waits behind another is not served: the keeper drops a request whose peer has already closed. A client
+that gives up during its own evaluation can send the identical request again and gets the stored claim.
+
 The server reads the caps and the timeout from this module at call time, so a test can patch them for an in-process
 server.
 """
@@ -23,6 +33,8 @@ from ...errors import Problem, Refused
 MAX_REQUEST_BYTES = 96 * 1024 * 1024          # a 64 MiB data file in base64 plus the envelope
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 SOCKET_TIMEOUT_S = 60.0
+LONG_OPS = frozenset({"evaluate", "gate", "report"})
+LONG_OP_TIMEOUT_S = 3600.0
 MAX_SOCKET_PATH = 107                         # sun_path is 108 bytes including the terminating NUL
 
 RULE = "AN-12"
@@ -35,6 +47,14 @@ _RECV_CHUNK = 1 << 16
 
 def refused(field: str, message: str, fix: str) -> Refused:
     return Refused([Problem(RULE, field, message, fix)])
+
+
+class RefusedAfterSpend(Refused):
+    """A refusal after the keeper granted an attempt: `result` holds the signed envelopes of that spend."""
+
+    def __init__(self, problems: list[Problem], result: dict) -> None:
+        super().__init__(problems)
+        self.result = result
 
 
 def read_line(sock: socket.socket, cap: int, *, deadline: float | None = None) -> bytes:
@@ -123,8 +143,8 @@ def ok_response(result: object) -> dict:
     return {"ok": True, "result": result, "problems": []}
 
 
-def problem_response(problems: list[Problem]) -> dict:
-    return {"ok": False, "result": None, "problems": [asdict(p) for p in problems]}
+def problem_response(problems: list[Problem], result: dict | None = None) -> dict:
+    return {"ok": False, "result": result, "problems": [asdict(p) for p in problems]}
 
 
 def encode_response(resp: dict) -> bytes:
@@ -145,7 +165,7 @@ def parse_response(line: bytes) -> dict:
             isinstance(p, dict) and set(p) == set(_PROBLEM_KEYS) and all(isinstance(p[k], str) for k in _PROBLEM_KEYS)
             for p in problems):
         raise bad
-    if not doc["ok"] and not problems:
+    if not doc["ok"] and (not problems or not (doc["result"] is None or isinstance(doc["result"], dict))):
         raise bad
     return doc
 
@@ -153,20 +173,27 @@ def parse_response(line: bytes) -> dict:
 # ---- client -------------------------------------------------------------------------------------------------------
 
 class KeeperClient:
-    """One connection per call. Every failure is `Refused` (AN-12), never a traceback."""
+    """One connection per call. Every failure is `Refused` (AN-12), never a traceback. Without an explicit `timeout`
+    an op in `LONG_OPS` waits `LONG_OP_TIMEOUT_S` and any other op `SOCKET_TIMEOUT_S`."""
 
-    def __init__(self, socket_path: Path, *, timeout: float = SOCKET_TIMEOUT_S) -> None:
+    def __init__(self, socket_path: Path, *, timeout: float | None = None) -> None:
         self.socket_path = Path(socket_path)
         self.timeout = timeout
+
+    def timeout_for(self, op: str) -> float:
+        if self.timeout is not None:
+            return self.timeout
+        return LONG_OP_TIMEOUT_S if op in LONG_OPS else SOCKET_TIMEOUT_S
 
     def call(self, op: str, project: str | None, args: dict) -> object:
         line = encode_request(op, project, args)
         if len(line) - 1 > MAX_REQUEST_BYTES:
             raise refused("request", f"the request is longer than the cap of {MAX_REQUEST_BYTES} bytes",
                           "send a smaller request (a data file of at most 64 MiB)")
-        deadline = time.monotonic() + self.timeout
+        timeout = self.timeout_for(op)
+        deadline = time.monotonic() + timeout
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(self.timeout)
+            sock.settimeout(timeout)
             try:
                 sock.connect(str(self.socket_path))
             except (OSError, ValueError):
@@ -183,12 +210,17 @@ class KeeperClient:
                 raise refused("response", "the keeper closed the connection without a complete response",
                               "check the keeper's state; retry the call") from None
             except TimeoutError:
-                raise refused("response", f"the keeper did not answer within {self.timeout} s",
-                              "check that the keeper is running and not busy; retry the call") from None
+                raise refused("response", f"the keeper did not answer within {timeout:g} s",
+                              "the keeper serves one request at a time and may be busy with a sealed evaluation; "
+                              "check that it is running, then retry the call (an identical evaluate returns the "
+                              "stored claim)") from None
             except OSError:
                 raise refused("response", "the connection to the keeper failed",
                               "check that the keeper is running; retry the call") from None
         doc = parse_response(raw)
         if not doc["ok"]:
-            raise Refused([Problem(*(p[k] for k in _PROBLEM_KEYS)) for p in doc["problems"]])
+            problems = [Problem(*(p[k] for k in _PROBLEM_KEYS)) for p in doc["problems"]]
+            if doc["result"] is not None:
+                raise RefusedAfterSpend(problems, doc["result"])
+            raise Refused(problems)
         return doc["result"]

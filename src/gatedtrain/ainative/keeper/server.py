@@ -12,7 +12,12 @@ environment record once.
 
 `OPS` maps an op name to its handler `(keeper, project, args, peer_uid) -> result`: `hello`, and the state ops
 `open_project`, `intake` (optional `accept_inconclusive`), `sealed_summary`, `confirm_metric`, `register`,
-`registration`, `latest_registration`, `records` and `has_record`, each taking exactly the args it names.
+`registration`, `latest_registration`, `records`, `has_record`, and the attempt ops `alpha`, `evaluate`
+(`registration_hash`, `baseline`, `candidate`), `gate` (`attempt_id`) and `report`, each taking exactly the args it
+names. A refusal after a spend (`RefusedAfterSpend`) carries the spend's signed envelopes in `result`.
+
+A request whose client has already closed its end (it gave up waiting behind another connection) is dropped unread,
+so a sealed evaluation is never granted to a client that is no longer there to receive the claim.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from ... import __version__
 from ...errors import Problem, Refused
 from .. import signing
 from . import envcheck, protocol, texts
+from .protocol import RefusedAfterSpend
 from .state import KEY_FILE, KeeperState  # noqa: F401  (KEY_FILE: the key's name in the state directory)
 
 _ACCEPT_POLL_S = 0.2             # how often the idle loop checks for a stop request
@@ -61,6 +67,8 @@ class Keeper:
                 raise protocol.refused("op", "unknown op", "send `hello` to see the keeper version; check the "
                                        "client and the keeper are the same gatedtrain version")
             return protocol.ok_response(handler(self, project, args, peer))
+        except RefusedAfterSpend as exc:
+            return protocol.problem_response(exc.problems, exc.result)
         except Refused as exc:
             return protocol.problem_response(exc.problems)
         except Exception as exc:
@@ -134,6 +142,12 @@ OPS: dict[str, Callable[[Keeper, str | None, dict, int], object]] = {
     "latest_registration": _state_op(lambda st, pr, a, peer: st.latest_registration(pr)),
     "records": _state_op(lambda st, pr, a, peer: st.records(pr)),
     "has_record": _state_op(lambda st, pr, a, peer: st.has_record(a["sha256"]), ("sha256",)),
+    "alpha": _state_op(lambda st, pr, a, peer: st.alpha(pr)),
+    "evaluate": _state_op(lambda st, pr, a, peer: st.evaluate(pr, a["registration_hash"], a["baseline"],
+                                                               a["candidate"]),
+                          ("registration_hash", "baseline", "candidate")),
+    "gate": _state_op(lambda st, pr, a, peer: st.gate(pr, a["attempt_id"]), ("attempt_id",)),
+    "report": _state_op(lambda st, pr, a, peer: st.report(pr)),
 }
 
 
@@ -148,6 +162,17 @@ def _send(conn: socket.socket, data: bytes) -> None:
 
 def _send_problem(conn: socket.socket, problem: Problem) -> None:
     _send(conn, protocol.encode_response(protocol.problem_response([problem])))
+
+
+def _peer_gone(conn: socket.socket) -> bool:
+    """True when the client already closed its end (EOF waiting after its request line)."""
+    conn.settimeout(0)                       # non-blocking: a socket with a timeout would wait for data first
+    try:
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
 
 
 def _respond(keeper: Keeper, line: bytes, peer: int) -> bytes:
@@ -185,6 +210,8 @@ def _serve_connection(keeper: Keeper, conn: socket.socket) -> None:
                                     "send the whole request at once, followed by a newline"))
         return
     except OSError:
+        return
+    if _peer_gone(conn):                     # gave up while queued: never act on it
         return
     conn.settimeout(timeout)                 # the reply gets its own full timeout
     _send(conn, _respond(keeper, line, uid))
@@ -252,6 +279,7 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
         _prepare_socket_path(socket_path)
         stop = stop if stop is not None else threading.Event()
         environment = signing.sign(state.key, "environment", envcheck.environment_record())
+        state.environment_sha256 = envcheck.environment_sha256(environment["record"])
         keeper = Keeper(state_dir, owner_uid, key=state.key, environment=environment, state=state)
         return _serve_loop(keeper, socket_path, stop)
     finally:

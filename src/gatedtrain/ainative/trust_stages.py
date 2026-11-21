@@ -849,8 +849,8 @@ _LOGGED_STAGES = ("evaluate_sealed", "gate")      # every attempt row (start, do
 REPORT_MD = "report.md"
 
 
-def render_markdown(report: dict) -> str:
-    """`report.md`, rendered from `report.json` alone: every number and name in it is read from `report`."""
+def _render_head(report: dict) -> list[str]:
+    """The lines every report version shares: headline, effect, registration and power."""
     reg, gate, power, shown = report["registration"], report["gate_result"], report["power"], report["display"]
     status = _effective_status(report["status"], reg["post_hoc"])
     lines = [_headline(report["status"], reg["post_hoc"]), ""]
@@ -877,14 +877,52 @@ def render_markdown(report: dict) -> str:
         lines.append(f"- amends: {reg['amends']}")
     lines += ["", "## Power",
               f"- sealed items planned: {power['n_sealed']}, needed: {power['n_needed']}",
-              f"- smallest gain the sealed set can detect: {shown['mde_planned']}", "",
-              "## Gate attempts"]
-    for e in report["ledger"]:
-        outcome = {True: "passed", False: "did not pass", None: "no outcome recorded"}[e["passed"]]
-        lines.append(f"- attempt {e['attempt_id']}: alpha {e['alpha']}, {outcome}")
-    lines += ["", "## Sealed evaluation and gate log"]
+              f"- smallest gain the sealed set can detect: {shown['mde_planned']}"]
+    return lines
+
+
+def _render_keeper(report: dict) -> list[str]:
+    """Report `schema_version` 2 (built and signed by the keeper): every attempt with its alpha, the set's ledger, the
+    alpha rule and its guarantee, and the keeper's key fingerprint."""
+    rule = report["alpha_rule"]
+    ledger = {row["attempt_id"]: row for row in report["ledger"]}
+    lines = ["", "## Sealed attempts of this project"]
     for a in report["attempts"]:
-        lines.append(f"- {a['stage']} attempt {a['attempt']} {a['event']} at {a['utc']}")
+        row = ledger.get(a["attempt_id"], {})
+        lines.append(f"- attempt {a['attempt_id']} (j = {a['j']}) at {a['utc']}: status {a['status']}, alpha "
+                     f"{a['alpha']}, alpha spent {row.get('cost')}, alpha earned {row.get('earned')}, candidate "
+                     f"{a['candidate_model_sha256']}")
+    lines += ["", "## Alpha-investing ledger of the sealed set"]
+    for row in report["ledger"]:
+        lines.append(f"- attempt {row['attempt_id']} of project {row['project_id']}: alpha {row['alpha']}, "
+                     f"{'passed' if row['passed'] else 'did not pass'}, alpha spent {row['cost']}, alpha earned "
+                     f"{row['earned']}, wealth after {row['wealth_after']}")
+    lines += ["", "## Alpha rule",
+              f"- rule: {rule['rule']}",
+              f"- initial wealth: {rule['initial_wealth']}, payout on a PASS: {rule['payout']}, smallest bid: "
+              f"{rule['min_bid']}, planning alpha: {rule['planning_alpha']}",
+              f"- guarantee: {rule['guarantee']}", "",
+              "## Keeper",
+              f"- key fingerprint: {report['keeper']['fingerprint']}",
+              f"- environment: {report['keeper']['environment_sha256']}"]
+    return lines
+
+
+def render_markdown(report: dict) -> str:
+    """`report.md`, rendered from `report.json` alone: every number and name in it is read from `report`. A report of
+    `schema_version` 2 (the keeper's) lists every attempt with alpha spent and earned, the alpha rule and the key
+    fingerprint; version 1 renders as in step 1."""
+    lines = _render_head(report)
+    if report.get("schema_version") == 2:
+        lines += _render_keeper(report)
+    else:
+        lines += ["", "## Gate attempts"]
+        for e in report["ledger"]:
+            outcome = {True: "passed", False: "did not pass", None: "no outcome recorded"}[e["passed"]]
+            lines.append(f"- attempt {e['attempt_id']}: alpha {e['alpha']}, {outcome}")
+        lines += ["", "## Sealed evaluation and gate log"]
+        for a in report["attempts"]:
+            lines.append(f"- {a['stage']} attempt {a['attempt']} {a['event']} at {a['utc']}")
     lines += ["", "## Known limits"]
     lines += [f"- {x['text']}" for x in report["known_limits"]]
     lines.append("")

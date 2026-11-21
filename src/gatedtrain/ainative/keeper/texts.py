@@ -27,3 +27,29 @@ LIMIT_KEEPER_CONFIRMATION = ("an agent with the user's shell can run `gatedtrain
 def sealed_guarantee(keeper_uid: int, owner_uid: int) -> str:
     """The guarantee a keeper running as `keeper_uid` for the user `owner_uid` states."""
     return KEEPER_SAME_USER_GUARANTEE if keeper_uid == owner_uid else KEEPER_GUARANTEE
+
+
+# ---- report v2 known limits (spec §5.4; preflight finding 16) -----------------------------------------------------
+
+LIMIT_KEEPER_MODEL_REFERENCE = ("a model reference must content-address its weights; the keeper hashes the model files "
+                                "a reference lists (`files`) when it scores, not weights the reference reaches in any "
+                                "other way")
+
+LIMIT_ALPHA_RULE = ("the test level of each attempt is set by alpha-investing (Foster-Stine) over every sealed "
+                    "evaluation on this sealed set, from every project that uses it; the guarantee is the marginal "
+                    "false discovery rate (mFDR) at level 0.05 over those attempts, not an error rate per attempt")
+
+
+def sealed_evaluations_text(n: int) -> str:
+    return (f"the sealed set was scored in {n} sealed evaluation{'' if n == 1 else 's'} across the projects that use "
+            "it (crashed ones included); each spent its alpha before it was scored, and this report closes the set")
+
+
+def known_limits(guarantee: str, n_attempts: int) -> list[dict]:
+    """The known limits of a keeper report (`schema_version` 2)."""
+    return [{"id": "sealed_guarantee", "text": guarantee},
+            {"id": "original_data", "text": LIMIT_ORIGINAL_DATA},
+            {"id": "metric_confirmation", "text": LIMIT_KEEPER_CONFIRMATION},
+            {"id": "model_reference", "text": LIMIT_KEEPER_MODEL_REFERENCE},
+            {"id": "alpha_rule", "text": LIMIT_ALPHA_RULE},
+            {"id": "sealed_evaluations", "attempts": n_attempts, "text": sealed_evaluations_text(n_attempts)}]
