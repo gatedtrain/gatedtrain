@@ -3,6 +3,7 @@ refuses model files whose format runs code on load (tests/README.md section 13).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
@@ -30,10 +31,10 @@ def _tmpdir(case: unittest.TestCase) -> Path:
 
 
 def _group_with_a_stranger():
-    """Every group appears to have a member with another uid (host-independent group-write tests)."""
-    stranger = mock.Mock(pw_name="agent", pw_uid=OTHER_UID, pw_gid=0)
-    return mock.patch.multiple(envcheck, grp=mock.Mock(getgrgid=lambda gid: mock.Mock(gr_gid=gid, gr_mem=["agent"])),
-                               pwd=mock.Mock(getpwnam=lambda name: stranger, getpwall=lambda: [stranger]))
+    """Every group appears shared (not a user-private group): host-independent group-write tests."""
+    return mock.patch.multiple(
+        envcheck, grp=mock.Mock(getgrgid=lambda gid: mock.Mock(gr_gid=gid, gr_name="staff", gr_mem=["agent"])),
+        pwd=mock.Mock(getpwuid=lambda uid: mock.Mock(pw_name=f"u{uid}", pw_uid=uid, pw_gid=-1)))
 
 
 def _hex(data: bytes) -> str:
@@ -129,18 +130,11 @@ class TestPathProblems(unittest.TestCase):
         self.assertEqual([str(hop_dir) in p.message for p in problems], [True], problems)
 
 
-def _grp_entry(gid: int, members: list[str]):
-    return mock.Mock(gr_gid=gid, gr_mem=members)
-
-
-def _pw_entry(name: str, uid: int, gid: int):
-    return mock.Mock(pw_name=name, pw_uid=uid, pw_gid=gid)
-
-
 @skip_unless_linux
 class TestGroupWrite(unittest.TestCase):
-    """A group-write bit refuses only when the group has a member outside the allowed uids (the keeper's, root);
-    the group database is patched so the tests do not depend on the host."""
+    """A group-write bit is accepted only on the user-private group of an allowed uid (the keeper's, root), known
+    without enumerating users, and without a POSIX ACL. The group and user databases, the file's gid and its
+    extended attributes are patched so the tests do not depend on the host."""
 
     GID = 4242
 
@@ -150,8 +144,8 @@ class TestGroupWrite(unittest.TestCase):
         self.f = self.tmp / "mod.py"
         self.f.write_text("x = 1\n", encoding="utf-8")
         os.chmod(self.f, 0o664)
-        real_lstat = os.lstat
-        f = str(self.f)
+        self.xattrs: list[str] = []
+        real_lstat, f = os.lstat, str(self.f)
 
         def lstat(path, *a, **kw):                             # the file appears to belong to group GID
             st = real_lstat(path, *a, **kw)
@@ -160,54 +154,125 @@ class TestGroupWrite(unittest.TestCase):
             fields = list(st)
             fields[stat.ST_GID] = self.GID
             return os.stat_result(fields)
-        patcher = mock.patch.object(envcheck.os, "lstat", lstat)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
-    def _problems(self, members: list[str], users: list, *, missing: bool = False) -> list:
+        def listxattr(path, *a, **kw):
+            return list(self.xattrs) if str(path) == f else []
+        for name, fake in (("lstat", lstat), ("listxattr", listxattr)):
+            patcher = mock.patch.object(envcheck.os, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _problems(self, *, group: tuple[str, list[str]] | None, keeper_gid: int, keeper_name: str = "keeper") -> list:
         def getgrgid(gid):
-            if missing or gid != self.GID:
+            if group is None or gid != self.GID:
                 raise KeyError(gid)
-            return _grp_entry(gid, members)
-        names = {u.pw_name: u for u in users}
+            return mock.Mock(gr_gid=gid, gr_name=group[0], gr_mem=group[1])
 
-        def getpwnam(name):
-            return names[name]
+        def getpwuid(uid):
+            if uid == os.getuid():
+                return mock.Mock(pw_name=keeper_name, pw_uid=uid, pw_gid=keeper_gid)
+            if uid == 0:
+                return mock.Mock(pw_name="root", pw_uid=0, pw_gid=0)
+            raise KeyError(uid)
         with mock.patch.object(envcheck.grp, "getgrgid", getgrgid), \
-                mock.patch.object(envcheck.pwd, "getpwnam", getpwnam), \
-                mock.patch.object(envcheck.pwd, "getpwall", lambda: list(users)):
+                mock.patch.object(envcheck.pwd, "getpwuid", getpwuid):
             return envcheck.path_problems([self.f], os.getuid())
 
-    def test_group_of_only_the_keeper_is_accepted(self):
-        users = [_pw_entry("keeper", os.getuid(), self.GID), _pw_entry("root", 0, 0)]
-        self.assertEqual(self._problems(["keeper", "root"], users), [])
+    def test_user_private_group_is_accepted(self):
+        self.assertEqual(self._problems(group=("keeper", []), keeper_gid=self.GID), [])
+        self.assertEqual(self._problems(group=("keeper", ["keeper", "root"]), keeper_gid=self.GID), [])
 
-    def test_group_with_another_member_refused(self):
-        users = [_pw_entry("keeper", os.getuid(), self.GID), _pw_entry("agent", OTHER_UID, 100)]
-        problems = self._problems(["agent"], users)
+    def test_supplementary_member_with_another_uid_refused(self):
+        problems = self._problems(group=("keeper", ["agent"]), keeper_gid=self.GID)
         self.assertEqual([p.rule for p in problems], ["AN-13"])
         self.assertIn(str(self.f), problems[0].message)
         self.assertIn("0664", problems[0].message)
         self.assertIn(f"gid {self.GID}", problems[0].message)
 
-    def test_primary_group_member_refused(self):
-        users = [_pw_entry("keeper", os.getuid(), 100), _pw_entry("agent", OTHER_UID, self.GID)]
-        self.assertEqual(len(self._problems([], users)), 1)
+    def test_shared_group_with_an_invisible_member_refused(self):
+        # no listed member, but the group is not the keeper's primary group: users whose primary group it is may not
+        # be listable (NSS without enumeration), so it refuses
+        self.assertEqual(len(self._problems(group=("staff", []), keeper_gid=100)), 1)
+
+    def test_group_named_otherwise_refused(self):
+        self.assertEqual(len(self._problems(group=("staff", []), keeper_gid=self.GID)), 1)
 
     def test_unresolvable_group_refused(self):
-        users = [_pw_entry("keeper", os.getuid(), self.GID)]
-        self.assertEqual(len(self._problems([], users, missing=True)), 1)
-
-    def test_unresolvable_member_name_refused(self):
-        users = [_pw_entry("keeper", os.getuid(), self.GID)]
-        self.assertEqual(len(self._problems(["ghost"], users)), 1)
+        self.assertEqual(len(self._problems(group=None, keeper_gid=self.GID)), 1)
 
     def test_other_write_refused_even_for_a_private_group(self):
         os.chmod(self.f, 0o666)
-        users = [_pw_entry("keeper", os.getuid(), self.GID)]
-        problems = self._problems([], users)
+        problems = self._problems(group=("keeper", []), keeper_gid=self.GID)
         self.assertEqual(len(problems), 1)
         self.assertIn("0666", problems[0].message)
+
+    def test_posix_acl_refused(self):
+        self.xattrs = ["system.posix_acl_access"]
+        problems = self._problems(group=("keeper", []), keeper_gid=self.GID)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("ACL", problems[0].message)
+
+    def test_default_acl_counts_on_a_directory_only(self):
+        self.xattrs = ["system.posix_acl_default"]                # mod.py is a file: a default ACL means nothing
+        self.assertEqual(self._problems(group=("keeper", []), keeper_gid=self.GID), [])
+        self.assertTrue(envcheck._has_posix_acl(self.f, True))
+
+    def test_no_xattr_support_is_no_acl(self):
+        with mock.patch.object(envcheck.os, "listxattr", side_effect=OSError(errno.ENOTSUP, "not supported")):
+            self.assertFalse(envcheck._has_posix_acl(self.f, False))
+        with mock.patch.object(envcheck.os, "listxattr", side_effect=OSError(errno.EACCES, "denied")):
+            self.assertTrue(envcheck._has_posix_acl(self.f, False))
+
+
+@skip_unless_linux
+class TestBytecodeAndPth(unittest.TestCase):
+    def setUp(self):
+        self.tmp = _tmpdir(self)
+        os.chmod(self.tmp, 0o700)
+        self.pkg = self.tmp / "pkg"
+        self.pkg.mkdir(mode=0o755)
+        os.chmod(self.pkg, 0o755)
+        self.mod = self.pkg / "m.py"
+        self.mod.write_text("x = 1\n", encoding="utf-8")
+        os.chmod(self.mod, 0o644)
+        self.cache = self.pkg / "__pycache__"
+        self.cache.mkdir()
+        os.chmod(self.cache, 0o755)
+        self.pyc = self.cache / "m.cpython-312.pyc"
+        self.pyc.write_bytes(b"\x00")
+        os.chmod(self.pyc, 0o644)
+
+    def _problems(self) -> list:
+        return envcheck.path_problems(envcheck._bytecode_paths([self.mod]), os.getuid())
+
+    def test_clean_cache_passes(self):
+        self.assertEqual(set(envcheck._bytecode_paths([self.mod])), {self.cache, self.pyc})
+        self.assertEqual(self._problems(), [])
+
+    def test_writable_pycache_dir_refused(self):
+        os.chmod(self.cache, 0o777)
+        self.assertTrue(any(str(self.cache) in p.message for p in self._problems()))
+
+    def test_writable_pyc_refused(self):
+        os.chmod(self.pyc, 0o646)
+        self.assertTrue(any(str(self.pyc) in p.message for p in self._problems()))
+
+    def test_writable_pth_refused(self):
+        pth = self.tmp / "evil.pth"
+        pth.write_text("import os\n", encoding="utf-8")
+        os.chmod(pth, 0o646)
+        with mock.patch.object(envcheck, "_site_dirs", lambda: [str(self.tmp)]):
+            found = envcheck._pth_files()
+        self.assertEqual(found, [pth])
+        self.assertTrue(any(str(pth) in p.message for p in envcheck.path_problems(found, os.getuid())))
+
+    def test_code_paths_include_the_site_pth_files_and_cached_bytecode(self):
+        import gatedtrain.ainative.keeper.envcheck as mod
+        paths = {os.path.abspath(p) for p in envcheck.keeper_code_paths()}
+        for pth in envcheck._pth_files():
+            self.assertIn(os.path.abspath(pth), paths)
+        if getattr(mod, "__cached__", None) and os.path.exists(mod.__cached__):
+            self.assertIn(os.path.abspath(mod.__cached__), paths)
 
 
 @skip_unless_linux
@@ -292,6 +357,12 @@ class TestModelFiles(unittest.TestCase):
         link = self.tmp / "model.safetensors"
         link.symlink_to(entry["path"])
         self._refused({"path": str(link), "sha256": entry["sha256"]})
+
+    def test_fifo_refused_without_blocking(self):
+        fifo = self.tmp / "model.safetensors"
+        os.mkfifo(fifo)
+        problems = self._refused({"path": str(fifo), "sha256": _hex(b"")})
+        self.assertIn("not a regular file", problems[0].message)
 
     def test_missing_file_refused(self):
         self._refused({"path": str(self.tmp / "missing.safetensors"), "sha256": _hex(b"")})

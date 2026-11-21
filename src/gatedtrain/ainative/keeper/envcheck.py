@@ -5,16 +5,23 @@ file it runs, or any directory above one, is writable by another uid (spec secti
 when:
 - its owner is neither the keeper's uid nor root (0);
 - it has the other-write bit;
-- it has the group-write bit and its group has a member whose uid is not allowed. The members are the group's
-  supplementary members in the group database plus every user whose primary group it is; the allowed uids are the
-  keeper's uid (which is the owner uid when the keeper runs as the user) and root. A group, or a member name, that
-  cannot be resolved counts as having another member.
+- it has the group-write bit, unless its group is the user-private group of an allowed user and it has no POSIX ACL.
+  The allowed uids are the keeper's uid (which is the owner uid when the keeper runs as the user) and root. A
+  user-private group is one whose membership is certain without enumerating the user database: its gid is the
+  allowed user's primary gid, its name is that user's name, and its supplementary members are allowed users only.
+  Any other group (a shared group, or one that cannot be resolved) refuses, since users whose primary group it is
+  may not be listable (NSS without enumeration). With a POSIX ACL (`system.posix_acl_access`, or
+  `system.posix_acl_default` on a directory) the group bits are the ACL mask, so a named user may write: refused. A
+  filesystem without extended attributes has no ACL.
 A root-owned directory with the sticky bit (such as `/tmp`) is excepted from the write-bit rules. The state directory
 itself must be exactly 0700 (spec section 5.1); its ancestors follow the rules above.
 
-The files checked are those of the interpreter, `sys.path`, every imported module, gatedtrain, the installed scenario
-packs and gatedtrain's runtime dependencies (followed through their requirements, extras left out, so an optional
-torch is not hashed at start).
+The files checked are those of the interpreter, `sys.path`, every module imported when the check runs (its source and
+its cached bytecode), the `__pycache__` directory next to every checked `.py` file and the files in it, every `.pth`
+file in the site directories (run at every interpreter start), gatedtrain, the installed scenario packs and
+gatedtrain's runtime dependencies (followed through their requirements, extras left out, so an optional torch is not
+hashed at start). Known limit: a module that is first imported after the check and lies outside those distributions
+is not checked; site-packages is not walked as a whole.
 
 The environment record names those distributions with a hash of their files; the keeper signs it once at start.
 
@@ -24,10 +31,12 @@ link, or a hash that differs from the one the driver sent is refused before any 
 
 from __future__ import annotations
 
+import errno
 import grp
 import hashlib
 import os
 import pwd
+import site
 import re
 import stat
 import sys
@@ -68,26 +77,35 @@ def _chain(path: Path) -> list[Path]:
     return chain
 
 
+_ACL_ATTRS = ("system.posix_acl_access",)
+_DEFAULT_ACL_ATTR = "system.posix_acl_default"
+
+
+def _has_posix_acl(path: Path, is_dir: bool) -> bool:
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            return False                     # no extended attributes on this filesystem: no ACL
+        return True                          # cannot tell: treat as an ACL (refuse)
+    wanted = _ACL_ATTRS + ((_DEFAULT_ACL_ATTR,) if is_dir else ())
+    return any(n in names for n in wanted)
+
+
 class _Groups:
-    """Whether a group has a member outside the allowed uids; the user and group databases are read once per check."""
+    """Whether a gid is the user-private group of an allowed user (known without enumerating the user database)."""
 
     def __init__(self, allowed: frozenset[int]) -> None:
-        self.allowed = allowed
-        self._users: list | None = None
+        self.users = {}
+        for uid in allowed:
+            try:
+                self.users[uid] = pwd.getpwuid(uid)
+            except KeyError:
+                pass
+        self.names = {u.pw_name for u in self.users.values()}
         self._cache: dict[int, bool] = {}
 
-    def _all_users(self) -> list:
-        if self._users is None:
-            self._users = list(pwd.getpwall())
-        return self._users
-
-    def _uid_of(self, name: str) -> int | None:
-        try:
-            return pwd.getpwnam(name).pw_uid
-        except KeyError:
-            return None
-
-    def has_other_member(self, gid: int) -> bool:
+    def is_private(self, gid: int) -> bool:
         if gid not in self._cache:
             self._cache[gid] = self._lookup(gid)
         return self._cache[gid]
@@ -96,12 +114,9 @@ class _Groups:
         try:
             group = grp.getgrgid(gid)
         except KeyError:
-            return True                      # an unknown group: its members cannot be known
-        for name in group.gr_mem:
-            uid = self._uid_of(name)
-            if uid is None or uid not in self.allowed:
-                return True
-        return any(u.pw_gid == gid and u.pw_uid not in self.allowed for u in self._all_users())
+            return False
+        return any(u.pw_gid == gid and group.gr_name == u.pw_name for u in self.users.values()) \
+            and set(group.gr_mem) <= self.names
 
 
 def _one_path_problems(path: Path, st: os.stat_result, keeper_uid: int, groups: _Groups) -> list[Problem]:
@@ -117,10 +132,15 @@ def _one_path_problems(path: Path, st: os.stat_result, keeper_uid: int, groups: 
     if mode & 0o002:
         problems.append(_problem("environment", f"{path} is writable by every user (mode {mode:04o})",
                                  f"remove the write bit: chmod o-w {path}"))
-    if mode & 0o020 and groups.has_other_member(st.st_gid):
-        problems.append(_problem("environment", f"{path} is writable by its group (mode {mode:04o}, gid "
-                                 f"{st.st_gid}), which has a member other than the keeper and root",
-                                 f"remove the write bit (chmod g-w {path}) or the other members from the group"))
+    if mode & 0o020:
+        if not groups.is_private(st.st_gid):
+            problems.append(_problem("environment", f"{path} is writable by its group (mode {mode:04o}, gid "
+                                     f"{st.st_gid}), which is not the private group of the keeper or root",
+                                     f"remove the write bit: chmod g-w {path}"))
+        elif _has_posix_acl(path, stat.S_ISDIR(st.st_mode)):
+            problems.append(_problem("environment", f"{path} has a POSIX ACL and group write bits (mode "
+                                     f"{mode:04o}), so a named user may write to it",
+                                     f"remove the ACL (setfacl -b {path}) or the write bit (chmod g-w {path})"))
     return problems
 
 
@@ -290,12 +310,54 @@ def keeper_code_paths() -> list[Path]:
         if p.exists():
             paths.append(p)
     for module in list(sys.modules.values()):
-        f = getattr(module, "__file__", None)
-        if isinstance(f, str) and os.path.exists(f):
-            paths.append(Path(f))
+        for attr in ("__file__", "__cached__"):
+            f = getattr(module, attr, None)
+            if isinstance(f, str) and os.path.exists(f):
+                paths.append(Path(f))
     for dist in keeper_distributions():
         paths += distribution_files(dist).values()
+    paths += _pth_files()
+    paths += _bytecode_paths(paths)
     return paths
+
+
+def _site_dirs() -> list[str]:
+    dirs = list(site.getsitepackages()) if hasattr(site, "getsitepackages") else []
+    dirs += [d for d in (sysconfig.get_path("purelib"), sysconfig.get_path("platlib")) if d]
+    return sorted(set(dirs))
+
+
+def _pth_files() -> list[Path]:
+    """Every `.pth` file directly in a site directory: the interpreter runs their import lines at every start."""
+    out = []
+    for d in _site_dirs():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        out += [Path(d) / n for n in sorted(names) if n.endswith(".pth")]
+    return out
+
+
+def _bytecode_paths(paths: list[Path]) -> list[Path]:
+    """The `__pycache__` directory next to every `.py` file and the files in it: CPython loads a matching `.pyc`
+    without reading the source."""
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for p in paths:
+        if p.suffix != ".py":
+            continue
+        cache = Path(os.path.abspath(p)).parent / "__pycache__"
+        if cache in seen:
+            continue
+        seen.add(cache)
+        try:
+            names = os.listdir(cache)
+        except OSError:                      # missing: creating it needs a write to the parent, which is checked
+            continue
+        out.append(cache)
+        out += [cache / n for n in sorted(names)]
+    return out
 
 
 def _file_sha256(path: Path) -> str:
@@ -333,7 +395,8 @@ def environment_sha256(record: dict) -> str:
 
 def _read_model_file(path: Path) -> tuple[str, bytes]:
     """`(sha256, first bytes)` of a regular file opened without following a final link."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    # O_NONBLOCK: a FIFO swapped in after the lstat check must not block the keeper on open.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise IsADirectoryError(path)
@@ -364,6 +427,8 @@ def _model_file_problem(field: str, entry: object) -> tuple[Problem | None, dict
         return _problem(field, f"{path.name}: cannot read the file", "pass an existing model file"), None
     if stat.S_ISLNK(st.st_mode):
         return _problem(field, f"{path.name} is a symbolic link", "pass the file itself, not a link"), None
+    if not stat.S_ISREG(st.st_mode):
+        return _problem(field, f"{path.name} is not a regular file", "pass a regular model file"), None
     try:
         digest, head = _read_model_file(path)
     except OSError:
