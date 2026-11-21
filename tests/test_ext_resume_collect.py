@@ -337,7 +337,9 @@ class TestThreeAttempts(Case):
 
 class TestOldLayoutImpactUnchanged(Case):
     def test_old_layout_json_answer_is_byte_for_byte_the_pre_resume_answer(self):
-        """The fixture was captured from the implementation at a3afd25 (before EXT-RES-5) for this scenario."""
+        """The fixture was captured from origin/main behaviour (before resumable runs) for this scenario: the `impact
+        --json` answer of an old-layout run (no attempts.jsonl) for shard-00001, with `query` set to null and the run
+        id replaced by `<run>`. The answer must match it byte for byte and keep its four keys."""
         sc = self.scenario()
         (sc.stage_out / "attempts.jsonl").unlink()
         proc = sc.collect(self.runs())
