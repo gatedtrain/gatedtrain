@@ -30,13 +30,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -e '.[tier-a]'
-      # The keeper refuses to start when a file it runs, or a directory above one, is writable by group or other
-      # (AN-13). The toolcache Python and the checkout belong to the runner user, so it clears those bits without sudo;
-      # the second step lists what is still open (at most 20 lines) and never fails on its own.
+      # The keeper refuses to start when a file it runs, or a directory above one, is writable by another uid (AN-13).
+      # The toolcache Python and the checkout belong to the runner user, which clears those bits itself; the image
+      # ships the directories above the toolcache Python (/opt, /opt/hostedtoolcache, ...) world-writable with an ACL,
+      # so this one step clears their group and other write bits with sudo (on an ACL, g-w clears the mask's write bit;
+      # the tests still run as the runner user). The last step fails the job
+      # early, with the list of what is still open, instead of every keeper test failing at start.
       - run: chmod -R go-w "$pythonLocation" "$GITHUB_WORKSPACE"
+      - run: |
+          d="$pythonLocation"
+          while [ "$d" != / ]; do d="$(dirname "$d")"; sudo chmod go-w "$d"; done
       - run: >-
-          python -c "import os; from gatedtrain.ainative.keeper import envcheck as e;
-          [print(p.line()) for p in e.path_problems(e.keeper_code_paths(), os.getuid())[:20]]"
+          python -c "import os, sys; from gatedtrain.ainative.keeper import envcheck as e;
+          ps = e.path_problems(e.keeper_code_paths(), os.getuid()); [print(p.line()) for p in ps[:20]];
+          sys.exit(1 if ps else 0)"
       # The CPU model and instruction sets of the runner, to match a demo result with the hardware it ran on.
       - run: grep -m1 'model name' /proc/cpuinfo; grep -o -m1 -w -E 'avx512f|avx2' /proc/cpuinfo | sort -u
       # As the runner user: the launch fixtures run the container as the user running the tests (EXT-63). That user
