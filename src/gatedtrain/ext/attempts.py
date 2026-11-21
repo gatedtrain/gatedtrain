@@ -2,17 +2,19 @@
 and the kept/orphaned split (EXT-RES-1 to EXT-RES-4; tests/README.md section 11.35).
 
 A run's `attempts.jsonl` begins with the header line `{"schema": "gatedtrain.ext.attempts", "version": 1}` (the
-marker of the new layout; a file whose first line is not that header is an older launcher's file and is not read
-here), then holds, per attempt A (1, 2, ... in launch order), a `start` line
+marker of the new layout; a file whose first line does not name the schema id is an older launcher's file and is not
+read here, and a first line that names it but is not exactly that header, integer version included, refuses), then
+holds, per attempt A (1, 2, ... in launch order), a `start` line
 `{"event": "start", "attempt": A, "utc": ..., "restore": null | {"cut", "last_step_included",
 "cut_json_sha256", "repaired"}}` and, only on a normal exit, an `end` line `{"event": "end", "attempt": A,
-"utc": ..., "status": ...}`. gpu-step.sh's log holds, per label, `START`, then `PREEMPTED` or `END rc=<int>`.
+"utc": ..., "status": ...}`. Start times do not decrease from one attempt to the next. gpu-step.sh's log holds, per label, `START`, then `PREEMPTED` or `END rc=<int>`.
 
 Alignment rule. A "non-empty attempt" is one with a `start` line. Guard attempts are the label's `START`
 events in log order (the `attempt=` token restarts at 1 on each gpu-step.sh invocation, so it is not used).
 A run `start` line pairs with the LAST guard attempt whose `START` is <= the line's `utc` (the run's start may
 be later than the guard's `START`), and its `utc` must be <= that attempt's terminator (or the next `START`
-when unterminated); two run lines in one guard attempt refuse. Run `utc` values are ISO 8601 UTC (`Z` or
+when unterminated); two run lines in one guard attempt refuse, and so does a run attempt whose guard attempt comes
+before the previous run attempt's (guard order follows attempt order). Run `utc` values are ISO 8601 UTC (`Z` or
 `+00:00`, optional fraction) compared at whole seconds. A guard attempt with no run `start` line is an empty
 attempt (paired with None), allowed only if it ended `PREEMPTED` and is not the last guard attempt.
 
@@ -27,7 +29,8 @@ is committed when it is in the `cuts` list ext-collect passes in. With more than
 committed cut's `cut.json` must carry a positive integer `attempt` (its writer), naming one of the non-empty
 attempts, with a step above that writer's branch step; otherwise the chain refuses (there is no step-based
 fallback). A single-attempt run may omit the field. The restore's `last_step_included` and `cut_json_sha256` must
-match the cut and its `cut.json` bytes (read without following links). A repaired restore is checked the same way
+match the cut and its `cut.json` bytes (read without following links); a restored cut's `cut.json` must carry
+that integer `last_step_included` (design 5.1: every restore point records it). A repaired restore is checked the same way
 (EXT-RES-7 adds its own validity checks). A later attempt with no earlier cut restores nothing and starts at
 branch step 0. A non-final segment ends at the next attempt's branch step; the final one at `max_steps`. A record
 of attempt A is kept iff `branch_step_A < step <= end_step_A` (EXT-RES-4)."""
@@ -52,9 +55,12 @@ HEADER = {"schema": HEADER_SCHEMA, "version": HEADER_VERSION}
 
 
 def is_new_layout(stage_out: Path) -> bool:
-    """Whether `<stage_out>/attempts.jsonl` is the resumable layout: its FIRST line is the header
-    `{"schema": "gatedtrain.ext.attempts", "version": 1}`. Any other attempts.jsonl (the launchers' older formats)
-    or none is the old layout. A link counts as new so that read_attempts refuses it."""
+    """Whether `<stage_out>/attempts.jsonl` is the resumable layout: its FIRST line names the schema id
+    `gatedtrain.ext.attempts` (the header `{"schema": "gatedtrain.ext.attempts", "version": 1}`). The first line ends at
+    the reader's line ends (`\\n`, `\\r\\n` or `\\r`, `canonical.text_lines`). A first line that names the schema id but is
+    not that exact header (a BOM before it, other keys, a float version) is the new layout too, so that read_attempts
+    refuses it instead of reading the run as an old one (EXT-RES-1). Any other attempts.jsonl (the launchers' older
+    formats) or none is the old layout. A link counts as new so that read_attempts refuses it."""
     path = Path(stage_out) / ATTEMPTS_FILE
     if os.path.islink(path):
         return True
@@ -64,11 +70,10 @@ def is_new_layout(stage_out: Path) -> bool:
             data = armfs.read_file(dfd, ATTEMPTS_FILE)
         finally:
             os.close(dfd)
-        first = data.split(b"\n", 1)[0].decode("utf-8")
-        doc = json.loads(first)
-    except (armfs.Unreadable, UnicodeDecodeError, ValueError, RecursionError, OSError):
+    except (armfs.Unreadable, OSError):
         return False
-    return isinstance(doc, dict) and doc.get("schema") == HEADER_SCHEMA
+    first = data.split(b"\n", 1)[0].split(b"\r", 1)[0]           # the first line of text_lines, on bytes
+    return HEADER_SCHEMA.encode() in first
 
 
 @dataclass(frozen=True)
@@ -127,15 +132,20 @@ def read_attempts(stage_out: Path) -> list[AttemptRecord]:
         raise _refuse(field, f"{ATTEMPTS_FILE} is not UTF-8", _FIX) from None
     starts: list[dict] = []
     ends: dict[int, str] = {}
+    last_start = None                                     # the previous start line's utc (whole seconds)
     for n, line in enumerate(text_lines(text), start=1):
         try:
             row = json.loads(line)
         except ValueError:
             raise _refuse(f"{field}:{n}", "line is not JSON", _FIX) from None
-        if n == 1 and isinstance(row, dict) and row.get("schema") == HEADER_SCHEMA:
-            if row.get("version") != HEADER_VERSION or isinstance(row.get("version"), bool):
+        if n == 1 and HEADER_SCHEMA in line:
+            # The header exactly: these two keys, the schema id and the integer version (not 1.0, not true).
+            if not (isinstance(row, dict) and set(row) == {"schema", "version"} and row["schema"] == HEADER_SCHEMA):
+                raise _refuse(f"{field}:1", f"the first line names {HEADER_SCHEMA} but is not the header "
+                                            f"{json.dumps(HEADER)}", _FIX)
+            if type(row["version"]) is not int or row["version"] != HEADER_VERSION:
                 raise _refuse(f"{field}:1", f"header version {row.get('version')!r} is not supported "
-                                            f"(this collector reads version {HEADER_VERSION})", _FIX)
+                                            f"(this collector reads the integer version {HEADER_VERSION})", _FIX)
             continue
         if not isinstance(row, dict) or not isinstance(row.get("attempt"), int) or isinstance(row["attempt"], bool) \
                 or not isinstance(row.get("utc"), str):
@@ -154,6 +164,12 @@ def read_attempts(stage_out: Path) -> list[AttemptRecord]:
             if row["attempt"] != len(starts) + 1:
                 raise _refuse(f"{field}:{n}", f"start line has attempt {row['attempt']}, expected {len(starts) + 1}",
                               _FIX)
+            t = _run_ts(row["utc"])
+            if last_start is not None and t < last_start:
+                # A backdated start would pair with an earlier guard window and flip the chain (align).
+                raise _refuse(f"{field}:{n}", f"start line of attempt {row['attempt']} has utc {row['utc']}, earlier "
+                                              "than the previous attempt's start; start times must not decrease", _FIX)
+            last_start = t
             starts.append(row)
         elif ev == "end":
             a = row["attempt"]
@@ -234,6 +250,7 @@ def align(records: list[AttemptRecord], guard: list[GuardAttempt]
 
     starts = [_ts(g.start_utc) for g in guard]
     assigned: dict[int, AttemptRecord] = {}
+    prev_gi = None                        # the guard attempt of the previous run attempt: guard order follows A
     for r in records:
         t = _run_ts(r.start_utc)
         cand = [i for i, st in enumerate(starts) if st <= t]
@@ -247,6 +264,12 @@ def align(records: list[AttemptRecord], guard: list[GuardAttempt]
             p1(f"attempts.jsonl attempt {r.attempt}", f"guard attempt {g.index} already holds a run start line "
                "(more run start lines than guard STARTs)", restart)
             return [(g, assigned.get(i)) for i, g in enumerate(guard)], problems
+        if prev_gi is not None and gi < prev_gi:
+            p1(f"attempts.jsonl attempt {r.attempt}", f"the start line lies in guard attempt {g.index}, before the "
+               f"previous run attempt's guard attempt {guard[prev_gi].index}; run attempts must follow the guard "
+               "attempts in order", restart)
+            return [(g, assigned.get(i)) for i, g in enumerate(guard)], problems
+        prev_gi = gi
         assigned[gi] = r
     pairs = [(g, assigned.get(i)) for i, g in enumerate(guard)]
 
@@ -381,7 +404,12 @@ def segment_chain(aligned: list[tuple[GuardAttempt, AttemptRecord | None]], cuts
                 doc = c[2] or {}
                 if rs.get("cut_json_sha256") != c[1]:
                     p2(r.attempt, f"cut_json_sha256 of {name} does not match its cut.json")
-                if "last_step_included" in doc and doc["last_step_included"] != step:
+                lsi = doc.get("last_step_included")
+                if not (isinstance(lsi, int) and not isinstance(lsi, bool)):
+                    # Design 5.1: every restore point is a committed cut with `last_step_included`.
+                    p2(r.attempt, f"the cut.json of {name} has no integer last_step_included; a restored cut must "
+                                  "record it")
+                elif lsi != step:
                     p2(r.attempt, f"last_step_included {step} of {name} does not match its cut.json")
                 if step != expected:
                     p2(r.attempt, f"{name} is not the newest committed cut of the earlier attempts "

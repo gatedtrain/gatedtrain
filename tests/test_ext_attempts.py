@@ -102,6 +102,42 @@ class ReadTests(Base):
         with self.assertRaises(Refused):
             read_attempts(self.dir)
 
+    def test_float_header_version_refuses(self):
+        # 1.0 == 1 in Python; the header's version must be the integer 1.
+        self.write_attempts([{"schema": "gatedtrain.ext.attempts", "version": 1.0}, start(1, "2026-11-20T10:00:05Z")])
+        with self.assertRaises(Refused) as cm:
+            read_attempts(self.dir)
+        self.assertEqual(cm.exception.problems[0].rule, "EXT-RES-1")
+
+    def test_header_lines_split_as_the_reader_splits(self):
+        # A lone \r ends a line for the reader (text_lines), so it must for the layout test too.
+        header = json.dumps({"schema": "gatedtrain.ext.attempts", "version": 1})
+        (self.dir / "attempts.jsonl").write_bytes((header + "\r" + json.dumps(start(1, "2026-11-20T10:00:05Z"))
+                                                   + "\r").encode())
+        self.assertTrue(is_new_layout(self.dir))
+        self.assertEqual(len(read_attempts(self.dir)), 1)
+
+    def test_first_line_naming_the_schema_must_be_the_exact_header(self):
+        # A first line that mentions the schema id but is not the exact header is the new layout, and refuses:
+        # a BOM before the header, extra keys, or a header that does not parse.
+        header = json.dumps({"schema": "gatedtrain.ext.attempts", "version": 1})
+        line = json.dumps(start(1, "2026-11-20T10:00:05Z"))
+        for first in ("﻿" + header, json.dumps({"schema": "gatedtrain.ext.attempts", "version": 1, "x": 1}),
+                      header[:-1], json.dumps(["gatedtrain.ext.attempts", 1])):
+            (self.dir / "attempts.jsonl").write_bytes((first + "\n" + line + "\n").encode())
+            self.assertTrue(is_new_layout(self.dir), first)
+            with self.assertRaises(Refused, msg=first) as cm:
+                read_attempts(self.dir)
+            self.assertEqual(cm.exception.problems[0].rule, "EXT-RES-1")
+
+    def test_backdated_start_refuses(self):
+        # Attempt 2's start is earlier than attempt 1's: the start times must not decrease across attempts.
+        self.write_attempts([start(1, "2026-11-20T11:00:05Z"), start(2, "2026-11-20T10:00:05Z", restore()),
+                             end(2, "2026-11-20T12:00:00Z")])
+        with self.assertRaises(Refused) as cm:
+            read_attempts(self.dir)
+        self.assertEqual(cm.exception.problems[0].rule, "EXT-RES-1")
+
 
 class GuardTests(Base):
     def test_guard_attempts(self):
@@ -291,6 +327,28 @@ class FixRoundTests(Base):
         with self.assertRaises(Refused):
             read_attempts(self.dir)
 
+    G3 = G1 + ["2026-11-20T11:00:00Z START run-a attempt=2", "2026-11-20T11:30:00Z PREEMPTED run-a attempt=2 rc=143",
+               "2026-11-20T12:00:00Z START run-a attempt=3", "2026-11-20T13:00:00Z END run-a attempt=3 rc=0"]
+
+    def test_guard_order_must_follow_attempt_order(self):
+        # Records that bypass the reader's time check (built directly): attempt 1 lies in guard window 2 and attempt 2
+        # in window 1. Pairing by window alone would flip the chain without a problem.
+        recs = [AttemptRecord(1, "2026-11-20T11:00:05Z", None, None, False),
+                AttemptRecord(2, "2026-11-20T10:00:05Z", restore(), None, False),
+                AttemptRecord(3, "2026-11-20T12:00:05Z", restore(), "ok", False)]
+        _, probs = align(recs, guard_attempts(self.write_log(self.G3), LABEL))
+        self.assertIn("EXT-RES-1", self.rules(probs))
+        self.assertTrue(any("order" in p.message for p in probs), probs)
+
+    def test_start_after_end_ok_refuses(self):
+        # An end line followed by another start line: the ended attempt is not final, which refuses.
+        _, probs = self.check(
+            [start(1, "2026-11-20T10:00:05Z"), end(1, "2026-11-20T10:20:00Z"), start(2, "2026-11-20T11:00:05Z", restore()),
+             end(2, "2026-11-20T12:00:00Z")],
+            self.G1 + ["2026-11-20T11:00:00Z START run-a attempt=2", "2026-11-20T12:00:01Z END run-a attempt=2 rc=0"])
+        self.assertIn("EXT-RES-3", self.rules(probs))
+        self.assertTrue(any("non-final attempt has an end line" in p.message for p in probs))
+
     def test_two_run_starts_in_one_guard_attempt_refuse(self):
         _, probs = self.check(
             [start(1, "2026-11-20T10:00:05Z"), start(2, "2026-11-20T10:10:05Z", restore()),
@@ -450,6 +508,17 @@ class ChainTests(Base):
         segs, probs = self.chain([rec(1), rec(2, self.rs(c10, repaired=True), "ok", True)], [c10])
         self.assertEqual(probs, [])
         self.assertEqual(segs[1].restore_cut, "checkpoint-10")
+
+    def test_restored_cut_without_last_step_included_refuses(self):
+        # Design 5.1: every restore point is a committed cut with `last_step_included` in its cut.json.
+        d = self.dir / "cuts" / "checkpoint-10"
+        d.mkdir(parents=True)
+        data = json.dumps({"files": {}, "attempt": 1}).encode()
+        (d / "cut.json").write_bytes(data)
+        c10 = (10, d, "sha256:" + __import__("hashlib").sha256(data).hexdigest())
+        _, probs = self.chain([rec(1), rec(2, self.rs(c10), "ok")], [c10])
+        self.assertEqual(self.rules(probs), ["EXT-RES-2"])
+        self.assertIn("last_step_included", probs[0].message)
 
     def test_repaired_restore_of_uncommitted_cut_refuses(self):
         ghost = (10, self.dir / "cuts" / "checkpoint-10", "sha256:" + "1" * 64)
