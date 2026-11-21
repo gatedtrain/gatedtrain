@@ -289,7 +289,7 @@ class KeeperState:
         return {"sealed_id": rec["sealed_id"], "train_rows": rec["train_rows"], "sealed_summary": summary,
                 "power": power, "reused": bool(reused)}
 
-    def _seal_new(self, project_id: str, raw: bytes, data_sha256: str) -> dict:
+    def _seal_new(self, project_id: str, raw: bytes, data_sha256: str, accept_inconclusive: bool) -> dict:
         s = sealed_eval.split_data(raw, data_sha256, planning_alpha=PLANNING_ALPHA,
                                    train_only=frozenset(self._released))
         inputs = set(s["input_hashes"])                  # a set: the order of first occurrence is not kept
@@ -301,6 +301,12 @@ class KeeperState:
         if s["n_sealed"] < 1:
             raise _problem("AN-16", "data", "every input was released as training in an earlier intake, so nothing "
                            "is left to seal", NEW_DATA_FIX)
+        if not s["conclusive"] and not accept_inconclusive:   # as step 1's intake_seal; nothing is stored yet
+            raise _problem("AN-6", "accept_inconclusive",
+                           f"the data are too small: the final test will most likely be INCONCLUSIVE "
+                           f"({s['n_sealed']} sealed examples, {s['n_needed']} needed); about {s['more']} more "
+                           "labelled examples would make it conclusive",
+                           "add labelled examples, or send accept_inconclusive true to go on")
         items = canonical_json(s["sealed"])
         sealed_id = sha256_bytes(items)
         self._write(f"sets/{_hex(sealed_id)}/items.json", items)
@@ -323,10 +329,15 @@ class KeeperState:
         self._index_intake(rec)
         return rec
 
-    def intake(self, project_id: str, raw: bytes, data_sha256: str) -> dict:
-        """Split and seal the data file (AN-16); returns `{sealed_id, train_rows, sealed_summary, power, reused}`."""
+    def intake(self, project_id: str, raw: bytes, data_sha256: str, *, accept_inconclusive: bool = False) -> dict:
+        """Split and seal the data file (AN-16); returns `{sealed_id, train_rows, sealed_summary, power, reused}`.
+        New data whose split would most likely be INCONCLUSIVE are refused (AN-6) unless `accept_inconclusive`,
+        before anything is stored, so the same rows plus more can be taken in afterwards."""
         with self._mutex:
             doc = self._project(project_id)
+            if not isinstance(accept_inconclusive, bool):
+                raise _problem("AN-6", "accept_inconclusive", "accept_inconclusive is not true or false",
+                               "send true or false, or leave it out")
             _check_sha(data_sha256, "data_sha256", "AN-16")
             if not isinstance(raw, bytes) or len(raw) > MAX_DATA_BYTES:
                 raise _problem("AN-6", "data", f"the data file is larger than 64 MiB ({MAX_DATA_BYTES} bytes)",
@@ -349,7 +360,7 @@ class KeeperState:
                                    NEW_DATA_FIX)
                 reused = rec["first_project_id"] != project_id
             else:
-                rec = self._seal_new(project_id, raw, data_sha256)
+                rec = self._seal_new(project_id, raw, data_sha256, accept_inconclusive)
                 reused = False
             doc.update(data_sha256=data_sha256, sealed_id=rec["sealed_id"], reused=reused)
             self._save_project(doc)

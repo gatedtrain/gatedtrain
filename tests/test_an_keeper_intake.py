@@ -176,6 +176,37 @@ class KeeperIntakeTest(unittest.TestCase):
         p = self.refused("intake", pid, intake_args(other))
         self.assertEqual(p.rule, "AN-16")
 
+    def test_inconclusive_data_need_the_flag_and_persist_nothing(self):   # AN-6, AN-16
+        small = [{"input": f"small-{i}", "label": f"L{i % 5}"} for i in range(100)]
+        pid = self.opened("p1")
+        p = self.refused("intake", pid, intake_args(jsonl(small)))
+        self.assertEqual((p.rule, p.field), ("AN-6", "accept_inconclusive"))
+        s = sealed_eval.split_data(jsonl(small), sha256_bytes(jsonl(small)), planning_alpha=PLANNING_ALPHA)
+        for n in (s["n_sealed"], s["n_needed"], s["more"]):
+            self.assertRegex(p.message, rf"\b{n}\b")
+        self.assertIn("add labelled examples", p.fix)
+        text = p.message + p.field + p.fix
+        self.assertFalse([r for r in small if r["input"] in text or re.search(rf"\b{r['label']}\b", text)])
+        self.assertEqual(sorted(x.name for x in self.kp.state.iterdir()), ["keeper.key", "lock", "projects"])
+        self.assertIsNone(self.client.call("latest_registration", pid, {}))
+        with self.assertRaises(Refused) as cm:
+            self.client.call("sealed_summary", pid, {})
+        self.assertEqual(problem(cm).rule, "AN-16")              # no data taken in
+        more = small + [{"input": f"more-{i}", "label": f"L{i % 5}"} for i in range(800)]
+        r = self.intake(pid, jsonl(more))                         # the same rows plus more: no AN-16
+        self.assertIs(r["power"]["conclusive_expected"], True)
+
+    def test_inconclusive_data_with_the_flag_are_sealed(self):
+        small = jsonl([{"input": f"small-{i}", "label": "x"} for i in range(100)])
+        pid = self.opened("p1")
+        p = self.refused("intake", pid, {**intake_args(small), "accept_inconclusive": "yes"})
+        self.assertEqual((p.rule, p.field), ("AN-6", "accept_inconclusive"))
+        r = self.call("intake", pid, {**intake_args(small), "accept_inconclusive": True})
+        self.assertIs(r["power"]["conclusive_expected"], False)
+        self.assertEqual(r["sealed_summary"]["n"], 50)
+        self.assertEqual(self.call("intake", pid, intake_args(small)), r)          # stored result, flag not needed
+        self.assertIs(self.intake(self.opened("p2"), small)["reused"], True)     # byte-identical reuse unaffected
+
     def test_same_data_second_project_reuses_the_sealed_set(self):     # AN-16, plan interpretation 1
         first = self.intake(self.opened("p1"))
         second = self.intake(self.opened("p2"))
@@ -294,7 +325,7 @@ class KeeperStateTest(unittest.TestCase):
     def ready(self, name: str = "p1", raw: bytes = TOY) -> tuple[str, dict]:
         pid = project_id(name)
         self.state.open_project(pid)
-        return pid, self.state.intake(pid, raw, sha256_bytes(raw))
+        return pid, self.state.intake(pid, raw, sha256_bytes(raw), accept_inconclusive=True)
 
     def test_a_second_state_on_one_directory_refused(self):
         with self.assertRaises(Refused) as cm:

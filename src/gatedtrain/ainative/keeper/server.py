@@ -11,8 +11,8 @@ one state directory is refused, and the Ed25519 signing key `keeper.key`, create
 environment record once.
 
 `OPS` maps an op name to its handler `(keeper, project, args, peer_uid) -> result`: `hello`, and the state ops
-`open_project`, `intake`, `sealed_summary`, `confirm_metric`, `register`, `registration`, `latest_registration`,
-`records` and `has_record`, each taking exactly the args it names.
+`open_project`, `intake` (optional `accept_inconclusive`), `sealed_summary`, `confirm_metric`, `register`,
+`registration`, `latest_registration`, `records` and `has_record`, each taking exactly the args it names.
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ def _intake(state: KeeperState, project: str, args: dict, peer: int) -> dict:
     except (ValueError, binascii.Error, UnicodeEncodeError):
         raise protocol.refused("args.data_b64", "the data are not standard base64 text",
                                "send the data file's bytes in standard base64") from None
-    return state.intake(project, raw, args["data_sha256"])
+    return state.intake(project, raw, args["data_sha256"], accept_inconclusive=args.get("accept_inconclusive", False))
 
 
 def _confirm(state: KeeperState, project: str, args: dict, peer: int) -> dict:
@@ -126,7 +126,7 @@ def _confirm(state: KeeperState, project: str, args: dict, peer: int) -> dict:
 OPS: dict[str, Callable[[Keeper, str | None, dict, int], object]] = {
     "hello": _hello,
     "open_project": _state_op(lambda st, pr, a, peer: st.open_project(pr)),
-    "intake": _state_op(_intake, ("data_b64", "data_sha256")),
+    "intake": _state_op(_intake, ("data_b64", "data_sha256"), ("accept_inconclusive",)),
     "sealed_summary": _state_op(lambda st, pr, a, peer: st.sealed_summary(pr)),
     "confirm_metric": _state_op(_confirm, ("scorer", "direction", "margin", "sentence"), ("scorer_params",)),
     "register": _state_op(lambda st, pr, a, peer: st.register(pr, a["registration"]), ("registration",)),
