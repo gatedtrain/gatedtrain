@@ -111,9 +111,13 @@ def _hello_key(hello: Any) -> tuple[str, bytes]:
 def bind_project(project: Project, socket: Path) -> KeeperBinding:
     """Bind the project to the keeper at `socket`: ask its key (`hello`), open the project in the keeper, then write
     `trust/keeper.pub` and `trust/keeper.json`. Binding again to the same key is a no-op; a binding to another key is
-    refused (AN-14), since the project's signed records name the first one."""
+    refused (AN-14), since the project's signed records name the first one.
+
+    Both calls wait with the long-op deadline (`protocol.LONG_OP_TIMEOUT_S`, read at call time), as `KeeperTrust.check`
+    does: on a keeper busy with another client's evaluation the wait is queueing, not work; a keeper that is not
+    running still fails at the connect (AN-12)."""
     socket = Path(socket).absolute()
-    client = KeeperClient(socket)
+    client = KeeperClient(socket, timeout=protocol.LONG_OP_TIMEOUT_S)
     fp, pem = _hello_key(client.call("hello", None, {}))
     pid = project_id(project)
     existing = load_binding(project)
@@ -285,9 +289,10 @@ class KeeperTrust:
         return self._call("intake", {"data_b64": base64.b64encode(raw).decode("ascii"), "data_sha256": data_sha256,
                                      "accept_inconclusive": bool(accept_inconclusive)})
 
-    def sealed_summary(self, ref: SealedRef) -> dict:
+    def sealed_summary(self, ref: SealedRef | None = None) -> dict:
+        """The keeper's summary of the project's sealed set; with `ref`, refused unless it is that set."""
         summary = self._call("sealed_summary")
-        if not isinstance(summary, dict) or summary.get("manifest_sha256") != ref.sealed_id:
+        if not isinstance(summary, dict) or (ref is not None and summary.get("manifest_sha256") != ref.sealed_id):
             raise _refuse("AN-8", "sealed_summary", "the keeper's sealed set of this project is not the one named",
                           "pass the sealed set id the keeper returned at intake")
         return summary
@@ -407,15 +412,21 @@ class KeeperAlphaLedger:
                       KEEPER_SPENDS)
 
     def entries(self) -> list[dict]:
-        """One entry per attempt on the sealed set (every project that uses it), in grant order; an open attempt has
-        `passed` and the settled amounts None."""
+        """One entry per attempt on the sealed set (every project that uses it, named by `project_id`; `j` is the
+        attempt's place in the set's ledger), in grant order; an open attempt has `passed` and the settled amounts
+        None. `project_entries` keeps this project's."""
         out: dict[str, dict] = {}
         for row in self.trust.alpha()["records"]:
             aid = row.get("attempt_id")
             if row.get("entry") == "grant":
-                out[aid] = {"attempt_id": aid, "alpha": row.get("alpha"), "passed": None, "alpha_spent": None,
-                            "alpha_earned": None, "wealth_after": None}
+                out[aid] = {"attempt_id": aid, "project_id": row.get("project_id"), "j": row.get("j"),
+                            "alpha": row.get("alpha"), "passed": None, "alpha_spent": None, "alpha_earned": None,
+                            "wealth_after": None}
             elif row.get("entry") == "settle" and aid in out:
                 out[aid].update(passed=row.get("passed"), alpha_spent=row.get("cost"), alpha_earned=row.get("earned"),
                                 wealth_after=row.get("wealth_after"))
         return list(out.values())
+
+    def project_entries(self) -> list[dict]:
+        """The entries of this project's own attempts (`entries` lists the whole sealed set's)."""
+        return [e for e in self.entries() if e["project_id"] == self.trust.binding.project_id]

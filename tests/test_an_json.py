@@ -41,6 +41,8 @@ MINIMAL_ARGS = {
     "ext-arm-fill": ["--adapter", "a", "--checkpoint", "c", "--items", "i", "arm"],
     "project": ["status", "root"],
     "keeper": ["serve", "--state", "s", "--socket", "k.sock", "--owner-uid", "1000"],
+    "setup": ["keeper"],
+    "verify": ["root"],
 }
 
 

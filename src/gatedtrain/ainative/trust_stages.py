@@ -261,8 +261,8 @@ def _scorer(decision: dict) -> tuple[scorers.ScorerSpec, dict]:
     return spec, entry.get("params", {})
 
 
-def _values(ctx: StageContext, decision: dict) -> dict:
-    """The scorer, direction, margin and alpha the registration will carry."""
+def _metric(decision: dict) -> dict:
+    """The scorer, direction and margin of a preregister decision, checked (AN-7)."""
     spec, _ = _scorer(decision)
     scorer = spec.name
     direction = decision.get("direction", spec.direction)
@@ -273,13 +273,30 @@ def _values(ctx: StageContext, decision: dict) -> dict:
     if not _num(margin) or not 0 <= margin <= MAX_MARGIN:
         raise _refuse7("decision.margin", f"margin {margin!r} is not a number from 0 to {MAX_MARGIN}",
                        "give the smallest gain that counts, as a fraction of the score (0.05 is 5 points)")
+    return {"scorer": scorer, "direction": direction, "margin": float(margin)}
+
+
+def keeper_confirmation(decision: dict, n_sealed: int) -> tuple[dict, str]:
+    """AN-18: what `gatedtrain keeper confirm` asks the keeper to record for a preregister decision (its `scorer`,
+    `scorer_params` and `margin`; the direction is the scorer's) and the plan sentence it shows first, the one
+    `preregister` states in keeper mode. The keeper matches a registration against exactly these values."""
+    v = _metric(decision)
+    _, params = _scorer(decision)
+    sentence = _sentence({**v, "alpha": alpha_investing.PLANNING_ALPHA}, n_sealed, keeper=True)
+    return {"scorer": v["scorer"], "scorer_params": params, "direction": v["direction"], "margin": v["margin"]}, \
+        sentence
+
+
+def _values(ctx: StageContext, decision: dict) -> dict:
+    """The scorer, direction, margin and alpha the registration will carry."""
+    v = _metric(decision)
     # Under the keeper the registration carries the fixed planning alpha: the test level of each attempt is set by
     # alpha-investing at the gate, so a rerun after an attempt registers the same content (preflight finding 13).
     alpha = ctx.ledger.planning_alpha if _keeper(ctx) else ctx.ledger.available()
     if not _num(alpha) or not 0 < alpha < 0.5:
         raise _refuse7("alpha", f"no alpha is available to register (available: {alpha!r})",
                        NEW_TEST_FIX)
-    return {"scorer": scorer, "direction": direction, "margin": float(margin), "alpha": float(alpha)}
+    return {**v, "alpha": float(alpha)}
 
 
 def _sealed_summary(ctx: StageContext) -> dict:

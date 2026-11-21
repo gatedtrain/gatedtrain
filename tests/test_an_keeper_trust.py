@@ -196,8 +196,8 @@ class KeeperPipelineTest(KeeperProject, unittest.TestCase):
         self.assertNotEqual(g2["attempt_id"], g1["attempt_id"])
         entries = KeeperAlphaLedger(KeeperTrust(proj)).entries()
         self.assertEqual([(e["alpha"], e["passed"]) for e in entries], [(0.02375, False), (BID2, True)])
-        self.assertEqual(set(entries[0]), {"attempt_id", "alpha", "passed", "alpha_spent", "alpha_earned",
-                                           "wealth_after"})
+        self.assertEqual(set(entries[0]), {"attempt_id", "project_id", "j", "alpha", "passed", "alpha_spent",
+                                           "alpha_earned", "wealth_after"})
 
         self.go(proj, "report")
         self.assertTrue(all(s["status"] == "done" for s in status(proj).values()), status(proj))

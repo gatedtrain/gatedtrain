@@ -1,8 +1,10 @@
 """`gatedtrain` command line (tests/README.md section 2).
 
 Exit codes: 0 success (for `run`, the gate passed); 1 `run` completed but the
-gate is FAIL, INCONCLUSIVE or MISSING; 2 usage error; 3 refused (spec or
-registration error, hash mismatch, existing `--out`, unknown impact target).
+gate is FAIL, INCONCLUSIVE or MISSING, and `verify` checked consistency only (no
+keeper and no fingerprint as anchor); 2 usage error; 3 refused (spec or
+registration error, hash mismatch, existing `--out`, unknown impact target, a
+bad signature or a record that differs from the anchor in `verify`).
 Under the top-level `--json` an argparse usage error is the envelope with exit 2 (rule `USAGE`) and an uncaught
 exception is the envelope with exit 1 (rule `INTERNAL`, the exception class only; no traceback), the code the text
 mode gives for a traceback. Without `--json` both behave as argparse and Python always did.
@@ -293,8 +295,10 @@ def _project_command(args) -> str:
     return f"project {args.project_cmd}"
 
 
-def _pfinish(args, data: dict, human: str = "", *, ok: bool = True, exit_code: int = EXIT_OK) -> int:
-    return emit(Result(_project_command(args), ok, exit_code, data, [], []), as_json=_as_json(args), human=human)
+def _pfinish(args, data: dict, human: str = "", *, ok: bool = True, exit_code: int = EXIT_OK,
+             warnings: list[str] | None = None) -> int:
+    return emit(Result(_project_command(args), ok, exit_code, data, [], list(warnings or [])), as_json=_as_json(args),
+                human=human)
 
 
 def _prefuse(args, problems: list[Problem]) -> int:
@@ -320,21 +324,41 @@ def _load_decision(path: str | None) -> dict:
     return doc
 
 
+def _keeper_hello(socket: Path) -> dict:
+    """The keeper's `hello`, its key checked (AN-14). It waits with the long-op deadline: on a keeper busy with another
+    client's evaluation the wait is queueing; a keeper that is not running fails at the connect (AN-12)."""
+    from .ainative.keeper import protocol
+    from .ainative.keeper_trust import _hello_key
+
+    hello = protocol.KeeperClient(socket, timeout=protocol.LONG_OP_TIMEOUT_S).call("hello", None, {})
+    _hello_key(hello)
+    return hello
+
+
 def cmd_project_create(args) -> int:
+    from .ainative.keeper_trust import bind_project
     from .ainative.pipeline import load_pipeline
     from .ainative.project import create_project
 
     pipeline = Path(args.pipeline).absolute()
+    socket = Path(args.keeper).absolute() if args.keeper else None
     try:
         load_pipeline(pipeline)                                  # syntax only; stage types are checked on `plan`/`run`
+        if socket is not None:
+            _keeper_hello(socket)                                # an unreachable keeper: nothing is created
         project = create_project(Path(args.root).absolute(), goal=args.goal, data=Path(args.data).absolute(),
                                  pipeline=str(pipeline), budget={"gpu_hours": args.gpu_hours, "llm_usd": 0},
                                  pipeline_bytes=pipeline.read_bytes())     # the project keeps its own copy
+        binding = bind_project(project, socket) if socket is not None else None
     except Refused as exc:
         return _prefuse(args, exc.problems)
-    return _pfinish(args, {"root": str(project.root), "pipeline": project.pipeline,
-                           "pipeline_sha256": project.pipeline_sha256, "budget": project.budget},
-                    f"project: {project.root}\n")
+    data = {"root": str(project.root), "pipeline": project.pipeline, "pipeline_sha256": project.pipeline_sha256,
+            "budget": project.budget}
+    human = f"project: {project.root}\n"
+    if binding is not None:
+        data["keeper"] = {"fingerprint": binding.fingerprint, "project_id": binding.project_id}
+        human += f"keeper: {binding.socket} (key {binding.fingerprint})\n"
+    return _pfinish(args, data, human)
 
 
 def cmd_project_plan(args) -> int:
@@ -373,14 +397,22 @@ def cmd_project_run(args) -> int:
     return _pfinish(args, data, human)
 
 
-def _recorded_gate(project):
-    """(gate status recorded in the attempt log or None, the alpha ledger's entries): evidence apart from the
-    pipeline state, so a stale or unreadable derived state never hides a recorded verdict."""
-    from .ainative.machine import recorded_output
-    from .ainative.trust import FixedAlphaLedger
+def _recorded_gate(project) -> tuple[str | None, list | None, list[str]]:
+    """(gate status recorded in the attempt log or None, the alpha ledger's entries of this project, warnings):
+    evidence apart from the pipeline state, so a stale or unreadable derived state never hides a recorded verdict.
+    The ledger is read through `machine.backends` (the keeper's for a bound project); when it cannot be read (an
+    unreachable keeper, AN-12) the entries are None and a warning says why."""
+    from .ainative.machine import backends, recorded_output
 
     rec = recorded_output(project, _GATE_STAGE, "gate_result")
-    return (rec.get("status") if isinstance(rec, dict) else None), FixedAlphaLedger(project).entries()
+    recorded = rec.get("status") if isinstance(rec, dict) else None
+    try:
+        _, ledger = backends(project)
+        project_entries = getattr(ledger, "project_entries", None)     # the keeper's ledger spans the sealed set
+        entries = project_entries() if project_entries is not None else ledger.entries()
+    except Refused as exc:
+        return recorded, None, [f"the alpha ledger cannot be read: {p.line()}" for p in exc.problems]
+    return recorded, entries, []
 
 
 def cmd_project_status(args) -> int:
@@ -391,7 +423,7 @@ def cmd_project_status(args) -> int:
         project = Project.load(Path(args.root))
         stages = status(project)
         gate = done_output(project, _GATE_STAGE, "gate_result")
-        recorded, ledger = _recorded_gate(project)
+        recorded, ledger, warnings = _recorded_gate(project)
     except Refused as exc:
         return _prefuse(args, exc.problems)
     gate_status = gate.get("status") if isinstance(gate, dict) else None
@@ -412,9 +444,11 @@ def cmd_project_status(args) -> int:
         lines.append(f"gate: recorded {recorded}, but the gate stage is {stages[_GATE_STAGE]['status']}\n")
     elif ledger:
         lines.append("gate: alpha spent, no gate result recorded\n")
+    elif ledger is None:
+        lines.append("gate: no gate result recorded; the alpha ledger cannot be read\n")
     else:
         lines.append("gate: no gate result recorded and no alpha spent\n")
-    return _pfinish(args, data, "".join(lines))
+    return _pfinish(args, data, "".join(lines), warnings=warnings)
 
 
 def cmd_project_report(args) -> int:
@@ -426,12 +460,13 @@ def cmd_project_report(args) -> int:
         report = done_output(project, "report", "report")
         if report is None:
             state = status(project)["report"]["status"]
-            recorded, ledger = _recorded_gate(project)
+            recorded, ledger, _ = _recorded_gate(project)
     except Refused as exc:
         return _prefuse(args, exc.problems)
     if report is None:
-        evidence = (f"a gate result is recorded ({recorded}) and the alpha ledger has {len(ledger)} entries"
-                    if recorded else f"no gate result is recorded; the alpha ledger has {len(ledger)} entries")
+        count = f"has {len(ledger)} entries" if ledger is not None else "cannot be read"
+        evidence = (f"a gate result is recorded ({recorded}) and the alpha ledger {count}"
+                    if recorded else f"no gate result is recorded; the alpha ledger {count}")
         return _prefuse(args, [Problem("AN-11", "report", f"there is no current report: the report stage is {state}; "
                                        f"{evidence}", "run the stages in order up to `report`; `project status` "
                                        "shows where it stopped")])
@@ -466,6 +501,9 @@ def _add_project(sub) -> None:
                         "pipeline needs a new project with new sealed data")
     c.add_argument("--gpu-hours", type=_gpu_hours, default=0.0, metavar="H",
                    help="the GPU-hour budget; step 1 only records it in project.yaml and does not enforce it")
+    c.add_argument("--keeper", metavar="SOCKET",
+                   help="bind the project to the keeper at this socket (trust/keeper.json, trust/keeper.pub); the "
+                        "keeper then seals, scores and gates (AN-12, AN-14)")
     c.set_defaults(func=cmd_project_create)
 
     c = ps.add_parser("plan", help="show what a stage would do, without running it")
@@ -488,21 +526,116 @@ def _add_project(sub) -> None:
     c.set_defaults(func=cmd_project_report)
 
 
-# AN-12: `gatedtrain keeper serve` (the full keeper and setup commands follow in a later step of this change).
+# AN-12, AN-14, AN-18, AN-19: `gatedtrain keeper ...`, `gatedtrain setup keeper`, `gatedtrain verify`.
+
+def _command_name(args) -> str:
+    sub = {"project": "project_cmd", "keeper": "keeper_cmd", "setup": "setup_cmd"}.get(args.command)
+    return f"{args.command} {getattr(args, sub)}" if sub else args.command
+
+
+def _kfinish(args, data: dict, human: str = "", *, ok: bool = True, exit_code: int = EXIT_OK,
+             warnings: list[str] | None = None) -> int:
+    return emit(Result(_command_name(args), ok, exit_code, data, [], list(warnings or [])), as_json=_as_json(args),
+                human=human)
+
+
+def _krefuse(args, problems: list[Problem]) -> int:
+    return emit(Result(_command_name(args), False, EXIT_REFUSED, {}, list(problems), []), as_json=_as_json(args),
+                human="")
+
 
 def cmd_keeper_serve(args) -> int:
     from .ainative.keeper.server import serve
 
-    command = f"keeper {args.keeper_cmd}"
     try:
         code = serve(Path(args.state).absolute(), Path(args.socket).absolute(), args.owner_uid)
+    except Refused as exc:                               # AN-12, AN-13: the keeper does not start
+        return _krefuse(args, exc.problems)
+    return _kfinish(args, {}, exit_code=code)
+
+
+def cmd_keeper_fingerprint(args) -> int:
+    try:
+        hello = _keeper_hello(Path(args.socket).absolute())
     except Refused as exc:
-        return emit(Result(command, False, EXIT_REFUSED, {}, exc.problems, []), as_json=_as_json(args), human="")
-    return emit(Result(command, True, code, {}, [], []), as_json=_as_json(args), human="")
+        return _krefuse(args, exc.problems)
+    data = {"fingerprint": hello["fingerprint"], "sealed_guarantee": hello.get("sealed_guarantee")}
+    return _kfinish(args, data, f"fingerprint: {data['fingerprint']}\nguarantee: {data['sealed_guarantee']}\n")
+
+
+CONFIRM_PROMPT = "Type yes to record this confirmation in the keeper: "
+
+
+def cmd_keeper_confirm(args) -> int:
+    """AN-18: show the plan sentence of the decision's scorer, scorer_params and margin, take `yes` on stdin (or
+    `--yes`), then record the confirmation in the keeper. The prompt goes to stderr, so stdout stays the result."""
+    from .ainative import signing
+    from .ainative.keeper_trust import KeeperTrust
+    from .ainative.project import Project
+    from .ainative.trust_stages import keeper_confirmation
+
+    try:
+        trust = KeeperTrust(Project.load(Path(args.root)))
+        decision = _load_decision(args.decision)
+        summary = trust.sealed_summary()
+        values, sentence = keeper_confirmation(decision, summary.get("n"))
+        if not args.yes:
+            print(sentence, file=sys.stderr)
+            print(CONFIRM_PROMPT, end="", file=sys.stderr, flush=True)
+            answer = sys.stdin.readline()
+            if answer.strip() != "yes":
+                raise Refused([Problem("AN-18", "stdin", "the confirmation was not given (the answer was not `yes`)",
+                                       "read the sentence and answer yes to confirm it, or change --decision "
+                                       "first")])
+        env = trust.confirm_metric(values, sentence)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    sha = signing.envelope_sha256(env)
+    return _kfinish(args, {"sentence": sentence, "envelope_sha256": sha}, f"{sentence}\nconfirmed: {sha}\n")
+
+
+def cmd_setup_keeper(args) -> int:
+    """AN-19: print the privileged commands and the systemd unit; run and write nothing."""
+    import os
+
+    from .ainative.keeper.setup import installed_packs, setup_commands
+
+    owner = os.getuid() if args.owner_uid is None else args.owner_uid
+    try:
+        out = setup_commands(user=args.user, state=args.state, socket=args.socket, venv=args.venv, owner_uid=owner,
+                             packages=args.packages)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    warnings = []
+    if args.packages is None and not installed_packs():
+        warnings.append("no scenario pack is installed here; pass --packages NAME==VERSION for each pack the keeper "
+                        "must run")
+    human = ("# run these once, as a user who may use sudo; gatedtrain runs none of them\n"
+             + "".join(c + "\n" for c in out["commands"]))
+    return _kfinish(args, out, human, warnings=warnings)
+
+
+def cmd_verify(args) -> int:
+    """AN-14: exit 0 when the project's signed records check against an anchor (the keeper's key or --fingerprint),
+    1 when there is no anchor and only their consistency was checked, 3 on a bad signature or a mismatch."""
+    from .ainative.verify import CONSISTENCY_ONLY, verify_project
+
+    try:
+        out = verify_project(Path(args.root), keeper=Path(args.keeper) if args.keeper else None,
+                             fingerprint=args.fingerprint)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    if out["anchor"] == "none":
+        return _kfinish(args, out, f"consistent: {out['checked']} records under key {out['fingerprint']}\n",
+                        ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY])
+    return _kfinish(args, out, f"verified against the {out['anchor']}: {out['checked']} records under key "
+                               f"{out['fingerprint']}\n")
 
 
 def _add_keeper(sub) -> None:
-    p = sub.add_parser("keeper", help="AI-native keeper daemon (Linux only)")
+    from .ainative.keeper import setup
+
+    p = sub.add_parser("keeper", help="AI-native keeper (Linux only): serve, fingerprint, confirm")
     ks = p.add_subparsers(dest="keeper_cmd", required=True)
     c = ks.add_parser("serve", help="serve the keeper on a Unix socket until SIGTERM")
     c.add_argument("--state", required=True, metavar="DIR", help="the keeper's state directory")
@@ -510,6 +643,36 @@ def _add_keeper(sub) -> None:
     c.add_argument("--owner-uid", required=True, type=int, metavar="UID",
                    help="the uid allowed to connect besides the keeper's own")
     c.set_defaults(func=cmd_keeper_serve)
+
+    c = ks.add_parser("fingerprint", help="print the fingerprint of the key the keeper serves; keep it out of band")
+    c.add_argument("--socket", required=True, metavar="PATH")
+    c.set_defaults(func=cmd_keeper_fingerprint)
+
+    c = ks.add_parser("confirm", help="show the deciding metric's sentence and record its confirmation (AN-18)")
+    c.add_argument("root", help="the project directory, bound to a keeper")
+    c.add_argument("--decision", metavar="FILE",
+                   help="the preregister decision (JSON): its scorer, scorer_params and margin are confirmed")
+    c.add_argument("--yes", action="store_true", help="confirm without reading `yes` from stdin")
+    c.set_defaults(func=cmd_keeper_confirm)
+
+    p = sub.add_parser("setup", help="print the commands that install a component; runs nothing (AN-19)")
+    ss = p.add_subparsers(dest="setup_cmd", required=True)
+    c = ss.add_parser("keeper", help="print the sudo commands and the systemd unit that install the keeper")
+    c.add_argument("--user", default=setup.DEFAULT_USER, help="the keeper's system user")
+    c.add_argument("--state", default=setup.DEFAULT_STATE, metavar="DIR")
+    c.add_argument("--socket", default=setup.DEFAULT_SOCKET, metavar="PATH")
+    c.add_argument("--venv", default=setup.DEFAULT_VENV, metavar="DIR", help="the root-owned virtual environment")
+    c.add_argument("--owner-uid", type=int, metavar="UID", help="the user the keeper serves (default: yours)")
+    c.add_argument("--packages", nargs="+", metavar="SPEC",
+                   help="scenario packs as NAME==VERSION (default: the installed packs at their versions)")
+    c.set_defaults(func=cmd_setup_keeper)
+
+    p = sub.add_parser("verify", help="check a keeper project's signed records against the keeper or a fingerprint "
+                                      "(AN-14)")
+    p.add_argument("root", help="the project directory")
+    p.add_argument("--keeper", metavar="SOCKET", help="anchor on the key the keeper at this socket serves")
+    p.add_argument("--fingerprint", metavar="FP", help="anchor on a key fingerprint held out of band")
+    p.set_defaults(func=cmd_verify)
 
 
 class _UsageError(Exception):
@@ -694,8 +857,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         if not _as_json(args):
             raise
-        name = (_project_command(args) if args.command == "project"
-                else f"keeper {args.keeper_cmd}" if args.command == "keeper" else args.command)
+        name = _command_name(args)
         problem = Problem("INTERNAL", "", f"unexpected {type(exc).__name__}; this is a bug", "report it")
         return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem], list(getattr(args, "ext_warnings", []))),
                     as_json=True, human="")
