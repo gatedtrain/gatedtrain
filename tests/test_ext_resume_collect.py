@@ -483,13 +483,39 @@ class TestFinalAttemptEnd(Case):
         rows = ledger(run_dir)
         self.assertEqual(sorted({r["step"] for r in rows if r["status"] == "kept"}), list(range(1, 13)))
 
-    def test_without_max_steps_later_records_are_ignored(self):
+    def test_without_max_steps_records_after_the_last_cut_refuse(self):
+        # Without `max_steps` the final segment ends at the last cut; later records are not dropped silently (they
+        # would hide consumption), they refuse as records beyond the run's end (EXT-RES-4).
+        from gatedtrain.errors import Refused
+
         sc = self.scenario()
         one_attempt(sc)
         set_max_steps(sc, None)
         extend_samples(sc, (11, 12), 1)
+        with self.assertRaises(Refused) as cm:
+            self.collect(sc)
+        self.assertEqual({p.rule for p in cm.exception.problems}, {"EXT-RES-4"})
+        self.assertIn("beyond max_steps 10", " ".join(p.message for p in cm.exception.problems))
+
+    def test_without_max_steps_the_run_ends_at_the_last_cut(self):
+        sc = self.scenario()
+        one_attempt(sc)
+        set_max_steps(sc, None)
         run_dir, _, _ = self.collect(sc)
         self.assertEqual(sorted({r["step"] for r in ledger(run_dir)}), list(range(1, 11)))
+
+    def test_max_steps_below_the_last_cut_or_not_an_integer_refuses(self):
+        # The last cut is step 10: a `max_steps` of 9 (or a non-integer) is not replaced by the cut step.
+        from gatedtrain.errors import Refused
+
+        for value in (9, "12", True, 12.0):
+            sc = self.scenario()
+            one_attempt(sc)
+            set_max_steps(sc, value)
+            with self.assertRaises(Refused, msg=value) as cm:
+                self.collect(sc)
+            hits = [p for p in cm.exception.problems if p.rule == "EXT-RES-4"]
+            self.assertTrue(hits and "max_steps" in hits[0].message, (value, cm.exception.problems))
 
     def test_records_beyond_max_steps_refuse(self):
         from gatedtrain.errors import Refused
@@ -598,6 +624,73 @@ class TestAdapterResults(Case):
         with self.assertRaises(Refused) as cm:
             self.collect(sc, edit)
         self.assertEqual({p.rule for p in cm.exception.problems}, {"EXT-RES-4"})
+
+    def refuses(self, edit, words: str = "") -> None:
+        from gatedtrain.errors import Refused
+
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        runs = self.runs()
+        with mock.patch.object(self, "runs", lambda: runs), self.assertRaises(Refused) as cm:
+            self.collect(sc, edit)
+        self.assertEqual({p.rule for p in cm.exception.problems}, {"EXT-RES-4"}, cm.exception.problems)
+        self.assertIn(words, " ".join(p.message for p in cm.exception.problems))
+        self.assertFalse(runs.exists() and any(runs.iterdir()), "no run directory remains after the refusal")
+
+    def test_kept_row_outside_its_segment_refuses(self):
+        def edit(cons):
+            row = next(r for r in cons["rows"] if r["controller_epoch"] == 1 and r["step"] == 2)
+            row["step"] = 6                                   # attempt 1 keeps steps 1-4 only
+            return cons
+
+        self.refuses(edit, "kept row")
+
+    def test_orphaned_row_of_the_final_segment_refuses(self):
+        def edit(cons):
+            cons["orphaned"] = cons["orphaned"] + [dict(next(r for r in cons["rows"] if r["controller_epoch"] == 3))]
+            return cons
+
+        self.refuses(edit, "orphaned row")
+
+    def test_kept_rows_moved_to_orphaned_refuse(self):
+        # Attempt 2 keeps step 6; the adapter lists it as orphaned (step not after the segment's end).
+        def edit(cons):
+            moved = [r for r in cons["rows"] if r["step"] == 6]
+            cons["rows"] = [r for r in cons["rows"] if r["step"] != 6]
+            cons["orphaned"] = cons["orphaned"] + moved
+            return cons
+
+        self.refuses(edit, "orphaned row")
+
+    def test_gap_in_the_written_kept_rows_refuses(self):
+        # The optional chain_problems hook is bypassed; the collector checks the rows it writes.
+        def edit(cons):
+            cons["rows"] = [r for r in cons["rows"] if r["step"] != 7]
+            return cons
+
+        self.refuses(edit, "no kept row at steps 7")
+
+    def test_steps_redone_must_be_a_non_negative_integer(self):
+        for bad in (True, -1, "3", 2.5):
+            def edit(cons, bad=bad):
+                cons["steps_redone"] = bad
+                return cons
+
+            self.refuses(edit, "steps_redone")
+
+    def test_adapter_parent_ref_is_replaced_by_the_collectors(self):
+        def edit(cons):
+            for r in cons["rows"] + cons["orphaned"]:
+                r["parent_ref"] = {"kind": "attempt", "id": "elsewhere.1:0"}
+            return cons
+
+        sc = self.scenario(stage_steps=STEPS)
+        three_attempts(sc)
+        run_dir, _, _ = self.collect(sc, edit)
+        for r in ledger(run_dir):
+            a = r["controller_epoch"]
+            want = None if a == 1 else {"kind": "attempt", "id": f"{run_dir.name}.{a - 1}:{ {2: 4, 3: 8}[a] }"}
+            self.assertEqual(r["parent_ref"], want)
 
     def test_no_orphaned_list_on_a_multi_attempt_chain_is_unknown_not_zero(self):
         def edit(cons):

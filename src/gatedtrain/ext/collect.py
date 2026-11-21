@@ -256,9 +256,17 @@ def resume_chain(ad, stage_out: Path, launch: dict, cuts: list[dict]) -> tuple[l
     last = max(c["step"] for c in cuts)
     args, _ = read_run_args(stage_out)
     declared = args.get("max_steps") if args else None
-    # The final attempt ends at run_args.json `max_steps` when it is an integer not below the last cut (design 5.2);
-    # otherwise at the last cut, and its later records are ignored as on the old path.
-    max_steps = declared if isinstance(declared, int) and not isinstance(declared, bool) and declared >= last else last
+    # The final attempt ends at run_args.json `max_steps` (design 5.2); without one (absent or null) at the last cut,
+    # and records after it refuse in the split (EXT-RES-4). A `max_steps` that is not an integer, or is below the
+    # last cut, contradicts the cuts and refuses rather than being replaced by the cut step.
+    if declared is None:
+        max_steps = last
+    elif not (isinstance(declared, int) and not isinstance(declared, bool)) or declared < last:
+        return None, [Problem("EXT-RES-4", "run_args.json.max_steps", f"max_steps {declared!r} is not an integer at or "
+                              f"above the last committed cut's step {last}",
+                              "collect a run whose run_args.json records the integer max_steps it trained to")]
+    else:
+        max_steps = declared
     segs, problems = attempts_mod.segment_chain(pairs, [(c["step"], c["path"]) for c in cuts], run_id="",
                                                 max_steps=max_steps)
     if problems:
@@ -277,12 +285,18 @@ def _parent_ref(sg, run_id: str) -> dict | None:
     return {"kind": "attempt", "id": f"{run_id}.{sg.parent}:{sg.branch_step}"}
 
 
+_ROWS_FIX = "return kept rows inside their segment and orphaned rows after a non-final segment's end, as split_steps does"
+
+
 def _stamp(rows: list[dict], status: str, segs: list, run_id: str) -> list[dict]:
     """The collector's own columns on adapter rows: `status`, and a `controller_epoch` and `parent_ref` that follow
-    the segment the row's `attempt_id` names. A row naming no segment of the chain, or an epoch other than its
-    segment's, refuses (EXT-RES-4)."""
+    the segment the row's `attempt_id` names (an adapter's own `parent_ref` is replaced). A row naming no segment of
+    the chain, or an epoch other than its segment's, refuses (EXT-RES-4). The adapter's kept/orphaned split is
+    checked, not trusted: a kept row has `branch_step < step <= end_step` of its segment (branch 0 for the first);
+    an orphaned row belongs to a non-final segment and has `end_step < step <= max_steps` (the final segment's end)."""
     by_id = {sg.attempt_id: sg for sg in segs}
-    out = []
+    final = segs[-1]
+    out, bad = [], []
     for i, r in enumerate(rows):
         sg = by_id.get(r.get("attempt_id"))
         epoch = r.get("controller_epoch")
@@ -291,10 +305,42 @@ def _stamp(rows: list[dict], status: str, segs: list, run_id: str) -> list[dict]
                                    f"controller_epoch {epoch!r}, which belong to no segment of the chain "
                                    f"({', '.join(by_id)})",
                                    "return rows whose attempt_id is the segment's and controller_epoch its attempt")])
-        row = {**r, "status": status, "controller_epoch": sg.attempt}
-        if row.get("parent_ref") is None:
-            row["parent_ref"] = _parent_ref(sg, run_id)
-        out.append(row)
+        step, lo = r.get("step"), sg.branch_step or 0
+        if not (isinstance(step, int) and not isinstance(step, bool)):
+            bad.append(f"{status} row {i} has step {step!r}, not an integer")
+        elif status == "kept" and not lo < step <= sg.end_step:
+            bad.append(f"kept row {i} (attempt {sg.attempt}, step {step}) is outside its segment's steps "
+                       f"{lo + 1}..{sg.end_step}")
+        elif status == "orphaned" and (sg is final or not sg.end_step < step <= final.end_step):
+            bad.append(f"orphaned row {i} (attempt {sg.attempt}, step {step}) is not after a non-final segment's end"
+                       + ("" if sg is final else f" ({sg.end_step}) and at most max_steps {final.end_step}"))
+        out.append({**r, "status": status, "controller_epoch": sg.attempt, "parent_ref": _parent_ref(sg, run_id)})
+    if bad:
+        raise Refused([Problem("EXT-RES-4", "ledger", m, _ROWS_FIX) for m in bad[:5]]
+                      + ([Problem("EXT-RES-4", "ledger", f"{len(bad) - 5} more rows outside their segment", _ROWS_FIX)]
+                         if len(bad) > 5 else []))
+    return out
+
+
+def _coverage_problems(kept: list[dict], precision: str, segs: list) -> list[Problem]:
+    """EXT-RES-4 on the rows the ledger receives, whatever the adapter's optional `chain_problems` said: the kept rows
+    cover steps 1..max_steps, each step from one attempt. Only a `stage`-precision result writes no rows (MM-23)."""
+    if not kept:
+        return [] if precision == "stage" else [Problem("EXT-RES-4", "ledger", f"no kept row at precision "
+                                                        f"{precision!r}", _ROWS_FIX)]
+    owners: dict[int, set[int]] = {}
+    for r in kept:
+        owners.setdefault(r["step"], set()).add(r["controller_epoch"])
+    last = segs[-1].end_step
+    gaps = [n for n in range(1, last + 1) if n not in owners]
+    over = sorted(n for n, o in owners.items() if len(o) > 1)
+    out = []
+    if gaps:
+        out.append(Problem("EXT-RES-4", "ledger", f"no kept row at steps {attempts_mod._ranges(gaps)} of 1..{last}",
+                           _ROWS_FIX))
+    if over:
+        out.append(Problem("EXT-RES-4", "ledger", f"kept rows of more than one attempt at steps "
+                                                  f"{attempts_mod._ranges(over)}", _ROWS_FIX))
     return out
 
 
@@ -302,9 +348,10 @@ def _consumption(ad, stage_out: Path, data: Path, cuts: list[dict], run_id: str,
     """(the adapter's consumption result, the chain with its attempt ids). Without a chain (the old layout) the
     adapter is called as before. With one, a chain-aware adapter gets it; for any other adapter the chain has one
     segment (`resume_chain` refuses more), and its kept rows take that segment's attempt id. The collector stamps
-    `status`, `controller_epoch` and `parent_ref` itself. `steps_redone` is the adapter's own count, else the
-    distinct (attempt, step) of the orphaned rows it returned, else 0 for a single segment and None (unknown) for
-    a chain it gave no `orphaned` list for."""
+    `status`, `controller_epoch` and `parent_ref` itself and checks the split and the step coverage of the rows it
+    writes (`_stamp`, `_coverage_problems`; EXT-RES-4). `steps_redone` is the adapter's own count (a non-negative
+    integer), else the distinct (attempt, step) of the orphaned rows it returned, else 0 for a single segment and
+    None (unknown) for a chain it gave no `orphaned` list for."""
     cut_args = [(c["step"], c["path"]) for c in cuts]
     if chain is None:
         return ad.consumption(stage_out, data, cut_args, run_id=run_id), None
@@ -318,6 +365,14 @@ def _consumption(ad, stage_out: Path, data: Path, cuts: list[dict], run_id: str,
     returned = cons.get("orphaned")
     cons["rows"] = _stamp(list(cons["rows"]), "kept", segs, run_id)
     cons["orphaned"] = _stamp(list(returned or []), "orphaned", segs, run_id)
+    problems = _coverage_problems(cons["rows"], cons.get("precision"), segs)
+    redone = cons.get("steps_redone")
+    if redone is not None and not (isinstance(redone, int) and not isinstance(redone, bool) and redone >= 0):
+        problems.append(Problem("EXT-RES-4", "steps_redone", f"the adapter's steps_redone {redone!r} is not a "
+                                "non-negative integer or null", "return the count of distinct (attempt, step) run "
+                                "again, or leave it out"))
+    if problems:
+        raise Refused(problems)
     if cons.get("steps_redone") is None:
         if returned is not None:
             cons["steps_redone"] = len({(r["attempt_id"], r["step"]) for r in cons["orphaned"]})

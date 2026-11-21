@@ -203,8 +203,8 @@ def read_samples(path: Path) -> tuple[dict[int, set[int]] | None, str | None]:
 def split_records(stage_out: Path, chain: list) -> tuple[list[dict] | None, list[dict], list[Problem]]:
     """(kept, orphaned, problems) of samples.jsonl for a chain (EXT-RES-4); kept is None when there is no
     samples.jsonl and the chain has one segment (nothing to split). With more than one segment the records must
-    exist and split cleanly. Without an integer `max_steps` in run_args.json the last cut bounds the run, so
-    records beyond the final segment's end are ignored, as on the old path."""
+    exist and split cleanly. The final segment ends where ext-collect ends it (run_args.json `max_steps`, or the last
+    cut without one); a record beyond that end refuses in `split_steps`, as in the collector, never dropped."""
     from ..ext.attempts import split_steps
 
     samples = Path(stage_out) / SAMPLES
@@ -218,10 +218,6 @@ def split_records(stage_out: Path, chain: list) -> tuple[list[dict] | None, list
     if records is None:
         return None, [], [Problem("EXT-RES-4", SAMPLES, why, "collect a resumed run with the records of every "
                                   "attempt")]
-    args, _ = read_run_args(stage_out)
-    declared = args.get("max_steps") if args else None
-    if not (isinstance(declared, int) and not isinstance(declared, bool)):
-        records = [d for d in records if d["step"] <= chain[-1].end_step]
     kept, orphaned, problems = split_steps(chain, records)
     return kept, orphaned, problems
 
