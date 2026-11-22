@@ -788,16 +788,43 @@ class KeeperState:
 
     @staticmethod
     def _remove_copies(path: Path) -> None:
-        """Remove a model copy directory (never following a link)."""
+        """Remove a model copy directory (never following a link); strict, as at start."""
         if os.path.islink(path) or os.path.isfile(path):
             os.unlink(path)
         elif os.path.isdir(path):
             shutil.rmtree(path)
 
+    @classmethod
+    def _discard_copies(cls, path: Path) -> None:
+        """Best effort while evaluating: a failed removal never changes the result (the sweep at start removes
+        what is left)."""
+        try:
+            cls._remove_copies(path)
+        except OSError:
+            pass
+
+    def _opened_ok(self, fd: int, st: os.stat_result, name: str) -> tuple[str, str] | None:
+        """AN-13 on the file the copy actually opened (a parent directory swapped for a link after the path checks
+        is caught here): it lies outside the keeper's state directory and the owner can read it. Fails closed when
+        the descriptor's path cannot be read."""
+        try:
+            real = os.path.realpath(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            return f"{name}: the keeper cannot tell where the opened file lies", \
+                "run the keeper where /proc is mounted"
+        state = os.path.realpath(self.dir)
+        if not real.startswith("/") or real == state or real.startswith(state + os.sep):
+            return f"{name} is inside the keeper's state directory", \
+                "keep model files outside the keeper's state directory"
+        if not self._owner_can_read(st):
+            return f"{name} is not readable by the owner uid", "pass a file the user the keeper serves can read"
+        return None
+
     def _model_files(self, arm: str, record: dict, dest: Path) -> dict:
         """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read
-        (the keeper is never a way to read a file the owner cannot); `envcheck.copy_model_files` then copies them into
-        `dest` and checks the copy. Returns the record the generator receives (the copies' paths)."""
+        (the keeper is never a way to read a file the owner cannot). The checks on the paths here are an early filter;
+        `envcheck.copy_model_files` repeats them on each opened descriptor (`_opened_ok`, authoritative), copies the
+        files into `dest` and checks the copy. Returns the record the generator receives (the copies' paths)."""
         problems = []
         entries = record.get("files", [])
         state = os.path.realpath(self.dir)
@@ -826,7 +853,7 @@ class KeeperState:
         if problems:
             raise Refused(problems)
         try:
-            envcheck.copy_model_files(record, dest)
+            envcheck.copy_model_files(record, dest, opened_ok=self._opened_ok)
         except Refused as exc:
             raise Refused([Problem(p.rule, f"{arm}.record.{p.field}", p.message, p.fix) for p in exc.problems]) \
                 from None
@@ -937,7 +964,7 @@ class KeeperState:
                                                            "settle": settled["settle"]}) from None
                 return self._claim_response(att)
             finally:
-                self._remove_copies(copies)
+                self._discard_copies(copies)
 
     def _baseline_key(self, base_sha: str, full: dict, ev: dict) -> str:
         return sha256_bytes(canonical_json({"baseline_model_sha256": base_sha, "sampler": full.get("sampler"),
@@ -967,8 +994,8 @@ class KeeperState:
 
     def _score(self, att: dict, full: dict, found: tuple[scorers.ScorerSpec, dict], fn: Any, base_rec: dict,
                cand_rec: dict, ev: dict, copies: Path) -> None:
-        """Score both arms on the records that name the keeper's copies; each arm's copy is removed once it is
-        scored."""
+        """Score both arms on the records that name the keeper's copies; each arm's copy is removed (best effort)
+        once it is scored."""
         spec, params = found
         score = scorers.bind(spec, params)
         items = self._items(att["sealed_id"])
@@ -979,10 +1006,10 @@ class KeeperState:
             records = sealed_eval.score_arm(items, generate, base_rec, full, score, score_range=spec.score_range,
                                             scorer_name=spec.name)
             self._write_arm(base_rel, att["baseline_model_sha256"], records)
-        self._remove_copies(copies / "baseline")
+        self._discard_copies(copies / "baseline")
         records = sealed_eval.score_arm(items, generate, cand_rec, full, score, score_range=spec.score_range,
                                         scorer_name=spec.name)
-        self._remove_copies(copies / "candidate")
+        self._discard_copies(copies / "candidate")
         self._write_arm(f"{set_rel}/records/{att['j']:06d}.json", att["candidate_model_sha256"], records)
 
     # ---- attempts: gate and settle ----------------------------------------------------------------------------------

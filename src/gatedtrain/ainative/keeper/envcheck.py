@@ -45,7 +45,7 @@ import stat
 import sys
 import sysconfig
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from importlib import metadata, util
 from pathlib import Path
 
@@ -412,6 +412,8 @@ def _read_model_file(path: Path) -> tuple[str, bytes]:
     return "sha256:" + h.hexdigest(), head
 
 
+OpenedOk = Callable[[int, os.stat_result, str], "tuple[str, str] | None"]
+CHANGED_FIX = "stop changing the model files while the keeper evaluates"
 TRAVERSE_FIX = "put model files under a directory the keeper user can traverse, such as the output root (mode 0755)"
 
 
@@ -490,9 +492,16 @@ def check_model_files(record: dict) -> list[dict]:
     return hashed
 
 
-def _copy_one(field: str, entry: dict, checked: os.stat_result, target: Path) -> tuple[Problem | None, dict | None]:
-    """Open the checked file without following a link, check it is the file that was checked, and stream it into
-    `target` (created exclusively, mode 0600) while hashing; the head is checked before anything is written."""
+def _changed(field: str, name: str) -> Problem:
+    return _problem(field, f"{name} changed between the check and the copy", CHANGED_FIX)
+
+
+def _copy_one(field: str, entry: dict, checked: os.stat_result, target: Path,
+              opened_ok: OpenedOk | None) -> tuple[Problem | None, dict | None]:
+    """Open the checked file without following a link, check it is the file that was checked (and pass `opened_ok`
+    on the open descriptor), and stream exactly its checked size into `target` (created exclusively, mode 0600)
+    while hashing; the head is checked before anything is written. More data, less data, or another size or mtime
+    after the copy is a change."""
     path = Path(entry["path"])
     try:
         src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -500,13 +509,16 @@ def _copy_one(field: str, entry: dict, checked: os.stat_result, target: Path) ->
         return _problem(field, f"{path.name}: the keeper cannot open the file", TRAVERSE_FIX), None
     with os.fdopen(src, "rb") as handle:
         st = os.fstat(handle.fileno())
-        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (checked.st_dev, checked.st_ino):
-            return _problem(field, f"{path.name} changed between the check and the copy",
-                            "stop changing the model files while the keeper evaluates"), None
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != \
+                (checked.st_dev, checked.st_ino, checked.st_size, checked.st_mtime_ns):
+            return _changed(field, path.name), None
+        refusal = opened_ok(handle.fileno(), st, path.name) if opened_ok is not None else None
+        if refusal is not None:
+            return _problem(field, *refusal), None
         h = hashlib.sha256()
-        size = 0
+        left = st.st_size
         try:
-            chunk = handle.read(_CHUNK)
+            chunk = handle.read(min(_CHUNK, left))
         except OSError:
             return _problem(field, f"{path.name}: the keeper cannot read the file", TRAVERSE_FIX), None
         problem = _head_problem(field, path.name, chunk)
@@ -521,25 +533,31 @@ def _copy_one(field: str, entry: dict, checked: os.stat_result, target: Path) ->
             try:
                 while chunk:
                     h.update(chunk)
-                    size += len(chunk)
+                    left -= len(chunk)
                     out.write(chunk)
-                    chunk = handle.read(_CHUNK)
+                    chunk = handle.read(min(_CHUNK, left)) if left > 0 else b""
+                more = handle.read(1)
+                after = os.fstat(handle.fileno())
                 out.flush()
                 os.fsync(out.fileno())
             except OSError:
                 return _problem(field, f"{path.name}: the keeper cannot copy the file into its state",
                                 "check the keeper's state directory and its disk"), None
+    if left != 0 or more or (after.st_size, after.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+        return _changed(field, path.name), None
     digest = "sha256:" + h.hexdigest()
     problem = _hash_problem(field, path.name, digest, entry["sha256"])
     if problem is not None:
         return problem, None
-    return None, {"name": path.name, "sha256": digest, "size": size}
+    return None, {"name": path.name, "sha256": digest, "size": st.st_size}
 
 
-def copy_model_files(record: dict, dest: Path) -> list[dict]:
+def copy_model_files(record: dict, dest: Path, *, opened_ok: OpenedOk | None = None) -> list[dict]:
     """Copy each file `record["files"]` lists into `dest/<base name>` and hash the copy (AN-13): the checks of
     `check_model_files`, then the file is opened with `O_NOFOLLOW | O_NONBLOCK`, must be the regular file that was
-    checked, and is streamed into a new file (`O_EXCL`, mode 0600) while hashing. `dest` must not exist; it is created
+    checked (same device, inode, size and mtime), must pass `opened_ok(fd, fstat, base name)` (None, or the
+    `(message, fix)` of a refusal: the caller's checks on the file actually opened), and is streamed into a new file
+    (`O_EXCL`, mode 0600) while hashing, bounded by the checked size. `dest` must not exist; it is created
     with mode 0700. Refused (AN-13) naming every bad entry: also two entries with one base name and a file the keeper
     cannot open; on a refusal `dest` is removed. Returns `[{"name", "sha256", "size"}]` in the listed order."""
     entries = record.get("files", [])
@@ -562,7 +580,7 @@ def copy_model_files(record: dict, dest: Path) -> list[dict]:
                                        "directory)")
                 else:
                     names.add(name)
-                    problem, ok = _copy_one(field, entry, checked, dest / name)
+                    problem, ok = _copy_one(field, entry, checked, dest / name, opened_ok)
             if problem is not None:
                 problems.append(problem)
             else:

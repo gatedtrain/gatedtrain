@@ -14,13 +14,14 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _keeper import skip_unless_linux
 
 from test_an_keeper_attempts import BASE, TOY, arm, model, registration
 from test_an_keeper_intake import confirm_args, project_id
 from gatedtrain.ainative import trust_stages
-from gatedtrain.ainative.keeper import envcheck, texts
+from gatedtrain.ainative.keeper import envcheck, state as state_mod, texts
 from gatedtrain.ainative.keeper.protocol import RefusedAfterSpend
 from gatedtrain.ainative.keeper.state import KeeperState
 from gatedtrain.canonical import sha256_bytes
@@ -29,6 +30,8 @@ from gatedtrain.testing import synthetic_pack as pack
 
 WEIGHTS = b"\x08\x00\x00\x00\x00\x00\x00\x00{}      "
 TEMPLATE = b"{% for m in messages %}{{ m.content }}{% endfor %}"
+OTHER_UID = 65534 if os.getuid() != 65534 else 65533
+_REAL_OPEN = os.open
 TRAVERSE_FIX = ("put model files under a directory the keeper user can traverse, such as the output root "
                 "(mode 0755)")
 
@@ -134,6 +137,57 @@ class CopyModelFilesTest(unittest.TestCase):
         self.assertIn("sha256", problems[0].message)
         self.assertIn("base name", problems[1].message)
         self.assertFalse(os.path.lexists(dest))
+
+    def _open_hook(self, target: str, before=None, after=None):
+        """Patch `os.open` so opening `target` runs `before()` first and `after()` once it is open."""
+        def fake(path, flags, *args, **kwargs):
+            hit = os.fspath(path) == target
+            if hit and before is not None:
+                before()
+            fd = _REAL_OPEN(path, flags, *args, **kwargs)
+            if hit and after is not None:
+                after()
+            return fd
+        return mock.patch.object(os, "open", fake)
+
+    def _refused_changed(self, entry: dict) -> None:
+        dest = self.tmp / "copy"
+        with self.assertRaises(Refused) as cm:
+            envcheck.copy_model_files({"files": [entry]}, dest)
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field), ("AN-13", "files[0]"))
+        self.assertIn("changed between the check and the copy", p.message)
+        self.assertFalse(os.path.lexists(dest))
+
+    def test_other_file_at_open_refused(self):                  # the dev/ino check
+        entry = self._file("model.safetensors", WEIGHTS)
+        other = self.src / "other.safetensors"
+        other.write_bytes(WEIGHTS)
+        with self._open_hook(entry["path"], before=lambda: os.replace(other, entry["path"])):
+            self._refused_changed(entry)
+
+    def test_growth_after_check_refused(self):                  # the copy is bounded by the checked size
+        entry = self._file("model.safetensors", WEIGHTS)
+
+        def grow():
+            with open(entry["path"], "ab") as f:
+                f.write(b"more")
+        with self._open_hook(entry["path"], after=grow):
+            self._refused_changed(entry)
+
+    def test_opened_ok_sees_the_opened_file(self):
+        entry = self._file("model.safetensors", WEIGHTS)
+        seen = []
+
+        def opened_ok(fd: int, st: os.stat_result, name: str):
+            seen.append((os.readlink(f"/proc/self/fd/{fd}"), st.st_size, name))
+            return "refused by the caller", "the caller's fix"
+        with self.assertRaises(Refused) as cm:
+            envcheck.copy_model_files({"files": [entry]}, self.tmp / "copy", opened_ok=opened_ok)
+        self.assertEqual(seen, [(entry["path"], len(WEIGHTS), "model.safetensors")])
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field, p.message, p.fix),
+                         ("AN-13", "files[0]", "refused by the caller", "the caller's fix"))
 
     @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
     def test_unreachable_file_names_the_traverse_fix(self):
@@ -277,6 +331,60 @@ class KeeperHandoffTest(unittest.TestCase):
         (left / "model.safetensors").write_bytes(WEIGHTS)
         self.state.close()
         self.state = self.open()
+        self.assertEqual(self.models_left(), [])
+
+
+    def swap_parent_after_path_checks(self, target_dir: Path) -> mock._patch:
+        """Replace `out/sub` by a link to `target_dir` once the keeper's path-level checks passed, just before the
+        copy opens the files (a parent swap that `O_NOFOLLOW` on the last component does not see)."""
+        real = envcheck.copy_model_files
+        sub = self.out / "sub"
+
+        def swapped(record, dest, **kwargs):
+            if record.get("files") and not sub.is_symlink():      # the candidate's call (the baseline has none)
+                shutil.rmtree(sub)
+                sub.symlink_to(target_dir)
+            return real(record, dest, **kwargs)
+        return mock.patch.object(envcheck, "copy_model_files", swapped)
+
+    def assert_fd_check_refuses(self, plant: Path, words: str) -> None:
+        sub = self.out / "sub"
+        sub.mkdir()
+        decoy = self._file("model.safetensors", WEIGHTS, sub)
+        (plant / "model.safetensors").write_bytes(WEIGHTS)       # same bytes: only the fd check can refuse
+        os.chmod(plant / "model.safetensors", 0o600)              # the keeper's user only
+        before, records = self.state.alpha(self.pid), self.state.records(self.pid)
+        with self.swap_parent_after_path_checks(plant), self.assertRaises(Refused) as cm:
+            self.evaluate(self.candidate([decoy]))
+        self.assertNotIsInstance(cm.exception, RefusedAfterSpend)
+        p = cm.exception.problems[0]
+        self.assertEqual((p.rule, p.field), ("AN-13", "candidate.record.files[0]"))
+        self.assertIn(words, p.message)
+        self.assertEqual(self.state.alpha(self.pid), before)
+        self.assertEqual(self.state.records(self.pid), records)
+        self.assertEqual(self.models_left(), [])
+        self.assertEqual(self.recorder.paths, set())
+
+    def test_opened_file_inside_state_refused(self):             # fix round 1, Important
+        plant = self.dir / "plant"
+        plant.mkdir(mode=0o700)
+        self.assert_fd_check_refuses(plant, "inside the keeper's state directory")
+
+    def test_opened_file_owner_cannot_read_refused(self):        # fix round 1, Important
+        plant = self.tmp / "private"
+        plant.mkdir(mode=0o700)
+        self.state.owner_uid = OTHER_UID                          # the owner is another user from here on
+        self.addCleanup(setattr, self.state, "owner_uid", os.getuid())
+        self.assert_fd_check_refuses(plant, "not readable by the owner uid")
+
+    def test_cleanup_failure_does_not_change_the_result(self):  # fix round 1, best-effort removal
+        with mock.patch.object(state_mod.shutil, "rmtree", side_effect=OSError("busy")):
+            att = self.evaluate(self.candidate([self._file("model.safetensors", WEIGHTS)]))
+        self.assertEqual(att["j"], 1)
+        self.assertEqual(att["claim"]["record"]["j"], 1)
+        self.assertNotEqual(self.models_left(), [])               # left behind ...
+        self.state.close()
+        self.state = self.open()                                  # ... and swept at the next start
         self.assertEqual(self.models_left(), [])
 
 
