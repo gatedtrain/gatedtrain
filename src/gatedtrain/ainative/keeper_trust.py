@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -425,9 +426,17 @@ class KeeperTrust:
 
     def report(self) -> dict:
         """The keeper's signed report record (`schema_version` 2); the receipts are synced before it is returned, so
-        the project holds every envelope the report rests on. The request carries the project's job totals from its
-        backend records (`backend_compute`), which the report states as the driver's (AN-10)."""
-        out = self._call("report", {"compute": backend_compute(self.project)})
+        the project holds every envelope the report rests on. When the project's backend recorded at least one job,
+        the request carries its job totals (`backend_compute`), which the report states as the driver's (AN-10); a
+        project without jobs sends none, so a keeper that does not know `compute` still reports it. Job records that
+        cannot be read never block the report: no totals are sent and a warning goes to stderr."""
+        try:
+            compute = backend_compute(self.project)
+        except Exception as exc:                 # the class only: the report does not rest on the driver's totals
+            compute = None
+            print(f"warning: the project's job records cannot be read ({type(exc).__name__}); the keeper's report "
+                  "states no job totals of the driver", file=sys.stderr)
+        out = self._call("report", {"compute": compute} if compute and compute["jobs"] > 0 else None)
         record = self._keep(out.get("report") if isinstance(out, dict) else None, "report")
         self.sync()
         return record

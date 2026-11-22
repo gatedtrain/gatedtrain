@@ -5,7 +5,8 @@ can rewrite the project. The anchor is either the key the keeper serves over its
 lists every envelope it signed for the project, `records`) or a key fingerprint the reader got out of band
 (`fingerprint`). Against the anchor `verify_project` checks:
 
-- the project's key copy and the fingerprint its binding names are the anchor's (preflight finding 10);
+- the project's key copy and the fingerprint its binding names are the anchor's, so a project bound to another key
+  is refused;
 - every envelope in the receipts (`RECEIPTS`) verifies under the anchor key, for this project;
 - each `registration`, `gate_result` and `report` record in the project equals the signed record its envelope holds
   (by `envelope_sha256` for the first two, by record equality for the report), and `report.md` is the rendering of
@@ -17,9 +18,11 @@ turns the anchor into the exit code (0 anchored, 1 consistency only). A keeper w
 another uid than the owner's (`same_user` not false) is no anchor either: the owner can read its key
 (`SAME_USER_KEEPER`, exit 1). Nor is a keeper whose `hello` for the project does not say `owner_has_root_docker` false
 (AN-21; a `hello` without the field counts as true): a rootful daemon the owner reaches can read its key
-(`ROOT_DOCKER_KEEPER`, exit 1). Under any anchor, a `report.json` that states the downgraded guarantee
-(`KEEPER_ROOT_DOCKER_GUARANTEE`) or the revision 23 guarantee (`KEEPER_GUARANTEE_V1`, stated before rootful access was
-checked) makes the exit 1 too (`ROOT_DOCKER_REPORT`, `UNCHECKED_GUARANTEE_REPORT`).
+(`ROOT_DOCKER_KEEPER`, exit 1). Under any anchor, a `report.json` that states any guarantee other than
+`KEEPER_GUARANTEE` makes the exit 1 too, with a warning naming which: the downgraded guarantee
+(`KEEPER_ROOT_DOCKER_GUARANTEE`, `ROOT_DOCKER_REPORT`), the revision 23 guarantee (`KEEPER_GUARANTEE_V1`, stated before
+rootful access was checked, `UNCHECKED_GUARANTEE_REPORT`), the same-user guarantee (`KEEPER_SAME_USER_GUARANTEE`,
+`SAME_USER_REPORT`) or a text this version does not know (`UNKNOWN_GUARANTEE_REPORT`).
 
 Only `--keeper` finds a deleted record: the project must hold exactly the envelopes the keeper's `records` op lists for
 it, no more and no fewer. Offline (`--fingerprint` or no anchor) a report is bound to this project through its
@@ -39,7 +42,8 @@ from ..errors import Problem, Refused
 from . import signing
 from .keeper import protocol
 from .keeper.protocol import KeeperClient
-from .keeper.texts import KEEPER_GUARANTEE_V1, KEEPER_ROOT_DOCKER_GUARANTEE
+from .keeper.texts import (KEEPER_GUARANTEE, KEEPER_GUARANTEE_V1, KEEPER_ROOT_DOCKER_GUARANTEE,
+                           KEEPER_SAME_USER_GUARANTEE)
 from .keeper_trust import KEEPER_PUB, RECEIPTS, _hello_key, load_binding, project_id
 from .project import Project, _refuse_links
 from .trust_stages import REPORT_MD, SCHEMA_GATE_RESULT, SCHEMA_REGISTRATION, SCHEMA_REPORT, render_markdown
@@ -55,6 +59,10 @@ ROOT_DOCKER_REPORT = ("the report states that the user's account could reach a r
                       "user's account")
 UNCHECKED_GUARANTEE_REPORT = ("the report states the guarantee of gatedtrain 0.4.0, which was stated before rootful "
                               "access was checked: its separate-user claim is not established")
+SAME_USER_REPORT = ("the report states that the keeper ran as the owner's own OS user: nothing was sealed from the "
+                    "user's account")
+UNKNOWN_GUARANTEE_REPORT = ("the report states a guarantee this version of gatedtrain does not know: its separate-user "
+                            "claim is not established")
 OFFLINE_LIMIT = ("offline verify cannot detect deleted records; verify against the keeper (--keeper) to check "
                  "that the project holds every record the keeper signed for it")
 _FP = re.compile(r"sha256:[0-9a-f]{64}")
@@ -257,7 +265,12 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
 
 
 def report_warnings(out: dict) -> list[str]:
-    """AN-14, AN-21: the warnings (each makes the exit 1) for the guarantees the checked reports state."""
-    found = set(out.get("report_guarantees") or [])
-    return ([ROOT_DOCKER_REPORT] if KEEPER_ROOT_DOCKER_GUARANTEE in found else []) + \
-        ([UNCHECKED_GUARANTEE_REPORT] if KEEPER_GUARANTEE_V1 in found else [])
+    """AN-14, AN-21: the warnings (each makes the exit 1) for the guarantees the checked reports state. An allow-list:
+    only `KEEPER_GUARANTEE` passes; the downgraded, the revision 23, the same-user and any other text each warn."""
+    found = out.get("report_guarantees") or []
+    known = {KEEPER_ROOT_DOCKER_GUARANTEE: ROOT_DOCKER_REPORT, KEEPER_GUARANTEE_V1: UNCHECKED_GUARANTEE_REPORT,
+             KEEPER_SAME_USER_GUARANTEE: SAME_USER_REPORT}
+    warnings = [w for g, w in known.items() if g in found]
+    if any(g != KEEPER_GUARANTEE and g not in known for g in found):
+        warnings.append(UNKNOWN_GUARANTEE_REPORT)
+    return warnings

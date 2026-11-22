@@ -328,13 +328,15 @@ class InferenceUnitTest(unittest.TestCase):
         self.model = batch_model([], "candidate")
         self.crash()
 
-    def test_daemon_rechecked_before_each_start(self):         # Task 3 carry
+    def test_daemon_rechecked_before_each_start(self):
+        """The daemon is checked again just before each start; after the grant a changed daemon is a crash (AN-9)."""
         ki = self.ki()
         self.run_ok(ki)
         self.rt._daemon = DaemonInfo(False, os.getuid(), str(self.sock))
         with self.assertRaises(Refused) as cm:
             self.run_ok(ki)
-        self.assertEqual(cm.exception.problems[0].rule, "AN-13")
+        self.assertEqual([p.rule for p in cm.exception.problems], ["AN-9"])
+        self.assertIn("not rootless", cm.exception.problems[0].message)
         self.assertEqual(len(self.rt.runs), 1)
         self.assertEqual(self.leftovers(), [])
 
@@ -439,9 +441,44 @@ class InferenceUnitTest(unittest.TestCase):
         spec = runtime_mod.RunSpec(name="gatedtrain-keeper-old", image=IMAGE, argv=("x",), env=(), mounts=(),
                                    user="0:0", labels=(inference.KEEPER_LABEL,))
         rt.run(spec)
-        self.ki(rt=rt).remove_leftovers()
+        self.assertEqual(self.ki(rt=rt).remove_leftovers(), [])
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(rt.inspect("gatedtrain-keeper-old").status, "missing")
+
+    def test_remove_leftovers_mode_000(self):
+        """A run directory left with mode 000 (and one inside it) is opened up and removed, not an exception."""
+        left = self.state / "run" / "deadbeef"
+        (left / "out").mkdir(parents=True)
+        (left / "out" / "predictions.jsonl").write_bytes(b"x\n")
+        os.symlink("/nonexistent-target", left / "link")
+        os.chmod(left / "out", 0)
+        os.chmod(left, 0)
+        self.addCleanup(lambda: left.exists() and os.chmod(left, 0o700))
+        self.assertEqual(self.ki().remove_leftovers(), [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_remove_leftovers_failure_is_a_start_problem(self):
+        left = self.state / "run" / "deadbeef"
+        left.mkdir(parents=True)
+        with mock.patch.object(inference.os, "rmdir", side_effect=PermissionError(13, "denied", str(left))):
+            problems = self.ki().remove_leftovers()
+        self.assertEqual(self.rules(problems), ["AN-13"])
+        self.assertIn(str(left), problems[0].message)
+
+    def test_remove_leftovers_does_not_wait_for_the_daemon(self):
+        """The socket is not there yet: containers are skipped without waiting, so the start checks keep their own
+        bounded wait."""
+        self.sock.unlink()
+
+        class Counting(FakeRuntime):
+            calls = 0
+
+            def containers(self, label):
+                Counting.calls += 1
+                raise RuntimeFailure("ps", 1)
+        rt = Counting(image_ids={IMAGE: IMAGE}, socket=str(self.sock))
+        self.assertEqual(self.ki(rt=rt).remove_leftovers(), [])
+        self.assertEqual((Counting.calls, self.clock.t), (0, 0.0))
 
     # -- ready (before the grant) ------------------------------------------------------------------------------------
 
@@ -469,6 +506,29 @@ class InferenceUnitTest(unittest.TestCase):
     def test_ready_eval_trees_needed(self):
         exc = self.refused_ready(self.ki(), dataclasses.replace(pack.BATCH, eval_trees=True), "AN-25")
         self.assertIn("eval tree", exc.problems[0].message)
+
+    def test_ready_interpreter_inside_the_eval_trees(self):
+        """With eval trees the generator's interpreter must be a regular file inside a configured tree, links
+        resolved within the trees."""
+        py_root, venv = self.tmp / "python", self.tmp / "venv"
+        (py_root / "bin").mkdir(parents=True)
+        (venv / "bin").mkdir(parents=True)
+        (py_root / "bin" / "python3.12").write_bytes(b"interp")
+        os.symlink(py_root / "bin" / "python3.12", venv / "bin" / "python")
+        os.mkdir(venv / "bin" / "adir")
+        ki = self.ki(self.config(eval_trees=(py_root, venv)))
+        gen = dataclasses.replace(pack.BATCH, eval_trees=True)
+        ki.ready(dataclasses.replace(gen, interpreter=str(venv / "bin" / "python")))
+        ki.ready(dataclasses.replace(gen, interpreter=str(py_root / "bin" / "python3.12")))
+        for bad in (pack.BATCH.interpreter, str(venv / "bin" / "missing"), str(venv / "bin" / "adir"),
+                    str(self.tmp / "elsewhere")):
+            with self.subTest(bad):
+                exc = self.refused_ready(ki, dataclasses.replace(gen, interpreter=bad), "AN-25")
+                self.assertIn("interpreter", exc.problems[0].message)
+        outside = self.tmp / "outside-python"
+        outside.write_bytes(b"interp")
+        os.symlink(outside, venv / "bin" / "python-out")
+        self.refused_ready(ki, dataclasses.replace(gen, interpreter=str(venv / "bin" / "python-out")), "AN-25")
 
     def test_ready_script_not_in_the_environment(self):
         script = self.tmp / "gen.py"
@@ -845,6 +905,45 @@ class EnvironmentRecordTest(unittest.TestCase):
                                              "eval_trees": [envcheck.eval_tree_record(tree)],
                                              "docker_cli_sha256": None}}
         self.assertEqual(hello["environment_sha256"], envcheck.environment_sha256(expected))
+
+    def test_leftover_containers_removed_before_the_start_checks(self):
+        """A labelled container left by an earlier keeper is removed even when the start checks then refuse."""
+        tmp = _tmpdir(self)
+        state, sock = tmp / "state", tmp / "keeper.sock"
+        state.mkdir(mode=0o700)
+        dsock = docker_socket(tmp)
+        rt = FakeRuntime({IMAGE: subprocess_handler}, image_ids={IMAGE: IMAGE}, socket=str(dsock), outcomes=["hang"])
+        rt.run(runtime_mod.RunSpec(name="gatedtrain-keeper-old", image=IMAGE, argv=("x",), env=(), mounts=(),
+                                   user="0:0", labels=(inference.KEEPER_LABEL,)))
+        cfg = InferenceConfig(image_id=OTHER_IMAGE, docker_host=f"unix://{dsock}")       # the start check refuses
+        view = rootful.HostView(root=write_host_tree(tmp / "host"), root_uid=os.getuid())
+        with mock.patch.object(envcheck, "environment_record", return_value={"stub": 1}):
+            with self.assertRaises(Refused) as cm:
+                server.serve(state, sock, os.getuid(), stop=threading.Event(), host_view=view, inference=cfg,
+                             runtime=rt)
+        self.assertIn("inference_image", [p.field for p in cm.exception.problems])
+        self.assertEqual(rt.inspect("gatedtrain-keeper-old").status, "missing")
+
+
+class NvidiaSmiOptionTest(unittest.TestCase):
+    """`keeper serve --nvidia-smi PATH`: absolute, checked like --docker, and only with --inference-image."""
+
+    def config(self, *extra: str):
+        from gatedtrain import cli
+        args = cli.build_parser().parse_args(["keeper", "serve", "--state", "/s", "--socket", "/k.sock",
+                                              "--owner-uid", "1", *extra])
+        return cli._inference_config(args)
+
+    def test_nvidia_smi_option(self):
+        cfg = self.config("--inference-image", IMAGE, "--nvidia-smi", "/opt/nvidia/bin/nvidia-smi")
+        self.assertEqual(cfg.nvidia_smi, Path("/opt/nvidia/bin/nvidia-smi"))
+        self.assertEqual(self.config("--inference-image", IMAGE).nvidia_smi, Path("/usr/bin/nvidia-smi"))
+        for extra in (("--inference-image", IMAGE, "--nvidia-smi", "nvidia-smi"),
+                      ("--inference-image", IMAGE, "--nvidia-smi", "/a:b/nvidia-smi"),
+                      ("--nvidia-smi", "/usr/bin/nvidia-smi")):
+            with self.subTest(extra), self.assertRaises(Refused) as cm:
+                self.config(*extra)
+            self.assertEqual(cm.exception.problems[0].rule, "AN-13")
 
 
 # ---------------------------------------------------------------------------------------------------------------------

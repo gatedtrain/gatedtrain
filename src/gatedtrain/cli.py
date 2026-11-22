@@ -629,10 +629,11 @@ def _krefuse(args, problems: list[Problem]) -> int:
 def _inference_config(args):
     """AN-25: the keeper's inference options as an `InferenceConfig`, None without `--inference-image`; Refused
     (AN-13) for a malformed value or an inference option without the image."""
-    from .ainative.keeper.inference import DEFAULT_DOCKER, InferenceConfig
+    from .ainative.keeper.inference import DEFAULT_DOCKER, DEFAULT_NVIDIA_SMI, InferenceConfig
 
     given = [name for name, value in (("--inference-ref", args.inference_ref), ("--eval-tree", args.eval_tree),
-                                      ("--docker-host", args.docker_host), ("--docker", args.docker))
+                                      ("--docker-host", args.docker_host), ("--docker", args.docker),
+                                      ("--nvidia-smi", args.nvidia_smi))
              if value not in (None, [])]
     if args.inference_image is None:
         if given:
@@ -643,11 +644,12 @@ def _inference_config(args):
         return InferenceConfig(image_id=args.inference_image,
                                docker_host=args.docker_host or f"unix:///run/user/{os.geteuid()}/docker.sock",
                                eval_trees=tuple(Path(t) for t in args.eval_tree or ()), image_ref=args.inference_ref,
-                               docker=Path(args.docker) if args.docker else DEFAULT_DOCKER)
+                               docker=Path(args.docker) if args.docker else DEFAULT_DOCKER,
+                               nvidia_smi=Path(args.nvidia_smi) if args.nvidia_smi else DEFAULT_NVIDIA_SMI)
     except ValueError as exc:
         raise Refused([Problem("AN-13", "inference_image", str(exc),
-                               "pass --inference-image sha256:<64 hex>, absolute --eval-tree and --docker paths, and "
-                               "--inference-ref pinned by digest")]) from None
+                               "pass --inference-image sha256:<64 hex>, absolute --eval-tree, --docker and "
+                               "--nvidia-smi paths, and --inference-ref pinned by digest")]) from None
 
 
 def cmd_keeper_serve(args) -> int:
@@ -771,8 +773,8 @@ def cmd_verify(args) -> int:
     """AN-14: exit 0 when the project's signed records check against an anchor (the keeper's key or --fingerprint),
     1 when there is no anchor and only their consistency was checked (no anchor given, a keeper that runs as the
     owner's own uid, or one whose owner reaches a rootful daemon (AN-21), either of which can read its key), 1 also
-    under any anchor when a report states the downgraded or the unchecked revision 23 guarantee, 3 on a bad signature
-    or a mismatch."""
+    under any anchor when a report states any guarantee but the separate-user one (`report_warnings`), 3 on a bad
+    signature or a mismatch."""
     from .ainative.verify import (CONSISTENCY_ONLY, OFFLINE_LIMIT, ROOT_DOCKER_KEEPER, SAME_USER_KEEPER,
                                   report_warnings, verify_project)
 
@@ -822,6 +824,8 @@ def _add_keeper(sub) -> None:
     c.add_argument("--docker-host", metavar="URL",
                    help="the keeper's rootless daemon (default unix:///run/user/<keeper uid>/docker.sock)")
     c.add_argument("--docker", metavar="PATH", help="the Docker CLI's absolute path (default /usr/bin/docker)")
+    c.add_argument("--nvidia-smi", metavar="PATH",
+                   help="nvidia-smi's absolute path, for a GPU batch generator (default /usr/bin/nvidia-smi)")
     c.set_defaults(func=cmd_keeper_serve)
 
     c = ks.add_parser("fingerprint", help="print the fingerprint of the key the keeper serves; keep it out of band")
