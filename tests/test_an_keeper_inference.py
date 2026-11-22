@@ -482,8 +482,62 @@ class InferenceUnitTest(unittest.TestCase):
                 Counting.calls += 1
                 raise RuntimeFailure("ps", 1)
         rt = Counting(image_ids={IMAGE: IMAGE}, socket=str(self.sock))
+        left = self.state / "run" / "deadbeef"
+        left.mkdir(parents=True)
         self.assertEqual(self.ki(rt=rt).remove_leftovers(), [])
         self.assertEqual((Counting.calls, self.clock.t), (0, 0.0))
+        self.assertEqual(self.leftovers(), [])                    # the state's run directories go all the same
+
+    def test_no_docker_call_before_the_cli_and_socket_checks(self):
+        """A Docker CLI another uid could change, or a socket that is not the keeper's in a 0700 directory, refuses
+        the start before the keeper runs the CLI or talks to the socket at all; the run directories are still
+        swept."""
+        left = self.state / "run" / "deadbeef"
+        left.mkdir(parents=True)
+        cli = self.tmp / "docker"
+        cli.write_bytes(b"#!/bin/sh\n")
+        os.chmod(cli, 0o755)
+        rt = DockerCLIRuntime(host=f"unix://{self.sock}", docker=str(cli))
+        bad = inference.Problem("AN-13", "docker", "the Docker CLI is writable by uid 1", "fix it")
+        calls = mock.Mock(side_effect=AssertionError("docker was called"))
+        with mock.patch.object(rt, "containers", calls), mock.patch.object(rt, "stop", calls), \
+                mock.patch.object(rt, "remove", calls), mock.patch.object(rt, "inspect", calls), \
+                mock.patch.object(rt, "daemon", calls), mock.patch.object(rt, "image_id", calls), \
+                mock.patch.object(inference.envcheck, "path_problems", return_value=[bad]):
+            problems = self.ki(self.config(docker=cli), rt=rt).remove_leftovers()
+        self.assertEqual([p.field for p in problems], ["docker"])
+        calls.assert_not_called()
+        self.assertEqual(self.leftovers(), [])
+        os.chmod(self.sock.parent, 0o755)                         # a socket directory another uid may write
+        with mock.patch.object(rt, "containers", calls), \
+                mock.patch.object(inference.envcheck, "path_problems", return_value=[]):
+            problems = self.ki(self.config(docker=cli), rt=rt).remove_leftovers()
+        self.assertEqual(self.rules(problems), ["AN-13"])
+        self.assertIn("0700", problems[0].message)
+        calls.assert_not_called()
+
+    def test_serve_refuses_before_any_docker_call(self):
+        tmp = self.tmp / "serve"
+        tmp.mkdir()
+        state, sock = tmp / "state", tmp / "keeper.sock"
+        state.mkdir(mode=0o700)
+        (state / "run" / "deadbeef").mkdir(parents=True)
+        cli = self.tmp / "docker"
+        cli.write_bytes(b"#!/bin/sh\n")
+        os.chmod(cli, 0o777)                                      # writable by every user: refused, never run
+        rt = DockerCLIRuntime(host=f"unix://{self.sock}", docker=str(cli))
+        calls = mock.Mock(side_effect=AssertionError("docker was called"))
+        cfg = self.config(docker=cli)
+        view = rootful.HostView(root=write_host_tree(tmp / "host"), root_uid=os.getuid())
+        with mock.patch.object(rt, "containers", calls), mock.patch.object(rt, "stop", calls), \
+                mock.patch.object(rt, "remove", calls), mock.patch.object(rt, "daemon", calls), \
+                mock.patch.object(rt, "image_id", calls), \
+                mock.patch.object(envcheck, "environment_record", return_value={"stub": 1}), \
+                self.assertRaises(Refused) as cm:
+            server.serve(state, sock, os.getuid(), stop=threading.Event(), host_view=view, inference=cfg, runtime=rt)
+        self.assertTrue(any(str(cli) in p.message for p in cm.exception.problems), cm.exception.problems)
+        calls.assert_not_called()
+        self.assertEqual(list((state / "run").iterdir()), [])
 
     def subids(self, subuid: str, subgid: str | None = "", *, owner=(5000, 5000), keeper=(999, 998)):
         """`_subid_problems` of a keeper (uid, gid) for an owner (uid, gid), with fake passwd entries and id files

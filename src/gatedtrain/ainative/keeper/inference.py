@@ -10,12 +10,14 @@ script (`/gen/<name>`), the eval trees at their own paths when the generator ask
 empty keeper-owned output directory `/out`. Nothing about the items is passed in the arguments or the environment.
 
 `KeeperInference`:
-- `start_problems` (AN-13, at `serve`): waits up to 60 s for the daemon's socket (the keeper user's daemon may start
-  after the keeper), then refuses a daemon that is not rootless or whose socket is not owned by the keeper uid under a
-  directory of mode 0700, an image ID other than the configured one, an eval tree that fails
-  `envcheck.eval_tree_problems`, (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that fails the keeper's
-  ownership check, and a subordinate id range of the owner that covers the keeper's uid or gid (or one of the keeper's
-  that covers the owner's), read from /etc/subuid and /etc/subgid (an unreadable file refuses);
+- `remove_leftovers` (at `serve`, first): the run directories, then the checks that need no Docker call, then
+  (only when those pass) the leftover containers;
+- `start_problems` (AN-13, at `serve`, after `remove_leftovers` reported nothing): waits up to 60 s for the daemon's
+  socket (the keeper user's daemon may start after the keeper), then refuses a daemon that is not rootless or whose
+  socket is not owned by the keeper uid under a directory of mode 0700, an image ID other than the configured one, an
+  eval tree that fails `envcheck.eval_tree_problems`, (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that
+  fails the keeper's ownership check, and a subordinate id range of the owner that covers the keeper's uid or gid (or
+  one of the keeper's that covers the owner's), read from /etc/subuid and /etc/subgid (an unreadable file refuses);
 - `environment`: what the signed environment record holds under `inference`;
 - `ready` (before the grant, so a refusal spends nothing): the generator's time limit fits the driver's wait for an
   evaluation, eval trees are configured when it needs them and its interpreter is a regular file inside one, its script
@@ -323,12 +325,42 @@ class KeeperInference:
         problems += self._subid_problems()
         return problems
 
+    def _socket_file_problems(self) -> list[Problem]:
+        """The checks of the daemon's socket that need no call to the daemon: when the configured socket exists, it is
+        the keeper's and lies in a directory of the keeper's with mode 0700."""
+        path = self._socket_path()
+        if path is None or not os.path.lexists(path):
+            return []
+        try:
+            sock, parent = os.lstat(path), os.lstat(os.path.dirname(path))
+        except OSError:
+            return [_problem(RULE_ENV, "docker_host", "the keeper's Docker socket or its directory cannot be "
+                             "inspected", DAEMON_FIX)]
+        problems = []
+        if sock.st_uid != self.keeper_uid:
+            problems.append(_problem(RULE_ENV, "docker_host", f"the keeper's Docker socket is owned by uid "
+                                     f"{sock.st_uid}, not the keeper (uid {self.keeper_uid})", DAEMON_FIX))
+        mode = stat.S_IMODE(parent.st_mode)
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != self.keeper_uid or mode != 0o700:
+            problems.append(_problem(RULE_ENV, "docker_host", f"the directory of the keeper's Docker socket is not "
+                                     f"the keeper's with mode 0700 (owner uid {parent.st_uid}, mode {mode:04o}), so "
+                                     "another uid could replace the socket", DAEMON_FIX))
+        return problems
+
     def remove_leftovers(self) -> list[Problem]:
-        """At start, before the start checks (the keeper holds its state lock): remove every container labelled for
-        the keeper, best effort and only when the daemon's socket is already there (no wait here, so a daemon that
-        is not up yet leaves the bounded wait to `start_problems`), then `state/run/*`, strictly: a directory without
-        the owner's permissions is opened up first, links are never followed, and an entry that still cannot be
-        removed is an AN-13 start problem naming its path in the keeper's state. [] when everything is removed."""
+        """At start, before `start_problems` (the keeper holds its state lock), in this order: (a) `state/run/*` is
+        removed, strictly and without any Docker call: a directory without the owner's permissions is opened up
+        first, links are never followed, and an entry that still cannot be removed is an AN-13 problem naming its
+        path in the keeper's state; (b) the checks that need no Docker call: the Docker CLI and `nvidia-smi`
+        (`_cli_problems`) and, when the socket exists, its owner and its 0700 directory; (c) only when (b) found
+        nothing, every container labelled for the keeper is removed, best effort and only when the socket is
+        already there (no wait here: the bounded wait stays in `start_problems`). Returns the problems of (a) and
+        (b); the caller runs `start_problems` only when there are none, so no Docker CLI another uid could change
+        and no socket another uid could replace is ever used."""
+        problems = self._remove_runs()
+        early = self._cli_problems() + self._socket_file_problems()
+        if early:
+            return problems + early
         path = self._socket_path()
         if path is not None and os.path.exists(path):
             try:
@@ -337,6 +369,9 @@ class KeeperInference:
                 names = ()
             for name in names:
                 self._remove_container(name)
+        return problems
+
+    def _remove_runs(self) -> list[Problem]:
         run = self.state_dir / RUN_DIR
         try:
             if os.path.lexists(run):

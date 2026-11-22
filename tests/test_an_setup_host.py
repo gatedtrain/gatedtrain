@@ -140,7 +140,9 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         self.assertIn("keeper fingerprint", " ".join(tail.split()))
         # overlapping subordinate id ranges refuse before any change, and again once the keeper user exists
         self.assert_order(cmds, ["check_subids() {", "check_subids before-changes", "apt-get update",
-                                 'KUID=$(id -u "$KEEPER")', "check_subids after-keeper-created", "--add-subuids"])
+                                 'KUID=$(id -u "$KEEPER")', "check_subids after-keeper-created", "--add-subuids",
+                                 "--add-subgids", "check_subids after-allocation", "gpasswd -d",
+                                 "dockerd-rootless-setuptool.sh install"])
         for f in ("/etc/subuid", "/etc/subgid"):
             self.assertIn(f, cmds[:cmds.index("apt-get update")])
         self.assert_bash_parses(script)

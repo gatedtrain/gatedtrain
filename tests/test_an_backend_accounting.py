@@ -280,7 +280,7 @@ class ClockedRuntime(FakeRuntime):
                 c.update(status="exited", exit_code=RC_STOPPED, finished_utc=self.clock().strftime(be.TIME_FORMAT))
 
 
-class TestRoundOne(_Acc):
+class TestRecoveryAndAccounting(_Acc):
     def test_new_driver_stops_attempt_past_limit(self) -> None:
         """A driver crash: a new backend that never submitted the job still stops the attempt at its limit."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=["hang"])

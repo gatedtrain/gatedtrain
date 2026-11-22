@@ -297,8 +297,8 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
 
     With `inference` (AN-25) the keeper runs batch generators in its inference container on `runtime` (default: the
     Docker CLI at `inference.docker` on `inference.docker_host`): once it holds its state lock it removes leftover
-    containers and run directories, refuses to start on any `KeeperInference.start_problems` (or a leftover it cannot
-    remove), and adds
+    run directories, checks the Docker CLI and the socket without calling Docker, then removes leftover containers,
+    refuses to start on any of those problems or any `KeeperInference.start_problems`, and adds
     `KeeperInference.environment()` to its environment record as `inference`. Without it a batch generator is
     refused before the grant (AN-8)."""
     if sys.platform != "linux":
@@ -317,8 +317,8 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
     try:
         record = envcheck.environment_record()
         if runner is not None:
-            problems = runner.remove_leftovers()            # before the start checks: an earlier keeper's containers
-            problems += runner.start_problems()
+            # the run directories, then the checks that need no Docker call, and only then any Docker call
+            problems = runner.remove_leftovers() or runner.start_problems()
             if problems:
                 raise Refused(_capped(problems))
             record["inference"] = runner.environment()
