@@ -34,6 +34,12 @@ GATEDTRAIN_GPU_CAP_H=1000 GATEDTRAIN_GPU_USED_H=<used> GATEDTRAIN_GPU_STEP_EST_H
   CPU-only step (`gpus: false`) has the same shape without `--runtime=nvidia --gpus all` (EXT-105). An adapter's
   executor sidecar script (EXT-199) gets a second shape: `--read-only`, tmpfs mounts and the adapter's fixed limit
   options, and no `--shm-size`.
+- Rootless host (EXT-263; the host file's `rootless = true`): the GPU options are `--device nvidia.com/gpu=all`
+  (Docker's native CDI) in place of `--runtime=nvidia --gpus all`, and `--user` is `0:0`, which is the owner on the
+  host under a rootless daemon. Everything else keeps its shape. The wrapper must run `docker --context gatedtrain run`,
+  with the context pointing at the owner's rootless daemon (`unix:///run/user/<owner uid>/docker.sock`), never a
+  socket named directly: on a rootful daemon `0:0` would be root on the host. `ext-launch --recheck` checks, without
+  starting a process, that this socket exists, is a socket and is owned by the owner.
 - Environment, set on the command line:
 
   | Variable | Value |

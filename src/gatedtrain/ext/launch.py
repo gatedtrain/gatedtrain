@@ -98,6 +98,9 @@ HOST_FILE_KEYS = ("host_work", "output_root")
 # Optional host file lists of absolute paths: more daemon configurations whose `data-root` is refused (EXT-73) and
 # more daemon sockets that are never mounted and whose group a container never runs in (EXT-40, EXT-51).
 HOST_FILE_LIST_KEYS = ("extra_daemon_configs", "extra_daemon_sockets")
+# Optional host file booleans: `rootless` (EXT-263), the launch rules of a host whose containers run on the owner's
+# rootless Docker daemon. No environment variable overrides it.
+HOST_FILE_BOOL_KEYS = ("rootless",)
 OUTPUT_ROOT_TOKEN = "{output_root}"      # a registry row's prefix for a directory under the output root
 # The adapter supplies input roots unless GATEDTRAIN_EXT_INPUT_ROOTS is set (EXT-79).
 ENV_PREFIX = "GATEDTRAIN_EXT_"
@@ -122,6 +125,13 @@ DOCKER_SOCKET_GLOBS = ("/run/docker.sock", "/var/run/docker.sock", "/run/docker-
 # "Command shape"; docs/tier-b-runbook.md section 8). The record keeps tmpfs paths only (EXT-39); the options
 # are code, never request values.
 GPU_RUNTIME = "--runtime=nvidia"      # with --gpus: the gatedtrain daemon's NVIDIA toolkit in CDI mode refuses --gpus alone
+ROOTFUL_GPU_OPTIONS = (GPU_RUNTIME, "--gpus", "all")
+# EXT-263: a rootless daemon gets the GPU through Docker's native CDI, and its container root is the owner on the host.
+CDI_GPU_OPTIONS = ("--device", "nvidia.com/gpu=all")
+ROOTLESS_USER = "0:0"
+# The owner's runtime directories; a rootless daemon's socket is `<RUN_USER_DIR>/<uid>/docker.sock` (EXT-263).
+RUN_USER_DIR = "/run/user"
+ROOTLESS_SOCKET = "docker.sock"
 SHM_SIZE = "--shm-size=8g"            # must stay at or below host RAM
 TMPFS_OPTIONS = "rw,exec,nosuid,nodev,size=8g"   # MM-34: Triton and torch.compile load compiled objects from /tmp
                                                  # (Docker's default is noexec); TRL recipe README
@@ -150,7 +160,7 @@ RECORD_KEYS = ("schema", "schema_version", "tags", "adapter", "area", "profile",
                "interpreter_path", "interpreter_sha256")                           # EXT-91
 # Paired sidecars are available to adapters that declare them in the registry (EXT-190).
 OPTIONAL_REQUEST_KEYS = ("sidecar",)
-OPTIONAL_RECORD_KEYS = ("sidecar",)
+OPTIONAL_RECORD_KEYS = ("sidecar", "rootless")      # EXT-263: `"rootless": true` only on a rootless host
 SIDECAR_REQUEST_KEYS = ("runtime", "argv", "mounts", "env", "network", "user", "tmpfs", "read_only", "cap_drop",
                         "security_opt", "gpus", "limits")
 SIDECAR_RECORD_KEYS = ("runtime", "argv", "mounts", "env_names", "network", "user", "tmpfs", "read_only",
@@ -193,12 +203,16 @@ class HostConfig:
     # The host file's `extra_daemon_configs` and `extra_daemon_sockets`, beside DAEMON_CONFIGS and SOCKET_PATHS.
     extra_daemon_configs: tuple[str, ...] = ()
     extra_daemon_sockets: tuple[str, ...] = ()
+    # EXT-263: the host file's `rootless`; the owner whose rootless daemon runs the containers (None: this process's uid).
+    rootless: bool = False
+    owner_uid: int | None = None
 
 
 def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """The host file's `host_work` and `output_root`, and the optional lists `extra_daemon_configs` and
-    `extra_daemon_sockets` ({} when the file does not exist); Refused when it does not parse, has other keys, a
-    layout value is not an absolute path, or a list key is not a list of absolute paths."""
+    """The host file's `host_work` and `output_root`, the optional lists `extra_daemon_configs` and
+    `extra_daemon_sockets`, and the optional boolean `rootless` ({} when the file does not exist); Refused when it does
+    not parse, has other keys, a layout value is not an absolute path, a list key is not a list of absolute paths, or
+    `rootless` is not a TOML boolean (EXT-263)."""
     import tomllib
 
     env = os.environ if environ is None else environ
@@ -210,7 +224,7 @@ def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         doc = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise Refused([Problem("EXT-HOST", str(path), f"does not parse ({exc.__class__.__name__})", fix)])
-    known = HOST_FILE_KEYS + HOST_FILE_LIST_KEYS
+    known = HOST_FILE_KEYS + HOST_FILE_LIST_KEYS + HOST_FILE_BOOL_KEYS
     bad = sorted(set(doc) - set(known))
     if bad:
         raise Refused([Problem("EXT-HOST", str(path), f"has keys {bad} besides {list(known)}", fix)])
@@ -219,6 +233,10 @@ def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
             if not (isinstance(v, list) and all(isinstance(x, str) and PurePosixPath(x).is_absolute() for x in v)):
                 raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not a list of absolute paths",
                                        f"write `{k}` in {path} as a TOML array of absolute paths")])
+        elif k in HOST_FILE_BOOL_KEYS:
+            if not isinstance(v, bool):
+                raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not true or false (EXT-263)",
+                                       f"write `{k} = true` or `{k} = false` in {path} (a TOML boolean, unquoted)")])
         elif not (isinstance(v, str) and PurePosixPath(v).is_absolute()):
             raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not an absolute path", fix)])
     return dict(doc)
@@ -228,7 +246,8 @@ def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
     """The host file's layout, or the `GATEDTRAIN_EXT_HOST_WORK`, `GATEDTRAIN_EXT_OUTPUT_ROOT` and
     `GATEDTRAIN_EXT_INPUT_ROOTS` overrides (tests; another host). Without the input-roots override the adapter's roots
     apply (EXT-79). Refused (EXT-HOST) when host_work or the output root is configured nowhere. The host file's
-    daemon lists apply under the overrides too: they only add refusals."""
+    daemon lists apply under the overrides too: they only add refusals. `rootless` comes from the host file only
+    (EXT-263)."""
     env = os.environ if environ is None else environ
     roots = tuple(r for r in env.get(ENV_INPUT_ROOTS, "").split(os.pathsep) if r)
     trees = tuple(r for r in env.get(ENV_INTERPRETER_TREES, "").split(os.pathsep) if r)      # EXT-113
@@ -245,7 +264,8 @@ def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
                       input_roots=roots or None, interpreter_trees=trees or None,
                       interpreter=env.get(ENV_INTERPRETER) or None, mirror_root=env.get(ENV_MIRROR_ROOT) or None,
                       extra_daemon_configs=tuple(file.get("extra_daemon_configs", ())),
-                      extra_daemon_sockets=tuple(file.get("extra_daemon_sockets", ())))
+                      extra_daemon_sockets=tuple(file.get("extra_daemon_sockets", ())),
+                      rootless=file.get("rootless", False))
 
 
 def adapter_config(cfg: HostConfig, adapter: str) -> HostConfig:
@@ -277,7 +297,8 @@ def host_config_sha256(cfg: HostConfig) -> str:
     interpreter_trees} of the effective layout. Resolve adapter defaults before hashing so changes to overrides
     can invalidate a recorded layout (EXT-117). An
     adapter with image interpreters adds `image_interpreters`; the other adapters' hashes are unchanged. Likewise a
-    host file with `extra_daemon_configs` or `extra_daemon_sockets` adds that list."""
+    host file with `extra_daemon_configs` or `extra_daemon_sockets` adds that list, and `rootless = true` adds
+    `"rootless": true` (EXT-263; a rootful layout's hash is unchanged)."""
     doc = {"host_work": cfg.host_work, "output_root": cfg.output_root, "input_roots": list(cfg.input_roots or ()),
            "mirror_root": cfg.mirror_root, "interpreter": cfg.interpreter,
            "interpreter_trees": list(cfg.interpreter_trees or ())}
@@ -286,6 +307,8 @@ def host_config_sha256(cfg: HostConfig) -> str:
     for k in HOST_FILE_LIST_KEYS:
         if getattr(cfg, k):
             doc[k] = list(getattr(cfg, k))
+    if cfg.rootless:
+        doc["rootless"] = True
     return sha256_bytes(canonical_json(doc))
 
 
@@ -367,18 +390,109 @@ def _real(p: str) -> str:
     return _realpath(_norm(p))
 
 
-def docker_socket_gids(paths: tuple[str, ...] | None = None) -> set[int]:
-    """EXT-51: the groups of the Docker daemon sockets that exist on this host (`DOCKER_SOCKET_GLOBS`)."""
+def _socket_groups(paths: tuple[str, ...]) -> list[tuple[str, int]]:
+    """(path, group) of every existing path the `glob` patterns `paths` match (the target's group for a link)."""
     import glob
 
-    gids: set[int] = set()
-    for pattern in DOCKER_SOCKET_GLOBS if paths is None else paths:
+    found: list[tuple[str, int]] = []
+    for pattern in paths:
         for p in sorted(glob.glob(pattern)):
             try:
-                gids.add(os.stat(p).st_gid)
+                found.append((p, os.stat(p).st_gid))
             except OSError:
                 pass
-    return gids
+    return found
+
+
+def docker_socket_gids(paths: tuple[str, ...] | None = None) -> set[int]:
+    """EXT-51: the groups of the Docker daemon sockets that exist on this host (`DOCKER_SOCKET_GLOBS`)."""
+    return {gid for _, gid in _socket_groups(DOCKER_SOCKET_GLOBS if paths is None else paths)}
+
+
+# ---------------------------------------------------------------------------
+# EXT-263: the launch rules on a rootless host
+# ---------------------------------------------------------------------------
+
+def owner_uid(cfg: HostConfig) -> int:
+    """EXT-263: the owner, whose rootless daemon runs the containers (`cfg.owner_uid`, else this process's uid)."""
+    return os.getuid() if cfg.owner_uid is None else cfg.owner_uid
+
+
+def _primary_gid(cfg: HostConfig, uid: int) -> int | None:
+    return (passwd_gid if cfg.primary_gid is None else cfg.primary_gid)(uid)
+
+
+def gpu_options(rootless: bool) -> tuple[str, ...]:
+    """The GPU options of a GPU step: Docker's native CDI under a rootless daemon (EXT-263), else the NVIDIA runtime."""
+    return CDI_GPU_OPTIONS if rootless else ROOTFUL_GPU_OPTIONS
+
+
+def container_user(cfg: HostConfig) -> str:
+    """The container's `uid:gid`: `0:0` under a rootless daemon (the owner on the host, EXT-263), else the owner's uid
+    and primary group (EXT-66). Raises ValueError for an owner without a user database entry."""
+    if cfg.rootless:
+        return ROOTLESS_USER
+    uid = owner_uid(cfg)
+    gid = _primary_gid(cfg, uid)
+    if gid is None:
+        raise ValueError(f"uid {uid} is not a user of this host")
+    return f"{uid}:{gid}"
+
+
+def rootless_socket(cfg: HostConfig, *, run_user_dir: str | None = None) -> str:
+    """EXT-263: the owner's rootless daemon socket, `<run_user_dir>/<owner uid>/docker.sock` (the context `gatedtrain`)."""
+    return posixpath.join(RUN_USER_DIR if run_user_dir is None else run_user_dir, str(owner_uid(cfg)), ROOTLESS_SOCKET)
+
+
+def rootful_socket_gids(cfg: HostConfig, *, globs: tuple[str, ...] | None = None,
+                        run_user_dir: str | None = None) -> set[int]:
+    """EXT-263: the groups of the Docker sockets `docker_socket_gids` finds (`globs`, default DOCKER_SOCKET_GLOBS, plus
+    the host file's `extra_daemon_sockets`), except a socket whose resolved path lies under the owner's runtime
+    directory `<run_user_dir>/<owner uid>/` (the owner's own rootless daemon; a link there to another socket counts)."""
+    own = _real(posixpath.join(RUN_USER_DIR if run_user_dir is None else run_user_dir, str(owner_uid(cfg))))
+    paths = (DOCKER_SOCKET_GLOBS if globs is None else tuple(globs)) + tuple(cfg.extra_daemon_sockets)
+    return {gid for p, gid in _socket_groups(paths) if not _within(_real(p), own)}
+
+
+def rootless_daemon_problem(cfg: HostConfig, *, run_user_dir: str | None = None) -> str | None:
+    """EXT-263, `ext-launch --recheck`: why the owner's rootless daemon socket is not in place, or None (also None on a
+    rootful host). A stat only: the socket exists, is a socket (not a link) and is owned by the owner; no process is
+    started (the local backend asks the daemon itself, AN-22)."""
+    import stat
+
+    if not cfg.rootless:
+        return None
+    path, uid = rootless_socket(cfg, run_user_dir=run_user_dir), owner_uid(cfg)
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return (f"the owner's rootless Docker socket {path} cannot be read ({exc.__class__.__name__}): the rootless "
+                f"daemon is not running for uid {uid} (EXT-263)")
+    if not stat.S_ISSOCK(st.st_mode):
+        return f"{path} is not a socket; the owner's rootless Docker daemon listens there (EXT-263)"
+    if st.st_uid != uid:
+        return (f"{path} is owned by uid {st.st_uid}, not the owner's uid {uid}: it is not the owner's rootless Docker "
+                "daemon (EXT-263)")
+    return None
+
+
+def option_value(v: str) -> str:
+    """EXT-39: `v` as a printed option value; ValueError when docker would read it as an option (empty or `-...`)."""
+    if not v or v.startswith("-"):
+        raise ValueError(f"{v!r} would be read by docker as an option")
+    return v
+
+
+def mount_source(host: str) -> str:
+    """EXT-69: the `-v` source of the mount of `host`, its strict `realpath` on this host; ValueError when it is an
+    option, does not resolve, or resolves to a path holding `:`, `,` or a control character."""
+    option_value(host)
+    real = _strict(host)
+    if real is None:
+        raise ValueError(f"mount source {host!r} does not resolve on this host")
+    if not _plain_path(real):
+        raise ValueError(f"mount source {host!r} resolves to {real!r}, which holds `:`, `,` or a control character")
+    return real
 
 
 def _kernel_problem(p: str, engine_dirs: tuple[str, ...] = ENGINE_DATA_DIRS) -> str | None:
@@ -746,7 +860,8 @@ def _output_problem(output: str, host_work: str | None, cfg: HostConfig, *, uid:
                     fresh: bool) -> str | None:
     """EXT-63: why `output` cannot be the run's own new output directory, or None. It resolves (strict) to a
     directory strictly under the configured output root's resolved path, outside host_work (lexical and
-    resolved), owned by the container's uid; with `fresh`, it is empty."""
+    resolved), owned by the container's uid `uid` (on a rootless host the owner's, which callers pass; EXT-263);
+    with `fresh`, it is empty."""
     import stat
 
     root = _strict(cfg.output_root)
@@ -766,6 +881,9 @@ def _output_problem(output: str, host_work: str | None, cfg: HostConfig, *, uid:
         if not stat.S_ISDIR(st.st_mode):
             return f"output_dir {output} is not a directory"
         if uid is not None and st.st_uid != uid:
+            if cfg.rootless:
+                return (f"output_dir {output} is owned by uid {st.st_uid}, not the owner's uid {uid} (the container's "
+                        "uid 0 under the rootless daemon; EXT-263)")
             return f"output_dir {output} is owned by uid {st.st_uid}, not the container's uid {uid}"
         if fresh:
             with os.scandir(real) as entries:
@@ -903,7 +1021,8 @@ def isolation_problems(doc: dict, *, kind: str, framework: str | None = None,
         bad("host_work", f"host_work {host_work} is not this host's work directory {cfg.host_work}, whose "
                          f"bin/gpu-step.sh and gpu-guard.log account the GPU time")
     if output is not None:
-        why = _output_problem(output, host_work, cfg, uid=ids[0] if ids else None, fresh=fresh)
+        why = _output_problem(output, host_work, cfg, uid=owner_uid(cfg) if cfg.rootless else ids[0] if ids else None,
+                              fresh=fresh)                                  # EXT-263: the owner's on a rootless host
         if why:
             bad("output_dir", why)
     mounts = doc.get("mounts")
@@ -1060,7 +1179,20 @@ def isolation_problems(doc: dict, *, kind: str, framework: str | None = None,
         if not (isinstance(doc.get("network_reason"), str) and doc["network_reason"].strip()):
             bad("network_reason", f"network {network!r} needs a `network_reason`; the default is `none`")
     user = doc.get("user")
-    if ids is None:
+    if cfg.rootless:                                                         # EXT-263
+        if user != ROOTLESS_USER:
+            bad("user", f"user {user!r} is not {ROOTLESS_USER}: under a rootless daemon the container runs as "
+                        f"{ROOTLESS_USER}, which is the owner on the host (any other uid is a subordinate uid that "
+                        "cannot write the owner's output; EXT-263)")
+        uid = owner_uid(cfg)
+        gids = rootful_socket_gids(cfg) if socket_gids is None else set(socket_gids)
+        primary = _primary_gid(cfg, uid)
+        if primary is None:
+            bad("user", f"the owner uid {uid} is not a user of this host (EXT-263)")
+        elif primary in gids:
+            bad("user", f"the owner's primary group {primary} owns a rootful Docker socket; container gid 0 is that "
+                        "group on the host, so the container could drive that daemon (EXT-263)")
+    elif ids is None:
         bad("user", f"user {user!r} is not `<uid>:<gid>` (ASCII digits)")
     elif ids[0] > ID_MAX or ids[1] > ID_MAX:                                # EXT-74
         bad("user", f"uid or gid above {ID_MAX} in {user!r}; the kernel's ids are 32 bits and larger values wrap")
@@ -1118,6 +1250,12 @@ def isolation_problems(doc: dict, *, kind: str, framework: str | None = None,
                 bad("env_names", _env_refusal(name, allowed_env))
         if HUB_OFFLINE not in names and not _b18_script(doc, cfg):
             bad("env_names", f"{HUB_OFFLINE} is not set; training and evaluation run offline")
+        if "rootless" in doc and doc["rootless"] is not True:                 # EXT-263
+            bad("rootless", f"rootless is {doc['rootless']!r}: a record written on a rootless host carries "
+                            "`\"rootless\": true` and any other omits the key")
+        elif doc.get("rootless", False) != cfg.rootless:
+            bad("rootless", f"the record was written under rootless={str(doc.get('rootless', False)).lower()}, this "
+                            f"host is rootless={str(cfg.rootless).lower()} (the host file's `rootless`; EXT-263)")
 
     # Plain fields.
     if kind == "request":
@@ -1292,7 +1430,8 @@ def sidecar_problems(doc: Any, *, kind: str, cfg: HostConfig, socket_gids: set[i
                 continue
             spool_host = real
             why = _output_problem(host, doc.get("host_work") if _abs(doc.get("host_work")) else None, cfg,
-                                  uid=ids[0] if ids else None, fresh=fresh)
+                                  uid=owner_uid(cfg) if cfg.rootless else ids[0] if ids else None,   # EXT-263
+                                  fresh=fresh)
             if why:
                 bad(f"{f}.host", f"the spool: {why.replace('output_dir', 'spool')}")
             if output is not None and (_within(real, _strict(output) or _norm(output)) or _within(output, host)
@@ -1700,21 +1839,9 @@ def build_command(record: dict, env: dict[str, str], *, est_h: float) -> str:
     prevent).
     EXT-69: each `-v` source is the mount's strict `realpath` on this host (raises ValueError when it does not
     resolve), so the daemon mounts the directory the rules judged, not whatever a symbolic link names later;
-    `ext-launch --recheck` re-runs the rules right before the command."""
-    def value(v: str) -> str:
-        if not v or v.startswith("-"):
-            raise ValueError(f"{v!r} would be read by docker as an option")
-        return v
-
-    def source(host: str) -> str:
-        value(host)
-        real = _strict(host)
-        if real is None:
-            raise ValueError(f"mount source {host!r} does not resolve on this host")
-        if not _plain_path(real):
-            raise ValueError(f"mount source {host!r} resolves to {real!r}, which holds `:`, `,` or a control character")
-        return real
-
+    `ext-launch --recheck` re-runs the rules right before the command.
+    EXT-263: a record with `"rootless": true` gets the GPU through Docker's native CDI (`gpu_options`)."""
+    value, source = option_value, mount_source
     from . import registry
 
     # EXT-191: the adapter's fixed options for this script (code, never request values); a `--shm-size=` among them
@@ -1744,7 +1871,7 @@ def build_command(record: dict, env: dict[str, str], *, est_h: float) -> str:
            f"GATEDTRAIN_GPU_STEP_EST_H={_g(est_h)}", f"{record['host_work'].rstrip('/')}/bin/gpu-step.sh",
            value(record["label"]), "--rm"]
     if record["gpus"]:
-        tok += [GPU_RUNTIME, "--gpus", "all"]
+        tok += list(gpu_options(record.get("rootless", False)))
     tok += ["--network", value(record["network"]), "--user", value(record["user"]), "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", *(shm or [SHM_SIZE])]
     tok += [o for o in options if not o.startswith("--shm-size=")]
@@ -1768,12 +1895,9 @@ def sidecar_commands(side: dict, env: dict[str, str], row: Mapping[str, Any], na
     """EXT-190: (start, stop) of the paired sidecar, as executor/run-executor.sh serve prints it: `docker --context gatedtrain
     run -d --name <name> --rm`, network none, the record's user, no capabilities, no-new-privileges, read-only root
     file system, the row's tmpfs options and limits, the environment, the mounts by their strict `realpath` (EXT-69),
-    the image and argv; then `docker --context gatedtrain stop <name>` after the trainer. Every isolation option is code."""
-    def value(v: str) -> str:
-        if not v or v.startswith("-"):
-            raise ValueError(f"{v!r} would be read by docker as an option")
-        return v
-
+    the image and argv; then `docker --context gatedtrain stop <name>` after the trainer. Every isolation option is code.
+    The sidecar never gets a GPU (`SIDECAR_FLAGS`), so no GPU option is printed on a rootful or a rootless host."""
+    value = option_value
     lim = side["limits"]
     tok = ["docker", "--context", DOCKER_CONTEXT, "run", "-d", "--name", value(name), "--rm", "--network", "none",
            "--user", value(side["user"]), "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only"]
@@ -1785,10 +1909,7 @@ def sidecar_commands(side: dict, env: dict[str, str], row: Mapping[str, Any], na
     for var in sorted(env):
         tok += ["-e", value(f"{var}={env[var]}")]
     for m in side["mounts"]:
-        real = _strict(m["host"])
-        if real is None or not _plain_path(real):
-            raise ValueError(f"mount source {m['host']!r} does not resolve to a plain path on this host")
-        tok += ["-v", value(f"{real}:{m['container']}:{m['mode']}")]
+        tok += ["-v", value(f"{mount_source(m['host'])}:{m['container']}:{m['mode']}")]
     tok.append(value(side["runtime"]["image"]))
     tok += list(side["argv"])
     stop = ["docker", "--context", DOCKER_CONTEXT, "stop", value(name)]
@@ -1990,6 +2111,8 @@ def ext_launch(*, adapter: str, profile: str, request: Path, gpu_log: Path, out_
             "limits": side["limits"],
             "interpreter_sha256": None if image_py else file_sha256(Path(container_file(side["argv"][0], ro)[1])),
             "script_sha256": file_sha256(Path(container_file(side["argv"][2], ro)[1]))}
+    if cfg.rootless:                                     # EXT-263: only on a rootless host (rootful records unchanged)
+        record["rootless"] = True
     record["label"] = launch_label(record)               # EXT-46: one label per launch record
     command = build_command(record, req["env"], est_h=est)
     if side is not None:                                 # EXT-190: sidecar first, trainer, then stop the sidecar
@@ -2018,7 +2141,8 @@ def recheck(*, adapter: str, record_path: Path, spec: Path | None = None, config
     isolation rule (mount sources resolved again, the output directory still empty), the recorded output root,
     the gpu-step.sh checksum and log, the label checksum, and with `--spec` the base and export mounts. The
     operator runs it immediately before launch. The GPU total must match the log (EXT-82). Adapters that bind spec
-    mounts require `--spec` (EXT-84). Return the confirmation line or raise Refused (exit 3)."""
+    mounts require `--spec` (EXT-84). On a rootless host the owner's rootless daemon socket must be in place, by a
+    stat only (EXT-263). Return the confirmation line or raise Refused (exit 3)."""
     cfg = adapter_config(host_config() if config is None else config, adapter)
     ad = _adapter(adapter)
     fix = "do not run the printed command; fix the cause and launch again"
@@ -2056,6 +2180,11 @@ def recheck(*, adapter: str, record_path: Path, spec: Path | None = None, config
                                         "GATEDTRAIN_GPU_USED_H is stale and gpu-step.sh would check the cap against it (EXT-82)",
                                         "launch again (new record, new output directory) so the command carries the "
                                         "current running total"))
+    why = rootless_daemon_problem(cfg)                                     # EXT-263: stat only, no process
+    if why:
+        problems.append(Problem("EXT-LAUNCH", "--recheck.daemon", why,
+                                "start the owner's rootless daemon (`systemctl --user start docker`) and run the "
+                                "printed command through the context `gatedtrain`"))
     if problems:
         raise Refused(problems)
     return f"recheck: ok {record['label']}"
