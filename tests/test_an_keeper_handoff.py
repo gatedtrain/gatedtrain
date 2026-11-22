@@ -370,12 +370,49 @@ class KeeperHandoffTest(unittest.TestCase):
         plant.mkdir(mode=0o700)
         self.assert_fd_check_refuses(plant, "inside the keeper's state directory")
 
-    def test_opened_file_owner_cannot_read_refused(self):        # fix round 1, Important
+    def as_other_owner(self) -> None:
+        """The owner is another uid from here on; the test's directory is opened to it (mode 0755), as /tmp is."""
+        os.chmod(self.tmp, 0o755)
+        self.state.owner_uid = OTHER_UID
+        self.addCleanup(setattr, self.state, "owner_uid", os.getuid())
+
+    def test_opened_file_owner_cannot_read_refused(self):
         plant = self.tmp / "private"
         plant.mkdir(mode=0o700)
-        self.state.owner_uid = OTHER_UID                          # the owner is another user from here on
-        self.addCleanup(setattr, self.state, "owner_uid", os.getuid())
+        self.as_other_owner()
         self.assert_fd_check_refuses(plant, "not readable by the owner uid")
+
+    def test_opened_file_owner_cannot_search_refused(self):
+        """The opened file is readable by every user, but a directory above it is not searchable by the owner."""
+        locked = self.tmp / "locked"
+        locked.mkdir(mode=0o700)
+        plant = locked / "open"
+        plant.mkdir(mode=0o755)
+        self.as_other_owner()
+        real = envcheck.copy_model_files
+
+        def readable(record, dest, **kwargs):                     # the planted copy is 0644, unlike the helper's
+            for f in plant.iterdir():
+                os.chmod(f, 0o644)
+            return real(record, dest, **kwargs)
+        with mock.patch.object(envcheck, "copy_model_files", readable):
+            self.assert_fd_check_refuses(plant, "cannot search a directory above the file")
+
+    def test_owner_cannot_search_an_ancestor_refused_before_spend(self):
+        """A 0644 file under a 0700 directory of another uid than the owner's is refused by the path check."""
+        secret = self.out / "secret"
+        secret.mkdir(mode=0o700)
+        self.as_other_owner()
+        before, records = self.state.alpha(self.pid), self.state.records(self.pid)
+        entry = self._file("model.safetensors", WEIGHTS, secret)
+        os.chmod(entry["path"], 0o644)
+        self.assert_refused_before_spend("ancestor", [entry], before, records)
+        with self.assertRaises(Refused) as cm:
+            self.evaluate(self.candidate([entry], "again"))
+        self.assertIn("cannot search a directory above the file", cm.exception.problems[0].message)
+        self.assertEqual(cm.exception.problems[0].fix, envcheck.TRAVERSE_FIX)
+        os.chmod(secret, 0o755)                                   # searchable: the same file passes
+        self.assertEqual(self.evaluate(self.candidate([entry], "open"))["j"], 1)
 
     def test_cleanup_failure_does_not_change_the_result(self):  # fix round 1, best-effort removal
         with mock.patch.object(state_mod.shutil, "rmtree", side_effect=OSError("busy")):

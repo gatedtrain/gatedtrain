@@ -162,6 +162,24 @@ class DetectionTest(Tree):
         self.tree(mountinfo="22 1 0:21 / /proc rw,nosuid,relatime shared:12 - proc proc rw,hidepid=0\n")
         self.assertEqual(self.reasons(), [])
 
+    def test_process_table_not_visible_fails_closed(self):
+        """With the PID-table check on (the real host's default), a table without PID 1 and without a process of
+        another uid than the keeper's is a private PID namespace or a hidden /proc."""
+        self.tree(statuses={4000: status(os.geteuid(), [100])})
+        self.assertEqual(self.reasons(), [])                              # a fake tree: no check by default
+        reasons = self.reasons(pid_sanity=True)
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("process table is not fully visible", reasons[0])
+        self.assertIn("fail closed", reasons[0])
+        self.tree(statuses={1: status(0, [], name="systemd"), 4000: status(os.geteuid(), [100])})
+        self.assertEqual(self.reasons(pid_sanity=True), [])               # a normal table: PID 1
+        shutil.rmtree(self.root / "proc" / "1")
+        self.assertEqual(len(self.reasons(pid_sanity=True)), 1)
+        self.tree(statuses={4000: status(os.geteuid(), [100]), 4001: status(os.geteuid() + 1, [], name="x")})
+        self.assertEqual(self.reasons(pid_sanity=True), [])               # another uid's process
+        self.assertTrue(rootful.HostView().checks_pid_table)
+        self.assertFalse(rootful.HostView(root=self.root).checks_pid_table)
+
     def test_unreadable_group_fails_closed(self):
         self.tree()
         (self.root / "etc" / "group").unlink()

@@ -786,19 +786,46 @@ class KeeperState:
 
     # ---- attempts: checks before the spend ------------------------------------------------------------------------
 
-    def _owner_can_read(self, st: os.stat_result) -> bool:
+    def _owner_groups(self) -> set[int]:
+        try:
+            pw = pwd.getpwuid(self.owner_uid)
+            return set(os.getgrouplist(pw.pw_name, pw.pw_gid))
+        except (KeyError, OSError):
+            return set()
+
+    def _owner_may(self, st: os.stat_result, bits: tuple[int, int, int], groups: set[int] | None = None) -> bool:
+        """Whether the owner uid has the (user, group, other) permission `bits` on `st` by its mode: the owner's
+        class if it owns the file, else the group class if one of its groups (`os.getgrouplist`) owns it, else
+        other. Root may."""
         if self.owner_uid == 0:
             return True
         if st.st_uid == self.owner_uid:
-            return bool(st.st_mode & stat.S_IRUSR)
-        try:
-            pw = pwd.getpwuid(self.owner_uid)
-            groups = set(os.getgrouplist(pw.pw_name, pw.pw_gid))
-        except (KeyError, OSError):
-            groups = set()
-        if st.st_gid in groups:
-            return bool(st.st_mode & stat.S_IRGRP)
-        return bool(st.st_mode & stat.S_IROTH)
+            return bool(st.st_mode & bits[0])
+        if st.st_gid in (self._owner_groups() if groups is None else groups):
+            return bool(st.st_mode & bits[1])
+        return bool(st.st_mode & bits[2])
+
+    def _owner_can_read(self, st: os.stat_result) -> bool:
+        return self._owner_may(st, (stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH))
+
+    def _owner_can_reach(self, real: str) -> bool:
+        """Whether the owner uid may search (x) every ancestor directory of the resolved path `real`, so the file
+        counts as readable by the owner only when the owner could also get to it. A directory that cannot be
+        inspected counts as not searchable (fail closed)."""
+        if self.owner_uid == 0:
+            return True
+        groups = self._owner_groups()
+        parent = os.path.dirname(real)
+        while True:
+            try:
+                st = os.stat(parent)
+            except OSError:
+                return False
+            if not self._owner_may(st, (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH), groups):
+                return False
+            if parent == os.path.dirname(parent):
+                return True
+            parent = os.path.dirname(parent)
 
     @staticmethod
     def _remove_copies(path: Path) -> None:
@@ -819,8 +846,8 @@ class KeeperState:
 
     def _opened_ok(self, fd: int, st: os.stat_result, name: str) -> tuple[str, str] | None:
         """AN-13 on the file the copy actually opened (a parent directory swapped for a link after the path checks
-        is caught here): it lies outside the keeper's state directory and the owner can read it. Fails closed when
-        the descriptor's path cannot be read."""
+        is caught here): it lies outside the keeper's state directory, the owner can read it and can search every
+        directory above its kernel-reported path. Fails closed when the descriptor's path cannot be read."""
         try:
             real = os.path.realpath(os.readlink(f"/proc/self/fd/{fd}"))
         except OSError:
@@ -832,11 +859,13 @@ class KeeperState:
                 "keep model files outside the keeper's state directory"
         if not self._owner_can_read(st):
             return f"{name} is not readable by the owner uid", "pass a file the user the keeper serves can read"
+        if not self._owner_can_reach(real):
+            return f"{name}: the owner uid cannot search a directory above the file", envcheck.TRAVERSE_FIX
         return None
 
     def _model_files(self, arm: str, record: dict, dest: Path) -> dict:
-        """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read
-        (the keeper is never a way to read a file the owner cannot). The checks on the paths here are an early filter;
+        """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read,
+        under directories the owner can search (the keeper is never a way to read a file the owner cannot). The checks on the paths here are an early filter;
         `envcheck.copy_model_files` repeats them on each opened descriptor (`_opened_ok`, authoritative), copies the
         files into `dest` and checks the copy. Returns the record the generator receives (the copies' paths)."""
         problems = []
@@ -864,6 +893,9 @@ class KeeperState:
             if not self._owner_can_read(st):
                 problems.append(Problem(envcheck.RULE, field, f"{name} is not readable by the owner uid",
                                         "pass a file the user the keeper serves can read"))
+            elif not self._owner_can_reach(real):
+                problems.append(Problem(envcheck.RULE, field, f"{name}: the owner uid cannot search a directory "
+                                        "above the file", envcheck.TRAVERSE_FIX))
         if problems:
             raise Refused(problems)
         try:

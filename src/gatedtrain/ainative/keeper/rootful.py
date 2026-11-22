@@ -17,7 +17,9 @@ returns the reasons the keeper must downgrade its guarantee for the owner uid, a
 
 It fails closed, with a reason, when `etc/group`, `etc/passwd`, `proc`, `proc/self/mountinfo` or `proc/net/tcp`
 cannot be read, when `proc` is mounted with `hidepid` (other users' processes are hidden, so old sessions cannot be
-seen), when a process's status cannot be read for any reason but its end (ENOENT, ESRCH), when a socket that
+seen), when the process table on the real host shows neither PID 1 nor any process of another uid than the
+keeper's (a private PID namespace or another hidden /proc: `HostView.pid_sanity`), when a process's status cannot be
+read for any reason but its end (ENOENT, ESRCH), when a socket that
 matched a glob cannot be stat'ed for any reason but its end (ENOENT), when a rootful socket's extended attributes
 cannot be listed (any error but ENOTSUP, ENODATA), and when the name service fails (an OSError; a group that does not
 exist is no reason). Reasons name uids,
@@ -60,6 +62,13 @@ class HostView:
     root: Path = Path("/")
     root_uid: int = 0
     nss: bool | None = None
+    pid_sanity: bool | None = None
+
+    @property
+    def checks_pid_table(self) -> bool:
+        """Whether a process table without PID 1 and without any process of another uid counts as hidden (None:
+        only on the real root)."""
+        return Path(self.root) == Path("/") if self.pid_sanity is None else self.pid_sanity
 
     def path(self, host_path: str) -> Path:
         return Path(self.root) / host_path.lstrip("/")
@@ -183,6 +192,8 @@ def _processes(view: HostView, owner_uid: int, risky: dict[int, str]) -> list[st
         names = os.listdir(proc)
     except OSError as exc:
         raise _Unreadable("/proc", exc) from None
+    own = os.geteuid()
+    visible = "1" in names                            # PID 1, or below: a process of another uid than the keeper's
     for name in sorted((n for n in names if n.isdigit()), key=int):
         host_path = f"/proc/{name}/status"
         try:
@@ -194,12 +205,18 @@ def _processes(view: HostView, owner_uid: int, risky: dict[int, str]) -> list[st
                            "(fail closed)")
             continue
         uids = _status_field(text, "Uid")
+        if any(u.isdigit() and int(u) != own for u in uids):
+            visible = True
         if str(owner_uid) not in uids:
             continue
         command = " ".join(_status_field(text, "Name")) or "?"
         carried = {int(g) for g in _status_field(text, "Groups") + _status_field(text, "Gid")[1:3] if g.isdigit()}
         for g in sorted(carried & set(risky)):         # supplementary, effective and saved gids
             reasons.append(f"pid {name} ({command}) of uid {owner_uid} carries gid {g} ({risky[g]})")
+    if view.checks_pid_table and not visible:
+        reasons.append("the process table is not fully visible (no PID 1 and no process of another uid: a private "
+                       "PID namespace or a hidden /proc), so other sessions of the owner cannot be seen: counted as "
+                       "rootful access (fail closed)")
     return reasons
 
 
