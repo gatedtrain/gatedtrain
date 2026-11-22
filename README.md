@@ -85,8 +85,8 @@ the report fields and control runs, or the [Tier B runbook](docs/tier-b-runbook.
 | `ext-launch` | Check an external run request, write the launch record and print the command for the operator. Use `--recheck` to verify the record before running it. |
 | `ext-from-nel`, `ext-merge-eval`, `ext-arm-fill` | Build and verify the per-item results for each side of the evaluation. |
 | `ext-collect` | Compare the candidate and baseline on the same evaluation items, then write the gate report, consumption ledger and checkpoint lineage. |
-| `project` | AI-native projects (preview): `create`, `plan`, `run`, `status`, `report`. See below. |
-| `keeper`, `setup keeper`, `verify` | AI-native keeper (preview, Linux only): `keeper serve`, `keeper fingerprint`, `keeper confirm`; print the install commands; check a keeper project's signed records. See below. |
+| `project` | AI-native projects (preview): `create`, `plan`, `run`, `status`, `report`, and `job list`, `job logs`, `job cancel` for the jobs of the local backend. See below. |
+| `keeper`, `setup keeper`, `setup host`, `verify` | AI-native keeper (preview, Linux only): `keeper serve`, `keeper fingerprint`, `keeper confirm`; print the install commands of the keeper and of the rootless Docker host; check a keeper project's signed records. See below. |
 | `impact` | Look up a shard across recorded runs. Each answer reports its precision as `row`, `iteration` or `stage`. |
 
 Gates support superiority, non-inferiority and equivalence. The registration fixes the margin, alpha, target
@@ -205,6 +205,109 @@ keeper's key). The driver keeps every envelope the keeper signed for the project
 and `report`, and on `project report`, it fetches the keeper's list and adds what it lacks (for example the claim of an
 evaluation it stopped waiting for), each verified first. A record the keeper signed that the project still lacks fails
 `verify --keeper` with exit 3.
+
+### Rootless containers, the local backend and the keeper's container (step 3a)
+
+Step 3a runs a project's jobs and the keeper's sealed evaluations in containers on rootless Docker (preview, Linux
+only). The owner and the keeper each run their own rootless Docker daemon, and the owner leaves the rootful `docker`
+group, through which anything running as the owner could otherwise read the keeper's state.
+
+```sh
+gatedtrain setup host [--inference-image REF@sha256:...] [--eval-requirements FILE --eval-python PATH] \
+    [--confirm-group-removal]                     # prints one root script; runs and writes nothing
+sudo bash gatedtrain-host-setup.sh                # after reading it; delete it afterwards
+gatedtrain project job list ./proj                # also: job logs ./proj JOB_ID [--tail N], job cancel ./proj JOB_ID
+```
+
+**Host.** `setup host` prints one bash script for root. All its checks come before its first change: it runs as root,
+the owner has the uid it was printed for, an NVIDIA CDI specification of `nvidia.com/gpu` exists in `/etc/cdi` or
+`/var/run/cdi`, `slirp4netns` or `pasta` is installed, and the parents of the directories it creates are root-owned and
+not writable by others. It then installs `uidmap` and `docker-ce-rootless-extras` at the installed `docker-ce`
+version, adds the AppArmor profile rootlesskit needs on Ubuntu 24.04, creates the keeper user (as `setup keeper`) and
+the subordinate id ranges, removes the owner from the `docker` group before any of the owner's user services start
+(`--confirm-group-removal` pauses first), enables lingering, starts one rootless daemon per user with its own data
+root (`/srv/gatedtrain/docker` for the owner, `/var/lib/gatedtrain-keeper-docker` for the keeper) and Docker's native
+CDI, and creates the owner's Docker context `gatedtrain`. Jobs write the models the keeper reads under the hand-off
+directory `/srv/gatedtrain/out` (the owner's, mode 0755). With `--inference-image` the keeper's daemon pulls that image
+and a drop-in of the keeper's systemd unit starts `keeper serve` with its image ID; with `--eval-requirements`
+(hash-pinned, binary wheels only) the script builds a root-owned eval environment (`/opt/gatedtrain-keeper/eval-venv`)
+from an interpreter under `/opt/gatedtrain-keeper/python`, mounted read-only into the keeper's containers. A login
+session keeps the `docker` group until it ends, so log out everywhere afterwards. Then set in the host file (see
+"Configuration"):
+
+```toml
+rootless = true
+output_root = "/srv/gatedtrain/out"
+```
+
+**Local backend.** A pack stage reaches the project's job backend as `ctx.backend` (AN-22 to AN-24):
+`new_output_dir(name, key=...)`, `submit(job)`, `status`, `wait`, `logs`, `cancel`, `artifacts` and `hand_off`. A
+`Job` (an image pinned by digest, the argv, read-only input mounts, one output directory, environment names the
+adapter allows, GPU or not, a time limit and a GPU-hour estimate) is checked by the launch rules `ext-launch` applies
+to a request of its adapter before anything starts, and runs detached on the owner's rootless daemon (the context
+`gatedtrain`). The backend refuses a daemon that is not rootless or whose socket is not the owner's, and an image the
+daemon does not hold (no job pulls one). The project keeps the records under `<root>/jobs/`: the job (environment
+names only), one row per attempt start, end, stop and cancel, and the tail of each attempt's log. Each attempt writes
+into a fresh `<output dir>/a<n>`. `failed`, `preempted` and `lost` attempts are retried up to `max_attempts` (default
+3); `oom`, `timed_out` and `cancelled` ones are not. A GPU attempt waits up to 900 s for a free GPU and is refused when
+the project's committed GPU-hours plus its estimate pass the budget (`--gpu-hours`); a running attempt is stopped at
+its time limit or at the budget. Every job that ends adds one row to `<host_work>/gpu-log.md` (`docs/gpu-step.md`). A
+stage run again with unchanged inputs gets the same job, so after the driver died while a job ran, `project run
+<stage>` reattaches to the running container instead of starting another one. `hand_off(job_id, paths)` returns
+`{path, sha256}` for model files the keeper user can read (regular files with `o+r`, directories with `o+x`, no link
+on the way), the `files` of a model reference.
+
+**The keeper's container.** `keeper serve --inference-image sha256:<64 hex> [--eval-tree DIR ...] [--docker-host
+URL]` runs a scenario pack's batch generator in a container of the keeper's own rootless daemon, one container per arm
+for all registered seeds, with `--user 0:0 --cap-drop ALL --security-opt no-new-privileges --read-only --network none
+--log-driver none` and Docker's default seccomp profile. Before any alpha is spent the keeper copies the model files a
+reference lists into its own state and checks their hashes; the container gets only that copy, read-only at
+`/in/model`, and the sealed inputs (never the labels) in a file. Its `/out` must then hold exactly one well-formed
+`predictions.jsonl`; anything else is a crash, and the attempt has spent its alpha (AN-9). The report's `compute`
+block states the keeper's containers and their seconds from the keeper's signed records, and the backend's job totals
+the driver sends with the report request, marked "the driver's job records (cooperative, not checked by the
+keeper)".
+
+**Rootful access.** At every request the keeper checks whether the owner's account can reach a rootful Docker or
+containerd daemon: membership of `docker`, `lxd`, `incus-admin` or `disk` or of a rootful socket's group, a process of
+an old session that still carries such a group, a rootful socket writable by everyone or carrying an access control
+list, a listener on TCP port 2375 or 2376. A check it cannot complete counts as positive. `keeper fingerprint` shows
+`owner_has_root_docker` and the reasons. While the check is positive, and for good on every sealed set in use at a
+positive check, a separate-user keeper states instead: "the keeper runs as a separate OS user, but the user's account
+can reach a rootful Docker or containerd daemon or holds a root-equivalent group (docker, lxd, incus-admin or disk), or
+did at a check while this sealed set was in use, and through that can read the keeper's state and signing key: the
+records are signed, but nothing is sealed from the user's account; remove the user from those groups, end the sessions
+that still carry them, and take in new data". `verify` exits 1 against a keeper whose `hello` says
+`owner_has_root_docker`, and on a report that states this text.
+
+**What is cooperative.** The job records, the GPU budget, the GPU log and the `ctx.backend` rules (a GPU job only from
+a stage that declares `needs: gpu`, no job and no output directory from `plan`) hold for drivers and stages that use
+the backend: anything running as the owner can start containers on the owner's daemon itself or edit the project's
+records. The budget is enforced while a driver polls the job. `rootless = true` is the host file's word: the backend
+checks the daemon it reaches, while `ext-launch` only prints. The keeper's own container time is the checked figure,
+and the rootful-access check does not cover sudo.
+
+### Scenario packs
+
+A scenario pack is a distribution that registers its stages in the entry point group `gatedtrain.stages` (one class
+per stage name; the five trust stage names are reserved) and one object in `gatedtrain.scenarios` with `name`,
+`generators` (per-item generation functions, by the name a model reference gives in `generator`), `pipeline` (the
+pipeline file), `scorers` (by reference) and `batch_generators` (`gatedtrain.ainative.batch.BatchGenerator`
+declarations, by name). A name is either a per-item or a batch generator. A pack that has only batch generators still
+exposes an empty `generators` mapping. A per-item generator runs inside the keeper process; a batch generator runs
+only in the keeper's inference container (the in-process path and a keeper started without `--inference-image`
+refuse it, AN-8). `gatedtrain.testing.synthetic_pack` is a small example of both (`synthetic_pack.yaml`,
+`synthetic_pack_batch.yaml`); it is not registered as an entry point.
+
+A `BatchGenerator` names its `script` (an absolute path inside the pack's installed package), the `interpreter` that
+runs it (an absolute container path: the image's own, or one inside the keeper's eval trees with `eval_trees=True`),
+`gpu` and `time_limit_s` (default 1200). The keeper runs `<interpreter> -I /gen/<script> --items /in/items.jsonl
+--sampler /in/sampler.json --model /in/model --out /out`. The script reads one `{"item_id", "input"}` line per item and
+`{"sampler", "seeds"}`, and writes only `/out/predictions.jsonl`: one line `{"item_id", "prediction", "seed"}` per item
+and seed, each written as `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+allow_nan=False)` followed by a newline. That is the keeper's canonical form only when `prediction` is a str, an int
+within ±(2**53-1), a bool or null: a float, a larger int, a missing, extra or duplicate line, or any other file in
+`/out` is a crash (AN-9).
 
 ## Adapter plugins
 

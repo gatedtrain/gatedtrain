@@ -19,7 +19,8 @@ whose `label` is `base` is the baseline; every other model is a candidate.
 Test-only backend switch (AN-24, tests/test_an_backend_stages.py): `GATEDTRAIN_TEST_BACKEND_RUNTIME=fake:<state dir>`
 makes `machine.compute_backend` build its backend on `FakeRuntime(state_dir=<state dir>)`, whose containers of every
 image run `subprocess_handler`; the outcome queue is the one the test stored in the state directory (no outcomes are
-passed here), so no Docker daemon is touched.
+passed here), so no Docker daemon is touched. The containers' times start at the process's start (the fake runtime's
+`start_utc`), since the backend compares them with the real clock.
 
 Test-only host view switch (AN-21, tests/test_an_rootful.py, tests/_keeper.py): `GATEDTRAIN_TEST_HOST_VIEW=<dir>` makes
 `keeper serve` run its rootful-access detection on the fake tree `<dir>` (`HostView(root=<dir>, root_uid=<this uid>)`)
@@ -32,10 +33,19 @@ reference (so a different `--inference-image` is refused at start), its socket i
 `--docker-host` (owned by this uid), containers of that image run `subprocess_handler` (the pack's script on the
 host), and with `<state dir>` the containers and the run log live there for the test to read. Only this wrapper reads
 the variable.
+
+Both runtime switches also keep the process away from the real tools (test safety): the Docker CLI runtime's one
+process call (`DockerCLIRuntime._cli`) and the `nvidia-smi` probe (`NvidiaSmiProbe.used_mib`) raise `RealToolUsed`,
+and the backend and the keeper get a GPU probe that reads a free GPU, so no code path, however it builds its runtime or
+probe, starts `docker` or `nvidia-smi`.
+
+The stand-in ext adapter (`gatedtrain.testing.standin`) is registered in every process of this wrapper: the batch
+pipeline's train job (`synthetic_pack.TrainJob`) and `ext-launch --adapter ainative-standin` use it.
 """
 
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 import time
@@ -43,7 +53,7 @@ from pathlib import Path
 
 from gatedtrain import cli
 from gatedtrain.ainative import stage as stage_mod, trust_stages
-from gatedtrain.testing import synthetic_pack as pack
+from gatedtrain.testing import standin, synthetic_pack as pack
 
 
 class _StageEP:
@@ -68,6 +78,33 @@ TEST_HOST_VIEW_ENV = "GATEDTRAIN_TEST_HOST_VIEW"
 TEST_KEEPER_RUNTIME_ENV = "GATEDTRAIN_TEST_KEEPER_RUNTIME"
 
 
+class RealToolUsed(AssertionError):
+    """A test process reached the real Docker CLI or `nvidia-smi`."""
+
+
+class _FreeGpu:
+    """A GPU probe that reads a free GPU."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def used_mib(self) -> int:
+        return 0
+
+
+def _forbid_real_tools() -> None:
+    from gatedtrain.ainative.runtime import DockerCLIRuntime, NvidiaSmiProbe
+
+    def docker_cli(self, op, args, **kw):
+        raise RealToolUsed(f"test: the Docker CLI must not run under a fake runtime switch (docker {op})")
+
+    def nvidia_smi(self):
+        raise RealToolUsed("test: nvidia-smi must not run under a fake runtime switch")
+
+    DockerCLIRuntime._cli = docker_cli
+    NvidiaSmiProbe.used_mib = nvidia_smi
+
+
 class _EveryImage(dict):
     """A handler table that runs `subprocess_handler` for any image."""
 
@@ -79,17 +116,23 @@ class _EveryImage(dict):
 
 def _fake_backend_runtime(mode: str) -> None:
     from gatedtrain.ainative import machine
+    from gatedtrain.ainative.runtime import TIME_FORMAT
     from gatedtrain.testing.fake_runtime import FakeRuntime
 
     kind, _, arg = mode.partition(":")
     if kind != "fake" or not arg:
         raise SystemExit(f"{TEST_BACKEND_RUNTIME_ENV}: expected fake:<state dir>, got {mode!r}")
+    _forbid_real_tools()
     real = machine.compute_backend
 
     def compute_backend(project, *, runtime=None):
-        rt = FakeRuntime(state_dir=Path(arg))
+        # The containers' times start now: the backend compares them with the real clock (time limits, AN-23).
+        now = datetime.datetime.now(datetime.timezone.utc).strftime(TIME_FORMAT)
+        rt = FakeRuntime(state_dir=Path(arg), start_utc=now)
         rt.handlers = _EveryImage()
-        return real(project, runtime=rt)
+        backend = real(project, runtime=rt)
+        backend.probe = _FreeGpu()
+        return backend
 
     machine.compute_backend = compute_backend
 
@@ -109,12 +152,14 @@ def _fake_host_view(root: str) -> None:
 def _fake_keeper_runtime(mode: str) -> None:
     import re
 
-    from gatedtrain.ainative.keeper import server
+    from gatedtrain.ainative.keeper import inference, server
     from gatedtrain.testing.fake_runtime import FakeRuntime, subprocess_handler
 
     m = re.fullmatch(r"fake:(sha256:[0-9a-f]{64})(?::(.+))?", mode)
     if m is None:
         raise SystemExit(f"{TEST_KEEPER_RUNTIME_ENV}: expected fake:<image id>[:<state dir>], got {mode!r}")
+    _forbid_real_tools()
+    inference.NvidiaSmiProbe = _FreeGpu               # the keeper's default probe reads a free GPU
     image, state_dir = m.group(1), m.group(2)
     real = server.serve
 
@@ -188,8 +233,9 @@ def main(argv: list[str]) -> int:
         _fake_host_view(os.environ[TEST_HOST_VIEW_ENV])
     if os.environ.get(TEST_KEEPER_RUNTIME_ENV):
         _fake_keeper_runtime(os.environ[TEST_KEEPER_RUNTIME_ENV])
+    standin.install()
     eps = [_StageEP(c) for c in (pack.ProfileData, pack.ChooseTaskAndBase, pack.BuildTrainSet, pack.WriteRecipe,
-                                 pack.Smoke, pack.Train)]
+                                 pack.Smoke, pack.Train, pack.ChooseTaskAndBaseFiles, pack.TrainJob)]
     stage_mod._plugin_entry_points = lambda: list(eps)
     trust_stages._scenario_entry_points = lambda: [_ScenarioEP()]
     trust_stages._reset_scenario_snapshot()

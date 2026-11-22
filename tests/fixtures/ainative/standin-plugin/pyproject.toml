@@ -1,0 +1,42 @@
+# A test-only distribution with no code of its own: it registers, through entry points, the synthetic scenario pack
+# (`gatedtrain.testing.synthetic_pack`, its stages and its `SCENARIO`) and the stand-in ext adapter
+# (`gatedtrain.testing.standin`) that ship inside gatedtrain but are never registered by gatedtrain itself. Installed
+# next to gatedtrain, it lets the installed `gatedtrain` command run the synthetic pipelines (`synthetic_pack.yaml`,
+# `synthetic_pack_batch.yaml`) and the local backend's stand-in jobs, as the test wrapper
+# `tests/fixtures/ainative/run_cli.py` does by patching the entry point lookups. Build it with
+# `python -m build --wheel tests/fixtures/ainative/standin-plugin`; never publish it.
+#
+# The stand-in adapter's training row names the synthetic adapter's evaluator, so the synthetic adapter is registered
+# too (the ext conformance check refuses a row whose evaluator is not registered).
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gatedtrain-ainative-standin"
+version = "0.1.0"
+description = "Test-only entry points for gatedtrain's synthetic scenario pack and stand-in ext adapter (no code)."
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.14"
+dependencies = ["gatedtrain>=0.4.0"]
+
+[project.entry-points."gatedtrain.scenarios"]
+synthetic = "gatedtrain.testing.synthetic_pack:SCENARIO"
+
+[project.entry-points."gatedtrain.stages"]
+profile_data = "gatedtrain.testing.synthetic_pack:ProfileData"
+choose_task_and_base = "gatedtrain.testing.synthetic_pack:ChooseTaskAndBase"
+choose_task_and_base_files = "gatedtrain.testing.synthetic_pack:ChooseTaskAndBaseFiles"
+build_train_set = "gatedtrain.testing.synthetic_pack:BuildTrainSet"
+write_recipe = "gatedtrain.testing.synthetic_pack:WriteRecipe"
+smoke = "gatedtrain.testing.synthetic_pack:Smoke"
+train = "gatedtrain.testing.synthetic_pack:Train"
+train_job = "gatedtrain.testing.synthetic_pack:TrainJob"
+
+[project.entry-points."gatedtrain.adapters"]
+ainative-standin = "gatedtrain.testing.standin:PLUGIN"
+synthetic = "gatedtrain.testing.synthetic:PLUGIN"
+
+[tool.setuptools]
+packages = []
