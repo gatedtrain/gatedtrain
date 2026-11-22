@@ -8,14 +8,19 @@ returns the reasons the keeper must downgrade its guarantee for the owner uid, a
   of a rootful socket (one of `ROOTFUL_SOCKET_GLOBS` owned by root), by `etc/group`, by its primary gid in
   `etc/passwd`, or, on the real host, by the group list the name service returns (`os.getgrouplist`, so sssd or LDAP
   groups count);
-- a live process of the owner (any of the ids on its `Uid:` line) carries such a gid in `Groups:` of
-  `proc/<pid>/status`, so a session started before the owner left the group counts until it ends;
-- a rootful socket is writable by every user;
+- a live process of the owner (any of the ids on its `Uid:` line) carries such a gid in `Groups:`, or as its
+  effective or saved gid on the `Gid:` line, of `proc/<pid>/status`, so a session started before the owner left the
+  group counts until it ends;
+- a rootful socket is writable by every user, or carries a POSIX access ACL (`system.posix_acl_access`), which can
+  grant other users access;
 - a TCP socket listens (state `0A`) on port 2375 or 2376 (`proc/net/tcp`, `proc/net/tcp6`).
 
 It fails closed, with a reason, when `etc/group`, `etc/passwd`, `proc`, `proc/self/mountinfo` or `proc/net/tcp`
 cannot be read, when `proc` is mounted with `hidepid` (other users' processes are hidden, so old sessions cannot be
-seen), and when a process's status cannot be read for any reason but its end (ENOENT, ESRCH). Reasons name uids,
+seen), when a process's status cannot be read for any reason but its end (ENOENT, ESRCH), when a socket that
+matched a glob cannot be stat'ed for any reason but its end (ENOENT), when a rootful socket's extended attributes
+cannot be listed (any error but ENOTSUP, ENODATA), and when the name service fails (an OSError; a group that does not
+exist is no reason). Reasons name uids,
 gids, pids with their command names, and paths only; at most `MAX_REASONS` are listed, then a count.
 
 Not detected (stated in the guarantee text or in design 05 §18.10): root through `sudo`; a rootful daemon on another
@@ -46,6 +51,8 @@ ROOT_EQUIVALENT_GROUPS = ("docker", "lxd", "incus-admin", "disk")
 TCP_LISTEN = "0A"
 MAX_REASONS = 20                 # reasons listed; the rest are counted in one more line
 _GONE = (errno.ENOENT, errno.ESRCH)
+ACL_XATTR = "system.posix_acl_access"
+_NO_XATTR = (errno.ENOTSUP, errno.ENODATA)
 
 
 @dataclass(frozen=True)
@@ -94,17 +101,33 @@ def _passwd(view: HostView, uid: int) -> tuple[str, int] | None:
     return None
 
 
-def _rootful_sockets(view: HostView) -> list[tuple[str, os.stat_result]]:
-    """(host path, stat) of every socket of `ROOTFUL_SOCKET_GLOBS` owned by `view.root_uid` (a link is followed)."""
+def _fail(what: str, exc: BaseException) -> str:
+    return f"{what} ({type(exc).__name__}): counted as rootful access (fail closed)"
+
+
+def _rootful_sockets(view: HostView, reasons: list[str]) -> list[tuple[str, os.stat_result]]:
+    """(host path, stat) of every socket of `ROOTFUL_SOCKET_GLOBS` owned by `view.root_uid` (a link is followed);
+    a stat error other than ENOENT, an ACL or an xattr listing error appends to `reasons`."""
     found = []
     for pattern in ROOTFUL_SOCKET_GLOBS:
         for p in sorted(glob.glob(str(view.path(pattern)))):
+            host_path = "/" + Path(p).relative_to(view.root).as_posix()
             try:
                 st = os.stat(p)
-            except OSError:
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:          # not the socket vanishing between glob and stat
+                    reasons.append(_fail(f"cannot stat {host_path}", exc))
                 continue
-            if stat.S_ISSOCK(st.st_mode) and st.st_uid == view.root_uid:
-                found.append(("/" + Path(p).relative_to(view.root).as_posix(), st))
+            if not (stat.S_ISSOCK(st.st_mode) and st.st_uid == view.root_uid):
+                continue
+            found.append((host_path, st))
+            try:
+                if ACL_XATTR in os.listxattr(p):
+                    reasons.append(f"{host_path} is a rootful daemon socket with a POSIX access ACL ({ACL_XATTR}), "
+                                   "which can grant other users access: counted as rootful access")
+            except OSError as exc:
+                if exc.errno not in _NO_XATTR:
+                    reasons.append(_fail(f"cannot list the extended attributes of {host_path}", exc))
     return found
 
 
@@ -174,9 +197,9 @@ def _processes(view: HostView, owner_uid: int, risky: dict[int, str]) -> list[st
         if str(owner_uid) not in uids:
             continue
         command = " ".join(_status_field(text, "Name")) or "?"
-        for g in _status_field(text, "Groups"):
-            if g.isdigit() and int(g) in risky:
-                reasons.append(f"pid {name} ({command}) of uid {owner_uid} carries gid {g} ({risky[int(g)]})")
+        carried = {int(g) for g in _status_field(text, "Groups") + _status_field(text, "Gid")[1:3] if g.isdigit()}
+        for g in sorted(carried & set(risky)):         # supplementary, effective and saved gids
+            reasons.append(f"pid {name} ({command}) of uid {owner_uid} carries gid {g} ({risky[g]})")
     return reasons
 
 
@@ -203,9 +226,11 @@ def owner_root_docker(owner_uid: int, view: HostView = HostView()) -> list[str]:
         for gname in ROOT_EQUIVALENT_GROUPS:
             try:
                 risky.setdefault(grp.getgrnam(gname).gr_gid, f"group {gname}")
-            except (KeyError, OSError):
-                pass
-    sockets = _rootful_sockets(view)
+            except KeyError:
+                pass                                   # no such group
+            except OSError as exc:
+                reasons.append(_fail(f"cannot look up group {gname} in the name service", exc))
+    sockets = _rootful_sockets(view, reasons)
     for host_path, st in sockets:
         risky.setdefault(st.st_gid, f"the group of {host_path}")
         if st.st_mode & stat.S_IWOTH:
@@ -219,8 +244,10 @@ def owner_root_docker(owner_uid: int, view: HostView = HostView()) -> list[str]:
         try:
             pw = pwd.getpwuid(owner_uid)
             entry = (pw.pw_name, pw.pw_gid)
-        except (KeyError, OSError):
-            pass
+        except KeyError:
+            pass                                       # no such user
+        except OSError as exc:
+            reasons.append(_fail(f"cannot look up uid {owner_uid} in the name service", exc))
     member: dict[int, str] = {}
     if entry is not None:
         uname, primary = entry
@@ -234,8 +261,8 @@ def owner_root_docker(owner_uid: int, view: HostView = HostView()) -> list[str]:
                 for gid in os.getgrouplist(uname, primary):
                     if gid in risky:
                         member.setdefault(gid, "the name service (getgrouplist)")
-            except OSError:
-                pass
+            except OSError as exc:
+                reasons.append(_fail(f"cannot list the groups of uid {owner_uid} in the name service", exc))
     for gid in sorted(member):
         reasons.append(f"uid {owner_uid} is in gid {gid} ({risky[gid]}) by {member[gid]}")
     try:
