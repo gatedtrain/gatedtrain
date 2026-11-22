@@ -67,6 +67,16 @@ def project_id(project: Project) -> str:
     return sha256_bytes(canonical_json(project._doc()))
 
 
+def backend_compute(project: Project) -> dict:
+    """AN-10, AN-22: the project's job totals `{jobs, seconds, gpu_seconds}` from its local backend's records
+    (`LocalBackend.jobs`, which reads records only: no runtime, no host file); zeros for a project without jobs. The
+    keeper states them in the report as the driver's (cooperative, not checked by the keeper)."""
+    from .backend import LocalBackend          # backend imports this module (project_id)
+
+    jobs = LocalBackend(project).jobs()
+    return {"jobs": len(jobs), "seconds": sum(j.seconds for j in jobs), "gpu_seconds": sum(j.gpu_seconds for j in jobs)}
+
+
 @dataclass(frozen=True)
 class KeeperBinding:
     socket: str
@@ -415,8 +425,9 @@ class KeeperTrust:
 
     def report(self) -> dict:
         """The keeper's signed report record (`schema_version` 2); the receipts are synced before it is returned, so
-        the project holds every envelope the report rests on."""
-        out = self._call("report")
+        the project holds every envelope the report rests on. The request carries the project's job totals from its
+        backend records (`backend_compute`), which the report states as the driver's (AN-10)."""
+        out = self._call("report", {"compute": backend_compute(self.project)})
         record = self._keep(out.get("report") if isinstance(out, dict) else None, "report")
         self.sync()
         return record

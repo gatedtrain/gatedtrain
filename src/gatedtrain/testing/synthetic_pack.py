@@ -14,11 +14,20 @@ six stages here. Every stage writes its outputs under its pipeline ref name (`ct
 `smoke` trains on a few rows and scores a probe set with the exact-match scorer; `ext.smoke.smoke_verdict` (the
 MM-38 rule for a binary metric) refuses a mean of 0 or 1, so a recipe that learns nothing never reaches `train`.
 `train` declares `needs = {"gpu"}` and `trains = True` but runs on the CPU.
+
+The batch form (`synthetic_pack_batch.yaml`, a keeper project) swaps two stages: `choose_task_and_base_files` writes the
+base model's table as a file, and `train_job` runs the fit's hand-off as a CPU job of the local backend
+(`ctx.backend`), so the models are files the keeper evaluates with the batch generator in its inference container.
 """
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import hashlib
+import json
+import os
+import stat
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +36,7 @@ from typing import Any, Callable, Mapping
 
 from ..ainative import scorers
 from ..ainative.batch import BatchGenerator
+from ..canonical import sha256_bytes
 from ..ainative.project import ArtifactRef
 from ..ainative.stage import Proposal, StageContext
 from ..ainative.trust_stages import SCHEMA_DEPLOYMENT, SCHEMA_MODEL_REF, SCHEMA_TRAIN_PART
@@ -38,8 +48,9 @@ GENERATOR = "synthetic.lookup"
 # The batch form of the same model (AN-25): a standard-library script that reads `<model>/table.json`, for the
 # keeper's inference container. `synthetic_pack.generate` stays the per-item form.
 BATCH_GENERATOR = "synthetic_table_batch"
+IMAGE_PYTHON = "/usr/local/bin/python3"
 BATCH = BatchGenerator(script=Path(__file__).resolve().with_name("synthetic_batch_generate.py"),
-                       interpreter="/usr/local/bin/python3", time_limit_s=600)
+                       interpreter=IMAGE_PYTHON, time_limit_s=600)
 SCHEMA_VERSION = 1
 SCHEMA_PROFILE = "gatedtrain.ainative.synthetic.profile"
 SCHEMA_RECIPE = "gatedtrain.ainative.synthetic.recipe"
@@ -299,6 +310,154 @@ class Train(_Base):
         return []
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The batch form of the pipeline (`synthetic_pack_batch.yaml`, AN-24, AN-25): the models are files, the candidate is
+# made by a job of the local backend, and the keeper evaluates both in its inference container.
+# ---------------------------------------------------------------------------------------------------------------------
+
+TRAIN_JOB_SCRIPT = Path(__file__).resolve().with_name("synthetic_train_job.py")
+TRAIN_JOB_POLL_S = 2.0
+TABLE = "table.json"
+
+
+def _table_bytes(table: dict) -> bytes:
+    """The table as `synthetic_train_job.py` writes it (the batch writer recipe)."""
+    return json.dumps(table, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def _write_file(path: Path, data: bytes) -> None:
+    """`path` replaced by `data` (mode 0644, never through a link): a temporary file in the same directory, renamed.
+    A regular file that already holds `data` is left as it is (a re-run while a job reads it: same inode)."""
+    with contextlib.suppress(OSError):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o644 and f.read(len(data) + 1) == data:
+                return
+    tmp = path.with_name(f".{path.name}.tmp")
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def _backend(ctx: StageContext, stage: str) -> Any:
+    if ctx.backend is None:
+        raise _refuse("SYN-1", "backend", f"stage {stage!r} needs the project's job backend (ctx.backend)",
+                      "run the stage through the stage machine")
+    return ctx.backend
+
+
+class ChooseTaskAndBaseFiles(ChooseTaskAndBase):
+    """`choose_task_and_base` for the batch generator: the base model is the empty table written as a file into a
+    backend output directory, and its reference lists that file with its hash (`{path, sha256}`, as `hand_off`
+    returns them) for the keeper to copy."""
+
+    name = "choose_task_and_base_files"
+
+    def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
+        _read(ctx, "profile")
+        out = _backend(ctx, self.name).new_output_dir("base")
+        data = _table_bytes({})
+        _write_file(out / TABLE, data)
+        deployment = {**_meta(SCHEMA_DEPLOYMENT), "sampler": dict(SAMPLER), "eval_seeds": list(EVAL_SEEDS)}
+        base = {**_meta(SCHEMA_MODEL_REF), "generator": BATCH_GENERATOR, "label": "base",
+                "files": [{"path": str(out / TABLE), "sha256": sha256_bytes(data)}]}
+        return {"deployment": ctx.project.write_artifact(ctx.stage or self.name, "deployment", deployment,
+                                                         SCHEMA_DEPLOYMENT),
+                "base": ctx.project.write_artifact(ctx.stage or self.name, "base", base, SCHEMA_MODEL_REF)}
+
+    def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
+        base = ctx.project.read_artifact(outputs["base"])
+        files = base.get("files")
+        if base.get("generator") != BATCH_GENERATOR or not (isinstance(files, list) and len(files) == 1):
+            return [Problem("SYN-1", "base.files", "the base model is not one table file of the batch generator",
+                            "rerun choose_task_and_base")]
+        try:
+            data = Path(files[0]["path"]).read_bytes()
+        except (OSError, KeyError, TypeError):
+            return [Problem("SYN-1", "base.files[0]", "the base model's table file cannot be read",
+                            "rerun choose_task_and_base")]
+        if data != _table_bytes({}) or files[0].get("sha256") != sha256_bytes(data):
+            return [Problem("SYN-1", "base.files[0]", "the base model's file is not the empty table it lists",
+                            "rerun choose_task_and_base")]
+        return []
+
+
+class TrainJob(_Base):
+    """`train` as a CPU job of the local backend: the table is fitted in process (`fit`), written with
+    `synthetic_train_job.py` to the output directory `train-inputs`, and the job (stand-in adapter, the pipeline's
+    `image`, no GPU) copies it to its output; the candidate reference lists the job's `table.json` from `hand_off`.
+    The job is built before its output directory, which is asked for by the job's key (`new_output_dir("train",
+    key=job.key())`): a re-run with the same inputs gets the same directory and `submit` reattaches to the same job,
+    so a driver that died while the job ran is replaced by running the stage again."""
+
+    name = "train_job"
+    inputs = {"train_set": SCHEMA_TRAIN_PART, "recipe": SCHEMA_RECIPE, "smoke": SCHEMA_SMOKE}
+    outputs = {"model": SCHEMA_MODEL_REF}
+    params = frozenset({"image"})
+    trains = True
+
+    def _image(self, ctx: StageContext) -> str:
+        image = ctx.params.get("image")
+        if not isinstance(image, str) or not image:
+            raise _refuse("SYN-1", "params.image", f"image {image!r} is not an image reference",
+                          "set the pipeline's `image` param to an image pinned by digest that has "
+                          f"{IMAGE_PYTHON}")
+        return image
+
+    def plan(self, ctx: StageContext) -> Proposal:
+        n = _read(ctx, "train_set").get("n")
+        return Proposal(self.name, f"fit the lookup table on {n} rows and hand it off through a CPU job in image "
+                        f"{self._image(ctx)}", {"noise": _read(ctx, "recipe")["noise"]}, {"gpu_hours": 0.0})
+
+    def run(self, ctx: StageContext, decision: dict) -> dict[str, ArtifactRef]:
+        from ..ainative.backend import Job
+        from ..ainative.runtime import Mount
+        from . import standin
+
+        if _read(ctx, "smoke").get("verdict") != "PASS":
+            raise _refuse("MM-38", "inputs.smoke", "the smoke run did not pass", "rerun smoke")
+        image = self._image(ctx)
+        backend = _backend(ctx, self.name)
+        recipe = _read(ctx, "recipe")
+        rows = _rows(_read(ctx, "train_set"), "train_set")
+        table = fit(rows, recipe["noise"], recipe["noise_seed"])
+        inputs = backend.new_output_dir("train-inputs")
+        _write_file(inputs / TABLE, _table_bytes(table))
+        _write_file(inputs / TRAIN_JOB_SCRIPT.name, TRAIN_JOB_SCRIPT.read_bytes())
+        job = Job(label="train", adapter=standin.NAME, runtime={"kind": "container", "image": image},
+                  framework={"name": standin.FRAMEWORK_PACKAGE, "version": "0.1", "commit": None},
+                  argv=(IMAGE_PYTHON, f"/inputs/{TRAIN_JOB_SCRIPT.name}", "--table", f"/inputs/{TABLE}",
+                        "--out", "/out"),
+                  env={"HF_HUB_OFFLINE": "1", "HOME": "/tmp/home"},
+                  mounts=tuple(Mount(str(inputs / n), f"/inputs/{n}") for n in (TRAIN_JOB_SCRIPT.name, TABLE)),
+                  output_dir="", output_container="/out", tmpfs=("/tmp",))
+        job = dataclasses.replace(job, output_dir=str(backend.new_output_dir("train", key=job.key())))
+        job_id = backend.submit(job)
+        status = backend.wait(job_id, poll_s=TRAIN_JOB_POLL_S)
+        if status.state != "succeeded":
+            raise _refuse("SYN-1", "train.job", f"the train job {job_id} ended {status.state}"
+                          + (f" ({status.reason})" if status.reason else ""),
+                          "read `gatedtrain project job logs`, fix the cause and run the stage again")
+        model = {**_meta(SCHEMA_MODEL_REF), "generator": BATCH_GENERATOR, "label": "candidate",
+                 "noise": recipe["noise"], "n_train": len(rows), "job_id": job_id,
+                 "files": backend.hand_off(job_id, [TABLE])}
+        return {"model": ctx.project.write_artifact(ctx.stage or self.name, "model", model, SCHEMA_MODEL_REF)}
+
+    def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
+        m = ctx.project.read_artifact(outputs["model"])
+        files = m.get("files")
+        if m.get("generator") != BATCH_GENERATOR or not (isinstance(files, list) and len(files) == 1
+                                                         and Path(str(files[0].get("path"))).name == TABLE):
+            return [Problem("SYN-1", "model", "the model is not one table file of this pack's batch generator",
+                            "rerun train")]
+        return []
+
+
 @dataclass(frozen=True)
 class Scenario:
     """What the `gatedtrain.scenarios` entry point exposes: the generation functions of the pack, by the name a
@@ -322,3 +481,6 @@ class Scenario:
 
 SCENARIO = Scenario("synthetic", {GENERATOR: generate}, Path(__file__).with_name("synthetic_pack.yaml"),
                     batch_generators={BATCH_GENERATOR: BATCH})
+# The batch form of the pipeline (`choose_task_and_base_files`, `train_job`); a pack exposes one pipeline file, so this
+# one is passed to `project create --pipeline` by path.
+BATCH_PIPELINE = Path(__file__).with_name("synthetic_pack_batch.yaml")

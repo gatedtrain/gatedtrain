@@ -14,7 +14,7 @@ MM-36 and `tests/README.md` EXT-24, EXT-28, EXT-46, EXT-53, EXT-57, EXT-64, EXT-
 |---|---|---|
 | `<host_work>/bin/gpu-step.sh` | the operator | `ext-launch`, `ext-launch --recheck` and `ext-collect` read its text and hash it; nothing in gatedtrain runs it |
 | `<host_work>/gpu-guard.log` | the wrapper | `ext-collect` (GPU seconds, first start) |
-| `<host_work>/gpu-log.md` | the operator | `ext-launch` and `--recheck` (the running total) |
+| `<host_work>/gpu-log.md` | the operator, and the AI-native local backend (one row per job, below) | `ext-launch` and `--recheck` (the running total); the local backend before each new job |
 
 ## Invocation
 
@@ -133,3 +133,32 @@ gatedtrain reads only the `Running total` column (`launch.gpu_used_h`): a table 
 The value used is the running total of the last data row of any such table; it must parse as a number. A file
 without such a row, or with a running total that is not a number, is refused. `ext-launch --gpu-log` must name
 `<host_work>/gpu-log.md` (EXT-67). Other columns, headings and notes are free text.
+
+### Rows the local backend writes
+
+The AI-native local backend (`gatedtrain.ainative.backend`, AN-23) runs its jobs' containers itself, on the owner's
+rootless daemon, without `gpu-step.sh` and without `gpu-guard.log`. It appends its own rows to the same
+`<host_work>/gpu-log.md`, so one running total covers both paths:
+
+- one row per job, when the job reaches a terminal state (succeeded, failed, cancelled, timed out or budget
+  exhausted), CPU jobs included (0.00 GPU-hours), all attempts of the job in that one row:
+
+  ```markdown
+  | 0001-train (train), 2 attempt(s) | 2026-11-22T10:00:00Z | 2026-11-22T10:42:10Z | 0.70 | 3.39 | SUCCEEDED rc=0 |
+  ```
+
+  `Step` is the job id, its label and its attempt count; `Started` is the first attempt's container start (its
+  `start` row's time when no container time is known) and `Ended` the last attempt's end; `GPU-hours` is the sum of
+  the attempts' GPU seconds (each attempt's container run time for a GPU job, 0 for a CPU job) over 3600, two
+  decimals; `Running total` is the log's previous running total plus that; `Outcome` is the job's state in capitals
+  and the last attempt's exit code (`-` when none);
+- the row is appended with `O_APPEND`, never through a symbolic link, under an exclusive lock on the file (the log is
+  the host's, shared by every project); a missing log is created with the table header and the first row in one
+  write; after a log that does not end inside a table with a `Running total` column (notes, a heading, a blank line)
+  the row comes with a new header, so it is the last row `launch.gpu_used_h` reads;
+- an existing log that does not parse is refused (AN-23) and never reset: before a new job is recorded, so a job's
+  end never fails on it after GPU time was spent; fix the log by hand;
+- a job whose terminal state was recorded but whose row a crash cut off gets its row at a later `status` of the job.
+
+The row of a backend GPU job raises the running total, so a launch record `ext-launch` wrote before it fails
+`ext-launch --recheck` (EXT-82); launch again once the backend's GPU jobs have ended.
