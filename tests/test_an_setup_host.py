@@ -121,7 +121,52 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         self.assertIn("without --eval-requirements passes no --eval-tree", " ".join(tail.split()))
         self.assert_bash_parses(script)
 
-    def test_fix_round_1_checks_and_extras_hold(self):
+    def test_user_manager_already_running_and_subids(self):
+        script = self.script()
+        cmds = commands_only(script)
+        # apt's lists are refreshed before uidmap is installed
+        self.assert_order(cmds, ["cd /", "apt-get update", "apt-get install -y uidmap"])
+        # an owner's user manager that already runs keeps the docker group: a warning when it is seen, before the
+        # start, and again at the end; the group removal still comes first
+        self.assert_order(cmds, ["gpasswd -d", 'systemctl is-active --quiet "user@$OWNER_UID.service"',
+                                 "loginctl enable-linger", 'systemctl start "user@$OWNER_UID.service"',
+                                 "dockerd-rootless-setuptool.sh install", '[ -z "$OWNER_MANAGER_WAS_ACTIVE" ]',
+                                 "done; the next steps"])
+        warn = [l for l in cmds.splitlines() if "OWNER_MANAGER_WAS_ACTIVE" in l and "echo" in l]
+        self.assertEqual(len(warn), 1, cmds)
+        self.assertIn("systemctl restart user@$OWNER_UID.service", cmds)
+        tail = script[script.rindex("# Next steps:"):]
+        self.assertIn("already running", " ".join(tail.split()))
+        self.assertIn("keeper fingerprint", " ".join(tail.split()))
+        # overlapping subordinate id ranges refuse before any change, and again once the keeper user exists
+        self.assert_order(cmds, ["check_subids() {", "check_subids before-changes", "apt-get update",
+                                 'KUID=$(id -u "$KEEPER")', "check_subids after-keeper-created", "--add-subuids"])
+        for f in ("/etc/subuid", "/etc/subgid"):
+            self.assertIn(f, cmds[:cmds.index("apt-get update")])
+        self.assert_bash_parses(script)
+
+    def test_subid_overlap_check_runs(self):
+        """The script's `covers` function, run by bash on temporary files (the only part of the script run here)."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is not installed")
+        cmds = commands_only(self.script())
+        start = cmds.index("covers() {")
+        func = cmds[start:cmds.index("\n}\n", start) + 3]
+        subuid = self.tmp / "subuid"
+        subuid.write_text("alice:100000:65536\nkeeper:165536:65536\n")
+        for user, uid, ident, covered in (("alice", 1234, 100000, True), ("alice", 1234, 165536, False),
+                                          ("1234", 1234, 100001, False), ("keeper", 999, 231071, True),
+                                          ("bob", 1, 100000, False)):
+            with self.subTest(user=user, ident=ident):
+                proc = subprocess.run([bash, "-c", func + f'\ncovers {subuid} {user} {uid} {ident}'],
+                                      capture_output=True, text=True, timeout=30)
+                self.assertEqual(proc.returncode == 0, covered, proc.stderr)
+        proc = subprocess.run([bash, "-c", func + f"\ncovers {self.tmp / 'absent'} alice 1234 100000"],
+                              capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_network_driver_and_extras_hold(self):
         cmds = commands_only(self.script())
         # a rootless network driver is checked before any change (item 7)
         self.assert_order(cmds, ["cd /", "command -v slirp4netns", "command -v pasta", "apt-get install -y uidmap"])

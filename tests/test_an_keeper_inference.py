@@ -61,6 +61,11 @@ def _tmpdir(case: unittest.TestCase, prefix: str = "gk-inf-") -> Path:
     return d
 
 
+def pwd_entry(name: str, uid: int, gid: int):
+    import pwd
+    return pwd.struct_passwd((name, "x", uid, gid, "", "/nonexistent", "/usr/sbin/nologin"))
+
+
 def docker_socket(root: Path) -> Path:
     """A stand-in for the keeper's rootless socket: a file in a 0700 directory owned by this uid."""
     d = root / "dockerd"
@@ -479,6 +484,41 @@ class InferenceUnitTest(unittest.TestCase):
         rt = Counting(image_ids={IMAGE: IMAGE}, socket=str(self.sock))
         self.assertEqual(self.ki(rt=rt).remove_leftovers(), [])
         self.assertEqual((Counting.calls, self.clock.t), (0, 0.0))
+
+    def subids(self, subuid: str, subgid: str | None = "", *, owner=(5000, 5000), keeper=(999, 998)):
+        """`_subid_problems` of a keeper (uid, gid) for an owner (uid, gid), with fake passwd entries and id files
+        (None: the file is absent)."""
+        files, where = [], Path(tempfile.mkdtemp(dir=self.tmp))
+        for name, text in (("subuid", subuid), ("subgid", subgid)):
+            f = where / name
+            if text is not None:
+                f.write_text(text)
+            files.append(str(f))
+        users = {owner[0]: pwd_entry("alice", *owner), keeper[0]: pwd_entry("gatedtrain-keeper", *keeper)}
+        ki = KeeperInference(self.config(), self.rt, self.state, probe=Probe(0), sleep=self.clock.sleep,
+                             clock=self.clock, owner_uid=owner[0])
+        ki.keeper_uid = keeper[0]
+        with mock.patch.object(inference, "SUBID_FILES", tuple(files)), \
+                mock.patch.object(inference.pwd, "getpwuid", lambda uid: users[uid]):
+            return ki._subid_problems()
+
+    def test_subid_ranges(self):
+        self.assertEqual(self.subids("alice:100000:65536\ngatedtrain-keeper:165536:65536\n",
+                                     "alice:100000:65536\n"), [])
+        for subuid, subgid, text in (("alice:900:200\n", "", "range of the owner in"),        # covers uid 999
+                                     ("5000:900:100\n", "", "range of the owner in"),         # by uid
+                                     ("gatedtrain-keeper:4990:20\n", "", "range of the keeper in"),
+                                     ("", "alice:998:1\n", "subordinate gid range of the owner"),
+                                     ("", "gatedtrain-keeper:5000:1\n", "subordinate gid range of the keeper"),
+                                     ("alice:x:1\n", "", "range of the owner in")):             # malformed
+            with self.subTest(subuid=subuid, subgid=subgid):
+                problems = self.subids(subuid, subgid)
+                self.assertEqual(self.rules(problems), ["AN-13"])
+                self.assertIn(text, problems[0].message)
+        problems = self.subids("", None)                                         # unreadable: fail closed
+        self.assertEqual(self.rules(problems), ["AN-13"])
+        self.assertIn("cannot be read", problems[0].message)
+        self.assertEqual(self.subids("alice:900:200\n", owner=(999, 998), keeper=(999, 998)), [])  # same user
 
     # -- ready (before the grant) ------------------------------------------------------------------------------------
 
