@@ -6,8 +6,10 @@ The backend runs on `FakeRuntime` with a fake GPU probe and a fake clock (the st
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import os
+import shutil
 import threading
 from pathlib import Path
 from unittest import mock
@@ -17,7 +19,7 @@ from gatedtrain.ainative.backend import LocalBackend
 from gatedtrain.ainative.runtime import GPU_BUSY_MIB
 from gatedtrain.errors import Refused
 from gatedtrain.ext import launch
-from gatedtrain.testing.fake_runtime import FakeRuntime
+from gatedtrain.testing.fake_runtime import RC_STOPPED, FakeRuntime
 
 from test_an_backend import IMAGE, SCRIPT, _Base, _train, setUpModule, tearDownModule  # noqa: F401
 
@@ -39,6 +41,9 @@ class Clock:
     def at(self, seconds: float) -> None:
         self.now = START + dt.timedelta(seconds=seconds)
 
+    def mono(self) -> float:
+        return (self.now - START).total_seconds()
+
 
 class Probe:
     def __init__(self, *readings: int | None) -> None:
@@ -57,7 +62,7 @@ class _Acc(_Base):
 
     def make_backend(self, rt: FakeRuntime | None = None, probe=None) -> LocalBackend:
         return LocalBackend(self.project, rt or self.rt, host=self.host, probe=probe, clock=self.clock,
-                            sleep=self.clock.sleep)
+                            sleep=self.clock.sleep, monotonic=self.clock.mono)
 
     def gpu_job(self, name: str = "train", est: float = 0.4, **kw):
         return self.job(name, gpu=True, gpu_hours_est=est, **kw)
@@ -140,6 +145,7 @@ class TestAccounting(_Acc):
         b = self.make_backend(rt)
         other = b.submit(self.gpu_job("first", est=0.25))            # 60 s recorded
         b.wait(other)
+        self.clock.at(60)                                             # the start row and the container agree
         jid = b.submit(self.gpu_job(est=0.4))                         # starts at +60 s; budget left 3540 s
         self.assertEqual(self.of(jid, "start")[0]["limit_s"], 3540)
         self.clock.at(60 + 3539)
@@ -259,7 +265,123 @@ class TestAccounting(_Acc):
         self.assertEqual((cm.exception.problems[0].rule, cm.exception.problems[0].field), ("AN-23", "budget.gpu_hours"))
 
 
+class ClockedRuntime(FakeRuntime):
+    """A fake runtime whose `stop` ends the container at the test clock's time (its run time is then real)."""
+
+    def __init__(self, clock: Clock, *args, **kw) -> None:
+        super().__init__(*args, **kw)
+        self.clock = clock
+
+    def stop(self, container: str, *, timeout_s: int = 30) -> None:
+        with self._state() as st:
+            c = self._live(st, "stop", container)
+            if c["status"] == "running":
+                c.update(status="exited", exit_code=RC_STOPPED, finished_utc=self.clock().strftime(be.TIME_FORMAT))
+
+
+class TestRoundOne(_Acc):
+    def test_new_driver_stops_attempt_past_limit(self) -> None:
+        """A driver crash: a new backend that never submitted the job still stops the attempt at its limit."""
+        rt = FakeRuntime({IMAGE: _train}, outcomes=["hang"])
+        jid = self.make_backend(rt).submit(self.job(time_limit_s=100))
+        self.clock.at(101)
+        s = self.make_backend(rt).status(jid)
+        self.assertEqual((s.state, s.outcome), ("timed_out", "timed_out"))
+        self.assertEqual(self.events(jid), ["start", "stop", "end"])
+
+    def test_lost_attempt_counts_its_time(self) -> None:
+        rt = FakeRuntime({IMAGE: _train}, outcomes=["vanish", "vanish"])
+        b = self.make_backend(rt)
+        jid = b.submit(self.gpu_job(est=0.4, max_attempts=2))
+        self.clock.at(500)
+        s = b.status(jid)                                             # a1 lost after 500 s; a2 started at +500 s
+        ends = self.of(jid, "end")
+        self.assertEqual([(e["outcome"], e["seconds"], e["gpu_seconds"]) for e in ends], [("lost", 500, 500)])
+        self.assertEqual(s.state, "running")
+        limit = self.of(jid, "start")[1]["limit_s"]
+        self.assertEqual(limit, 3600 - 500)
+        self.clock.at(500 + 99999)
+        s = b.status(jid)
+        self.assertEqual(s.state, "failed")
+        self.assertEqual(self.of(jid, "end")[1]["gpu_seconds"], limit)   # at most its limit
+        self.assertLessEqual(b.gpu_seconds(), 3600)
+
+    def test_concurrent_gpu_jobs_stay_within_budget(self) -> None:
+        """Review round 1, Important 3: two GPU jobs (0.4 h each) run at once and longer than estimated; each poll
+        recomputes the budget left from the recorded time and both attempts' run times, so together they overrun the
+        1 h budget by at most one poll interval each."""
+        rt = ClockedRuntime(self.clock, {IMAGE: _train}, outcomes=["hang", "hang"], duration_s=0)
+        b = self.make_backend(rt)
+        ids = [b.submit(self.gpu_job("a", est=0.4)), b.submit(self.gpu_job("b", est=0.4))]
+        poll = 70
+        t = 0
+        while any(b.status(j).state == "running" for j in ids):
+            t += poll
+            self.clock.at(t)
+            self.assertLess(t, 4000)
+        states = [b.status(j) for j in ids]
+        self.assertEqual([s.state for s in states], ["budget_exhausted", "budget_exhausted"])
+        self.assertLessEqual(b.gpu_seconds(), 3600 + 2 * poll)
+        self.assertGreaterEqual(b.gpu_seconds(), 3600)
+
+    def test_missing_log_row_added_by_later_status(self) -> None:
+        """Minor 4: a crash cut off the log row; the next status adds it, once."""
+        old = be.GPU_LOG_HEADER + "| old | a | b | 1.00 | 1.00 | PASS rc=0 |\n"
+        self.gpu_log().write_text(old)
+        jid = self.backend.submit(self.job())
+        self.assertEqual(self.backend.wait(jid).state, "succeeded")
+        self.gpu_log().write_text(old)                                # the row was lost
+        self.backend.status(jid)
+        self.backend.status(jid)
+        lines = self.gpu_log().read_text().splitlines()
+        self.assertEqual([l for l in lines if l.startswith(f"| {jid} (")], [lines[-1]])
+        self.assertEqual(len(lines), 4)
+
+    def test_inputs_changed_stops_cut_off_container(self) -> None:
+        """Minor 8: a container of the due attempt runs (its `start` row was cut off); it is stopped and recorded
+        before the refusal."""
+        rt = FakeRuntime({IMAGE: _train}, outcomes=["preempt", "hang"])
+        b = self.make_backend(rt)
+        jid = b.submit(self.job())
+        rt.run(dataclasses.replace(rt.runs[0], name=self.name(jid, 2)))
+        (self.inputs / SCRIPT).write_text("print('changed')\n")
+        with self.assertRaises(Refused):
+            b.status(jid)
+        self.assertEqual(self.events(jid), ["start", "end", "start", "end", "refused"])
+        self.assertEqual(rt.inspect(self.name(jid, 2)).status, "missing")
+        self.assertEqual(self.of(jid, "refused")[0]["attempt"], 3)
+        self.assertEqual(b.status(jid).state, "failed")
+
+
 class TestGpuLog(_Acc):
+    def test_log_ending_in_notes(self) -> None:
+        """Important 1: the documented log (tests/fixtures/ext/gpu-log.fixture.md) ends in notes; a new table is
+        appended and its total counts."""
+        fixture = Path(__file__).parent / "fixtures" / "ext" / "gpu-log.fixture.md"
+        shutil.copyfile(fixture, self.gpu_log())
+        before_text = self.gpu_log().read_text()
+        before = launch.gpu_used_h(self.gpu_log())
+        rt = FakeRuntime({IMAGE: _train}, duration_s=1800)
+        b = self.make_backend(rt)
+        jid = b.submit(self.gpu_job())
+        b.wait(jid)
+        text = self.gpu_log().read_text()
+        self.assertTrue(text.startswith(before_text))
+        self.assertAlmostEqual(launch.gpu_used_h(self.gpu_log()), round(before + 0.5, 2))
+        self.assertEqual(text.splitlines()[-3], be.GPU_LOG_HEADER.splitlines()[0])
+
+    def test_log_with_trailing_blank_line(self) -> None:
+        self.gpu_log().write_text("| Step | Started (UTC) | Ended (UTC) | GPU-hours | Running total | Outcome |\n"
+                                  "|---|---|---|---|---|---|\n| old | a | b | 2.00 | 2.00 | PASS rc=0 |\n\n")
+        b = self.make_backend(FakeRuntime({IMAGE: _train}, duration_s=1800))
+        jid = b.submit(self.gpu_job())
+        b.wait(jid)
+        self.assertEqual(launch.gpu_used_h(self.gpu_log()), 2.5)
+        b2 = b.submit(self.job("cpu"))
+        b.wait(b2)
+        self.assertEqual(launch.gpu_used_h(self.gpu_log()), 2.5)
+        self.assertEqual(self.gpu_log().read_text().count("| Step |"), 2)  # the second row joined the new table
+
     def test_gpu_log_row(self) -> None:
         """Pre-flight finding 7: an absent log is created with the header and the first row at once (total from 0);
         later rows add to the last running total; CPU jobs get a row too."""

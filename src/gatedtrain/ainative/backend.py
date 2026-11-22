@@ -23,7 +23,9 @@ AN-23: an attempt's GPU seconds are its container's run time (0 for a CPU job). 
 when the committed GPU time (the recorded GPU seconds plus the estimates of the project's other queued or running GPU
 jobs) plus the job's estimate exceeds `budget.gpu_hours`; a refused start is a `refused` row and ends the job
 `budget_exhausted`. A running attempt is stopped at its time limit, a GPU attempt also once it used the budget left when
-it started (`stop` rows, while a driver polls). Before a GPU attempt starts the backend waits for a free GPU (the
+it started, or once the project's recorded GPU time plus the run time of all its running GPU attempts reaches the budget
+(`stop` rows). This is enforced per poll: only while a driver calls `status`, and an attempt may overrun by up to one
+poll interval. Before a GPU attempt starts the backend waits for a free GPU (the
 `probe`; none: no wait). `failed`, `preempted` and `lost` attempts are retried while attempts remain, under the job lock
 that records the end. Each job that reaches a terminal state appends one row to `<host_work>/gpu-log.md`.
 
@@ -49,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
-from ..canonical import canonical_json, file_sha256, sha256_bytes
+from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
 from ..ext import launch
 from ..ext.launch import HostConfig
@@ -452,6 +454,21 @@ def _sha256_nofollow(path: str, *, field: str = "path") -> str:
     return got
 
 
+def _sha256_bound(path: str, field: str) -> str:
+    """The sha256 of a file the argv binding resolved (links followed, a FIFO never blocks); Refused (AN-22) when it is
+    not a regular file."""
+    got = _sha256_regular(path, follow=True)
+    if got is None:
+        raise Refused([_problem(field, f"{path} is not a regular file", "name a regular script and interpreter")])
+    return got
+
+
+def _start_row(rows: list[dict], attempt: int) -> dict | None:
+    """The last `start` row of `attempt`."""
+    found = [r for r in rows if r.get("event") == "start" and r.get("attempt") == attempt]
+    return found[-1] if found else None
+
+
 def _record_argv(argv: list[str]) -> list[str]:
     """The docker argument list with each `-e NAME=value` replaced by `-e NAME` (MM-35)."""
     out = list(argv)
@@ -485,13 +502,15 @@ class LocalBackend:
 
     def __init__(self, project: Project, runtime: Runtime | None = None, *, host: HostConfig | None = None,
                  probe: GpuProbe | None = None, clock: Callable[[], datetime] = _utc_now,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self.project = project
         self._runtime = runtime
         self._host = host
         self.probe = probe
         self.clock = clock
         self.sleep = sleep
+        self.monotonic = monotonic
         self._jobs: dict[str, Job] = {}         # jobs this backend submitted: their environment values start them
         self._pid: str | None = None
 
@@ -637,7 +656,7 @@ class LocalBackend:
         start; the job stays queued."""
         if self.probe is None:
             return
-        if not wait_for_gpu(self.probe, sleep=self.sleep, clock=lambda: self.clock().timestamp()):
+        if not wait_for_gpu(self.probe, sleep=self.sleep, clock=self.monotonic):
             raise Refused([Problem(RULE_GPU, "gpu", f"the GPU is busy: compute processes held more than {GPU_BUSY_MIB} "
                                    f"MiB through {GPU_WAIT_S} s of waiting, or this host has no nvidia-smi to read it",
                                    "let the other GPU work end, then poll or submit the job again (it stays queued)")])
@@ -662,15 +681,10 @@ class LocalBackend:
         if st.st_size == 0:
             return None
         try:
-            total = launch.gpu_used_h(Path(f"/dev/fd/{fd}"))
-            text = os.pread(fd, st.st_size, 0).decode("utf-8")
+            return launch.gpu_used_h(Path(f"/dev/fd/{fd}"))
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise self._gpu_log_refused(path, f"does not parse ({exc.__class__.__name__}: no table row with a numeric "
                                         "`Running total`)") from None
-        if not _table_open(text):
-            raise self._gpu_log_refused(path, "does not end in its `Running total` table; a row appended there would "
-                                        "not count")
-        return total
 
     def _gpu_log_check(self) -> None:
         """Before a new job: an existing log must parse, so a job's end never fails on it after GPU time was spent."""
@@ -687,10 +701,13 @@ class LocalBackend:
         finally:
             os.close(fd)
 
-    def _gpu_log(self, job_id: str, rec: Mapping[str, Any], status: JobStatus) -> None:
+    def _gpu_log(self, job_id: str, rec: Mapping[str, Any], status: JobStatus, *, if_missing: bool = False) -> None:
         """One row for a job that reached a terminal state, appended without following a link and under a lock on the
         log (it is the host's, shared by projects): the header and the first row in one write when the log is absent;
-        an existing log that does not parse is refused, never reset."""
+        after a log that does not end inside its `Running total` table (notes, headings, a blank line: free text,
+        docs/gpu-step.md) a new table, header and row, so the row is the last one `launch.gpu_used_h` reads. An
+        existing log that does not parse is refused, never reset. `if_missing`: only when the log has no row of the
+        job yet (a terminal state whose row a crash cut off)."""
         rows = self._rows(job_id)
         starts = [r for r in rows if r.get("event") == "start"]
         ends = [r for r in rows if r.get("event") == "end"]
@@ -708,13 +725,17 @@ class LocalBackend:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             before = self._gpu_log_total(fd, path)
+            size = os.fstat(fd).st_size
+            text = os.pread(fd, size, 0).decode("utf-8", "replace") if size else ""
+            if if_missing and any(line.startswith(f"| {job_id} (") for line in text.splitlines()):
+                return
             row = (f"| {job_id} ({rec['job']['label']}), {len(starts)} attempt(s) | {first} | {last} | {hours:.2f} "
                    f"| {(before or 0.0) + hours:.2f} | {status.state.upper()} rc={rc} |\n")
             if before is None:
                 data = GPU_LOG_HEADER + row
             else:
-                size = os.fstat(fd).st_size
-                data = ("" if os.pread(fd, 1, size - 1) == b"\n" else "\n") + row
+                sep = "" if text.endswith("\n") else "\n"
+                data = sep + (row if _table_open(text) else "\n" + GPU_LOG_HEADER + row)
             os.write(fd, data.encode("utf-8"))
             os.fsync(fd)
         finally:
@@ -855,8 +876,8 @@ class LocalBackend:
                 for t in docker_run_argv(spec, context=launch.DOCKER_CONTEXT)]
         rec = {"schema": JOB_SCHEMA, "schema_version": SCHEMA_VERSION, "job_id": job_id, "key": key, "stage": stage,
                "job": _record_doc(job), "rootless": cfg.rootless, "host_config_sha256": launch.host_config_sha256(cfg),
-               "script_sha256": file_sha256(Path(binding.script_host)),
-               "interpreter_sha256": (file_sha256(Path(binding.interpreter_host))
+               "script_sha256": _sha256_bound(binding.script_host, "job.argv"),
+               "interpreter_sha256": (_sha256_bound(binding.interpreter_host, "job.argv")
                                       if binding.interpreter_host is not None else None),
                "docker_argv": _record_argv(argv),
                "utc": self._utc()}
@@ -880,6 +901,17 @@ class LocalBackend:
                                     "never recorded", "submit the job again (the same job reattaches) and poll it")])
         if (key or job.key()) != rec["key"]:
             why = "the inputs changed since the job was recorded"
+            name = self._container(job_id, attempt)
+            st = self.runtime.inspect(name)
+            if st.status in ("running", "exited"):          # a start a crash cut off: stop it and record it first
+                self._append(job_id, "start", attempt=attempt, container=name, name=name,
+                             output=self._attempt_dir(rec, attempt))
+                if st.status == "running":
+                    self.runtime.stop(name)
+                    st = self.runtime.inspect(name)
+                rows = self._rows(job_id)
+                self._end(job_id, rec, _summarize(job_id, int(rec["job"]["max_attempts"]), rows), st, rows)
+                attempt += 1
             self._append(job_id, "refused", attempt=attempt, rule=RULE, reason=why)
             raise Refused([_problem("job", f"job {job_id}: {why}; it ends here, its attempt {attempt} is not started",
                                     "submit the job again: with the new inputs it is a new job")])
@@ -945,6 +977,11 @@ class LocalBackend:
             _refuse_links(self.project.root, rel)
             _write_atomic(self.project.root / rel, log[-LOG_CAP_BYTES:])
         seconds = _seconds(st.started_utc, st.finished_utc)
+        if st.status == "missing":
+            # No container times: the attempt counts from its `start` row up to now, at most its limit, so a lost GPU
+            # attempt is not free and its retries cannot overspend the budget (review round 1).
+            limit_s = view.limit[0] if view.limit else int(rec["job"]["time_limit_s"])
+            seconds = min(int(self._elapsed(_start_row(rows, attempt))), limit_s)
         self._append(job_id, "end", attempt=attempt, outcome=outcome, rc=st.exit_code, started_utc=st.started_utc,
                      finished_utc=st.finished_utc, seconds=seconds,
                      gpu_seconds=seconds if rec["job"]["gpu"] else 0)
@@ -956,9 +993,12 @@ class LocalBackend:
                  raise_budget: bool = False) -> JobStatus:
         """Under the job's lock: start a due attempt, or inspect the running one, stop it past its limit and record its
         end (then start a retry when one is due). A RuntimeFailure leaves the records as they were. A job that reaches
-        a terminal state here (from `was`, default its state on entry) gets its GPU log row."""
+        a terminal state here (from `was`, default its state on entry) gets its GPU log row; a job already terminal
+        gets it when the log has none (`_gpu_log(if_missing=True)`)."""
         view = self._view(job_id, rec)
         if (was or view.status.state) in TERMINAL:
+            if view.status.state in TERMINAL:
+                self._gpu_log(job_id, rec, view.status, if_missing=True)    # a row a crash cut off
             return view.status
         try:
             status = self._step(job_id, rec, view, key=key, raise_budget=raise_budget)
@@ -978,9 +1018,9 @@ class LocalBackend:
         if view.status.state == "running":
             name = self._container(job_id, view.status.attempt)
             st = self.runtime.inspect(name)
-            if st.status == "running" and self._past_limit(rec, view, st):
+            reason = self._due_stop(rec, view, st) if st.status == "running" else None
+            if reason is not None:
                 if view.stop_reason is None:
-                    reason = view.limit[1] if view.limit else "timed_out"
                     self._append(job_id, "stop", attempt=view.status.attempt, reason=reason)
                 self.runtime.stop(name)
                 view = self._view(job_id, rec)
@@ -998,15 +1038,42 @@ class LocalBackend:
             view = self._view(job_id, rec)
         return view.status
 
-    def _past_limit(self, rec: Mapping[str, Any], view: _View, st: ContainerState) -> bool:
-        """The running attempt reached its limit (or a stop was already recorded and is due again)."""
+    def _elapsed(self, start_row: Mapping[str, Any] | None) -> float:
+        """Seconds from a `start` row's time to now (0 without one)."""
+        if not (start_row and isinstance(start_row.get("utc"), str)):
+            return 0.0
+        started = datetime.strptime(start_row["utc"], TIME_FORMAT).replace(tzinfo=timezone.utc)
+        return max(0.0, (self.clock() - started).total_seconds())
+
+    def _budget_remaining_s(self) -> float:
+        """The project's GPU budget minus its recorded GPU seconds and the time every running GPU attempt has run so
+        far (from its `start` row): what all running GPU attempts together may still use (review round 1)."""
+        used = 0.0
+        for job_id in self._job_ids():
+            if not (self.project.root / JOBS_DIR / job_id / JOB_FILE).exists():
+                continue
+            rec = self._record(job_id)
+            rows = self._rows(job_id)
+            st = _summarize(job_id, int(rec["job"]["max_attempts"]), rows).status
+            used += st.gpu_seconds
+            if rec["job"].get("gpu") is True and st.state == "running":
+                used += self._elapsed(_start_row(rows, st.attempt))
+        return self._budget_hours() * 3600 - used
+
+    def _due_stop(self, rec: Mapping[str, Any], view: _View, st: ContainerState) -> str | None:
+        """The reason to stop the running attempt now, else None: a stop already recorded (due again), its own limit
+        (the time limit, or the budget left when it started), or for a GPU attempt the project's budget used up by
+        the recorded time and every running GPU attempt (checked at each poll: enforcement is per poll)."""
         if view.stop_reason is not None:
-            return True
-        if not st.started_utc:
-            return False
-        limit_s = view.limit[0] if view.limit else int(rec["job"]["time_limit_s"])
-        started = datetime.strptime(st.started_utc, TIME_FORMAT).replace(tzinfo=timezone.utc)
-        return (self.clock() - started).total_seconds() >= limit_s
+            return view.stop_reason
+        if st.started_utc:
+            limit_s, reason = view.limit or (int(rec["job"]["time_limit_s"]), "timed_out")
+            started = datetime.strptime(st.started_utc, TIME_FORMAT).replace(tzinfo=timezone.utc)
+            if (self.clock() - started).total_seconds() >= limit_s:
+                return reason
+        if rec["job"].get("gpu") is True and self._budget_remaining_s() <= 0:
+            return "budget_exhausted"
+        return None
 
     # -- public operations -------------------------------------------------------------------------------------------
 
