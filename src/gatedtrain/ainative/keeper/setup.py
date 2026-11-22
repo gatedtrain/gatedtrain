@@ -37,11 +37,12 @@ KEEP_FINGERPRINT = ("# keep the fingerprint the last command printed somewhere t
                     "another device); `gatedtrain verify <project> --fingerprint <fp>` checks a project against it")
 
 _USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _PINNED = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9._,-]+\])?==[A-Za-z0-9][A-Za-z0-9.+!_-]*")
 
 
-def _refuse(field: str, message: str, fix: str) -> Refused:
-    return Refused([Problem(RULE, field, message, fix)])
+def _refuse(field: str, message: str, fix: str, rule: str = RULE) -> Refused:
+    return Refused([Problem(rule, field, message, fix)])
 
 
 def installed_packs() -> list[str]:
@@ -62,20 +63,34 @@ def installed_packs() -> list[str]:
 _UNIT_UNSAFE = re.compile(r"[%$\s'\"\\]")
 
 
-def _absolute(field: str, value: str) -> PurePosixPath:
+def _absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or "\n" in value:
-        raise _refuse(field, "the path is not an absolute path without `..`", "pass an absolute path")
+        raise _refuse(field, "the path is not an absolute path without `..`", "pass an absolute path", rule)
     if _UNIT_UNSAFE.search(value):
         raise _refuse(field, "the path holds a character systemd rewrites or splits in a unit (`%`, `$`, whitespace, "
-                      "a quote or a backslash)", "pass a path of letters, digits, `/`, `.`, `_` and `-`")
+                      "a quote or a backslash)", "pass a path of letters, digits, `/`, `.`, `_` and `-`", rule)
     return path
 
 
-def _unit(user: str, state: PurePosixPath, socket: PurePosixPath, venv: PurePosixPath, owner_uid: int,
-          runtime_dir: str | None) -> str:
-    serve = " ".join(shlex.quote(str(x)) for x in (venv / "bin" / "gatedtrain", "keeper", "serve", "--state", state,
-                                                   "--socket", socket, "--owner-uid", owner_uid))
+def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath, owner_uid: int, *,
+               inference_image: str | None = None, eval_trees: list[str] | tuple[str, ...] = (),
+               docker_host: str | None = None) -> list[str]:
+    """The keeper's `serve` command as argv, the one source of the unit's `ExecStart=` (here) and of the inference
+    drop-in `gatedtrain setup host` prints (preflight finding 17). The caller has validated every value."""
+    argv = [str(venv / "bin" / "gatedtrain"), "keeper", "serve", "--state", str(state), "--socket", str(socket),
+            "--owner-uid", str(owner_uid)]
+    if inference_image is not None:
+        argv += ["--inference-image", inference_image]
+    for tree in eval_trees:
+        argv += ["--eval-tree", str(tree)]
+    if docker_host is not None:
+        argv += ["--docker-host", docker_host]
+    return argv
+
+
+def _unit(user: str, serve: list[str], runtime_dir: str | None) -> str:
+    serve = " ".join(shlex.quote(x) for x in serve)
     lines = ["[Unit]",
              "Description=gatedtrain keeper (sealed evaluation, AI-native step 2)",
              "",
@@ -96,11 +111,40 @@ def _unit(user: str, state: PurePosixPath, socket: PurePosixPath, venv: PurePosi
     return "\n".join(lines) + "\n"
 
 
+def _inference_options(inference_image: str | None, eval_trees: list[str] | None,
+                       docker_host: str | None) -> tuple[str | None, list[str], str | None]:
+    """The keeper's inference options (AN-25) checked for the unit's `ExecStart=`; Refused (AN-19) for an image that
+    is not an image ID, an eval tree that is not a plain absolute path, a Docker host systemd would rewrite or docker
+    would read as an option, or an option without `--inference-image`, as `keeper serve` refuses it."""
+    trees = list(eval_trees or [])
+    if inference_image is None:
+        for field, given in (("--eval-tree", trees), ("--docker-host", docker_host)):
+            if given:
+                raise _refuse(field, f"{field} needs --inference-image",
+                              "pass the inference image ID (sha256:<64 hex>) the keeper's daemon holds")
+        return None, [], None
+    if not _IMAGE_ID.fullmatch(inference_image):
+        raise _refuse("--inference-image", "the inference image is not an image ID sha256:<64 hex>",
+                      "pass the ID the keeper's daemon prints for the image (`docker image inspect -f '{{.Id}}'`)")
+    for tree in trees:
+        _absolute("--eval-tree", tree)
+        if any(c in tree for c in ":,"):
+            raise _refuse("--eval-tree", "the eval tree holds `:` or `,`, which a docker mount cannot carry",
+                          "pass a path of letters, digits, `/`, `.`, `_` and `-`")
+    if docker_host is not None and (not docker_host or docker_host.startswith("-")
+                                    or _UNIT_UNSAFE.search(docker_host)):
+        raise _refuse("--docker-host", "the Docker host is empty, starts with `-`, or holds a character systemd "
+                      "rewrites or splits in a unit", "pass unix:///run/user/<keeper uid>/docker.sock")
+    return inference_image, trees, docker_host
+
+
 def setup_commands(*, user: str = DEFAULT_USER, state: str = DEFAULT_STATE, socket: str = DEFAULT_SOCKET,
-                   venv: str = DEFAULT_VENV, owner_uid: int, packages: list[str] | None = None) -> dict:
+                   venv: str = DEFAULT_VENV, owner_uid: int, packages: list[str] | None = None,
+                   inference_image: str | None = None, eval_trees: list[str] | None = None,
+                   docker_host: str | None = None) -> dict:
     """`{commands: [str], unit: str}` for installing the keeper (AN-19). Refused (AN-19) on a user name, path or
     package spec that is not safe to print as a command: an unpinned package would let the keeper run whatever
-    version is current when the user runs the command."""
+    version is current when the user runs the command. The inference options (AN-25) go into `ExecStart=`."""
     if not _USER.fullmatch(user):
         raise _refuse("--user", "the user name is not a plain system user name ([a-z_][a-z0-9_-]*, at most 32 "
                       "characters)", f"pass a name such as {DEFAULT_USER}")
@@ -111,6 +155,7 @@ def setup_commands(*, user: str = DEFAULT_USER, state: str = DEFAULT_STATE, sock
     if len(str(socket_p).encode()) > protocol.MAX_SOCKET_PATH:
         raise _refuse("--socket", f"the socket path is longer than {protocol.MAX_SOCKET_PATH} bytes",
                       "use a shorter path, such as the default")
+    image, trees, host = _inference_options(inference_image, eval_trees, docker_host)
     pins = installed_packs() if packages is None else list(packages)
     for spec in pins:
         if not _PINNED.fullmatch(spec):
@@ -119,7 +164,8 @@ def setup_commands(*, user: str = DEFAULT_USER, state: str = DEFAULT_STATE, sock
     q = shlex.quote
     sock_dir = socket_p.parent
     runtime_dir = sock_dir.name if sock_dir.parent == PurePosixPath("/run") else None
-    unit = _unit(user, state_p, socket_p, venv_p, owner_uid, runtime_dir)
+    unit = _unit(user, serve_argv(venv_p, state_p, socket_p, owner_uid, inference_image=image, eval_trees=trees,
+                                  docker_host=host), runtime_dir)
     commands = [
         f"sudo useradd --system --user-group --home-dir {q(str(state_p))} --no-create-home "
         f"--shell /usr/sbin/nologin {q(user)}",
