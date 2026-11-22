@@ -52,6 +52,12 @@ PROJECT_JOB_ARGS = {
     "cancel": ["project", "job", "cancel", "root", "0001-train"],
 }
 
+# `setup` sub-subcommands (AN-19, AN-20): each parses with and without `--json`.
+SETUP_ARGS = {
+    "keeper": ["setup", "keeper"],
+    "host": ["setup", "host"],
+}
+
 
 def subcommand_names(parser) -> list[str]:
     for action in parser._actions:
@@ -76,6 +82,25 @@ class TestJson(unittest.TestCase):
             args = build_parser().parse_args(["--json", *argv])
             self.assertEqual((args.json, args.project_cmd, args.job_cmd), (True, "job", name))
             self.assertIs(build_parser().parse_args(argv).json, False, name)
+        for name, argv in SETUP_ARGS.items():
+            args = build_parser().parse_args(["--json", *argv])
+            self.assertEqual((args.json, args.setup_cmd), (True, name))
+            self.assertIs(build_parser().parse_args(argv).json, False, name)
+
+    def test_setup_host_envelope(self):                       # AN-20: the script is data, nothing runs
+        import os
+
+        proc = run_cli(["--json", "setup", "host", "--owner-uid", str(os.getuid())], cwd=self.tmp)
+        self.assertEqual(proc.returncode, EXIT_OK, describe(proc))
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout.count("\n"), 1, describe(proc))
+        doc = json.loads(proc.stdout)
+        self.assertEqual((doc["schema"], doc["command"], doc["ok"], doc["exit"], doc["problems"]),
+                         ("gatedtrain.cli_result", "setup host", True, 0, []))
+        self.assertEqual(set(doc["data"]), {"script", "command"})
+        self.assertTrue(doc["data"]["script"].startswith("#!/bin/bash\n"))
+        self.assertEqual(doc["data"]["command"], "sudo bash gatedtrain-host-setup.sh")
+        self.assertEqual(list(self.tmp.iterdir()), [])
 
     def test_refusal_is_one_json_line(self):
         proc = run_cli(["--json", "validate", "missing.yaml"], cwd=self.tmp)

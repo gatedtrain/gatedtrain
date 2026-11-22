@@ -717,7 +717,8 @@ def cmd_setup_keeper(args) -> int:
     owner = os.getuid() if args.owner_uid is None else args.owner_uid
     try:
         out = setup_commands(user=args.user, state=args.state, socket=args.socket, venv=args.venv, owner_uid=owner,
-                             packages=args.packages)
+                             packages=args.packages, inference_image=args.inference_image,
+                             eval_trees=args.eval_tree, docker_host=args.docker_host)
     except Refused as exc:
         return _krefuse(args, exc.problems)
     warnings = []
@@ -727,6 +728,43 @@ def cmd_setup_keeper(args) -> int:
     human = ("# run these once, as a user who may use sudo; gatedtrain runs none of them\n"
              + "".join(c + "\n" for c in out["commands"]))
     return _kfinish(args, out, human, warnings=warnings)
+
+
+def cmd_setup_host(args) -> int:
+    """AN-20: print the root script that sets up rootless Docker for the owner and the keeper; run and write
+    nothing. Plain mode prints the script only, so stdout is the file."""
+    import os
+    import pwd
+
+    from .ainative.hostsetup import RULE, host_script
+
+    try:
+        if args.owner is None:
+            owner, uid = pwd.getpwuid(os.getuid()).pw_name, os.getuid() if args.owner_uid is None else args.owner_uid
+        else:
+            owner, uid = args.owner, args.owner_uid
+            if uid is None:
+                try:
+                    uid = pwd.getpwnam(owner).pw_uid
+                except KeyError:
+                    raise Refused([Problem(RULE, "--owner-uid", f"there is no user {owner!r} on this host to take "
+                                           "the uid from", "pass --owner-uid")]) from None
+        requirements = None
+        if args.eval_requirements is not None:
+            try:
+                requirements = Path(args.eval_requirements).read_bytes()
+            except OSError as exc:
+                raise Refused([Problem(RULE, "--eval-requirements", f"the requirements file cannot be read "
+                                       f"({type(exc).__name__})", "pass a readable requirements file")]) from None
+        out = host_script(owner=owner, owner_uid=uid, keeper_user=args.keeper_user, keeper_home=args.keeper_home,
+                          keeper_data_root=args.keeper_data_root, owner_data_root=args.owner_data_root,
+                          handoff=args.handoff, state=args.state, socket=args.socket, venv=args.venv,
+                          inference_ref=args.inference_image, eval_requirements=requirements,
+                          eval_python=args.eval_python, eval_venv=args.eval_venv,
+                          confirm_group_removal=args.confirm_group_removal)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    return _kfinish(args, out, out["script"])
 
 
 def cmd_verify(args) -> int:
@@ -807,7 +845,44 @@ def _add_keeper(sub) -> None:
     c.add_argument("--owner-uid", type=int, metavar="UID", help="the user the keeper serves (default: yours)")
     c.add_argument("--packages", nargs="+", metavar="SPEC",
                    help="scenario packs as NAME==VERSION (default: the installed packs at their versions)")
+    c.add_argument("--inference-image", metavar="ID",
+                   help="the inference image ID (sha256:<64 hex>) printed into ExecStart= (AN-25)")
+    c.add_argument("--eval-tree", action="append", metavar="DIR",
+                   help="a root-owned eval tree printed into ExecStart= (repeatable; needs --inference-image)")
+    c.add_argument("--docker-host", metavar="URL",
+                   help="the keeper's rootless daemon printed into ExecStart= (needs --inference-image)")
     c.set_defaults(func=cmd_setup_keeper)
+
+    from .ainative import hostsetup
+
+    c = ss.add_parser("host", help="print the root script that sets up rootless Docker for you and the keeper "
+                                   "(AN-20); runs nothing")
+    c.add_argument("--owner", metavar="NAME", help="the user the keeper serves (default: you)")
+    c.add_argument("--owner-uid", type=int, metavar="UID", help="the owner's uid (default: the owner's uid here)")
+    c.add_argument("--keeper-user", default=setup.DEFAULT_USER, metavar="NAME", help="the keeper's system user")
+    c.add_argument("--keeper-home", default=hostsetup.DEFAULT_KEEPER_HOME, metavar="DIR")
+    c.add_argument("--keeper-data-root", default=hostsetup.DEFAULT_KEEPER_DATA_ROOT, metavar="DIR",
+                   help="the keeper's rootless Docker data root")
+    c.add_argument("--owner-data-root", default=hostsetup.DEFAULT_OWNER_DATA_ROOT, metavar="DIR",
+                   help="the owner's rootless Docker data root")
+    c.add_argument("--handoff", default=hostsetup.DEFAULT_HANDOFF, metavar="DIR",
+                   help="the hand-off directory (the owner's output_root)")
+    c.add_argument("--state", default=setup.DEFAULT_STATE, metavar="DIR", help="the keeper's state (as setup keeper)")
+    c.add_argument("--socket", default=setup.DEFAULT_SOCKET, metavar="PATH", help="the keeper's socket (as setup "
+                                                                                  "keeper)")
+    c.add_argument("--venv", default=setup.DEFAULT_VENV, metavar="DIR", help="the keeper's venv (as setup keeper)")
+    c.add_argument("--inference-image", metavar="REF@sha256:...",
+                   help="the inference base image, pinned by digest, the keeper's daemon pulls; its ID goes into a "
+                        "drop-in of the keeper's unit")
+    c.add_argument("--eval-requirements", metavar="FILE",
+                   help="hash-pinned requirements of the keeper's eval venv (needs --eval-python)")
+    c.add_argument("--eval-python", metavar="PATH",
+                   help=f"the interpreter the eval venv is created from, under {hostsetup.DEFAULT_EVAL_PYTHON_ROOT}")
+    c.add_argument("--eval-venv", default=hostsetup.DEFAULT_EVAL_VENV, metavar="DIR",
+                   help="the keeper's root-owned eval venv")
+    c.add_argument("--confirm-group-removal", action="store_true",
+                   help="pause before removing you from the docker group")
+    c.set_defaults(func=cmd_setup_host)
 
     p = sub.add_parser("verify", help="check a keeper project's signed records against the keeper or a fingerprint "
                                       "(AN-14)")
