@@ -1,9 +1,9 @@
 """Test fixture: the keeper as a subprocess of the test user (tests/README.md section 13).
 
 `KeeperProcess` makes a fresh temporary directory holding `state/` (mode 0700, or `state_mode`) and `keeper.sock`,
-starts `tests/fixtures/ainative/run_cli.py keeper serve --state ... --socket ... --owner-uid <os.getuid()>` (so the
-synthetic pack is injected as in step 1) and waits for `hello`. Leaving the context stops the process and removes the
-directory; a start that fails cleans up before it raises.
+starts `tests/fixtures/ainative/run_cli.py keeper serve --state ... --socket ... --owner-uid <os.getuid()>` followed by
+`args` (so the synthetic pack is injected as in step 1) and waits for `hello`. Leaving the context stops the process
+and removes the directory; a start that fails cleans up before it raises.
 
 The keeper's rootful-access detection (AN-21) reads a fake host tree, never the real host (the CI runner is in the
 `docker` group, preflight finding 19): unless `env` sets `GATEDTRAIN_TEST_HOST_VIEW`, `KeeperProcess` writes a clean
@@ -71,8 +71,9 @@ class KeeperStartError(AssertionError):
 
 class KeeperProcess:
     def __init__(self, *, owner_uid: int | None = None, env: dict[str, str] | None = None,
-                 state_mode: int = 0o700) -> None:
+                 state_mode: int = 0o700, args: list[str] | None = None) -> None:
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
+        self.args = list(args or [])
         self.state_mode = state_mode
         self.env = dict(env or {})
         self.tmp: Path | None = None
@@ -123,7 +124,7 @@ class KeeperProcess:
         self._close_log()
         self._log = open(self.log_path, "ab")
         cmd = [sys.executable, str(RUN_CLI), "keeper", "serve", "--state", str(self.state),
-               "--socket", str(self.socket), "--owner-uid", str(self.owner_uid)]
+               "--socket", str(self.socket), "--owner-uid", str(self.owner_uid), *self.args]
         env = {**cli_env(), **self.env}
         if not env.get(HOST_VIEW_ENV):           # never the real host's docker group (preflight finding 19)
             env[HOST_VIEW_ENV] = str(write_host_tree(self.tmp / "host", owner_uid=self.owner_uid))

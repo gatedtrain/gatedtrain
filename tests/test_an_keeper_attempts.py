@@ -303,7 +303,7 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
         self.assertEqual((report["schema"], report["schema_version"]), ("gatedtrain.ainative.report", 2))
         self.assertEqual(set(report), {"schema", "schema_version", "status", "metric", "n_sealed", "registration",
                                        "power", "gate_result", "display", "ledger", "attempts", "sealed_guarantee",
-                                       "known_limits", "alpha_rule", "keeper"})
+                                       "known_limits", "alpha_rule", "keeper", "compute"})
         self.assertEqual(report["status"], "PASS")               # the PASS attempt is the headline
         gate = report["gate_result"]
         self.assertEqual((gate["attempt_id"], gate["alpha"], gate["status"]), (a2["attempt_id"], a2["alpha"], "PASS"))

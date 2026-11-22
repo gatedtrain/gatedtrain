@@ -183,11 +183,17 @@ limits.
 
 **Guarantee.** With the keeper under its own user, the report's `sealed_guarantee` reads: "the sealed items,
 registrations, claims, ledger and per-item records are held by a separate OS user running code the user's account
-cannot change, and every record is signed; the candidate runs inside the keeper process, not in a container (a model
-format that executes code is refused); the original data file and the metric confirmation are only as strong as the
-user's own account; a root user or the keeper's own account can break all of it." A keeper running as the owner's own
-user (as in the tests) says so instead: "the keeper runs as the owner's own OS user, so anything running as the user
-can read its state and signing key: the records are signed, but nothing is sealed (a test or development setup)".
+cannot change, and every record is signed; the keeper found no rootful Docker or containerd access by the user's
+account, nor the account in the docker, lxd, incus-admin or disk group, when this was stated or at any earlier check
+on this sealed set (sudo is not checked); a scenario pack's per-item generator runs the candidate inside the keeper
+process, and a batch generator runs it in a container of the keeper's own rootless Docker with no network, a read-only
+root file system and the predictions as its only output; either way the candidate is a copy of the model files the
+keeper hashed, and a model format that executes code is refused; an escape from that container through a bug in the
+inference code or the kernel gives the keeper's account; the original data file and the metric confirmation are only
+as strong as the user's own account; a root user, also one reached through sudo, or the keeper's own account can break
+all of it." A keeper running as the owner's own user (as in the tests) says so instead: "the keeper runs as the owner's
+own OS user, so anything running as the user can read its state and signing key: the records are signed, but nothing
+is sealed (a test or development setup)".
 
 **`verify`.** `verify ./proj --keeper SOCKET` checks every signed record in the project (the registration, each
 receipt in `trust/keeper/records.jsonl`, the gate result, `report.json` and `report.md`) against the key the keeper

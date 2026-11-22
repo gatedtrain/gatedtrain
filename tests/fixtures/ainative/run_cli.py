@@ -24,6 +24,14 @@ passed here), so no Docker daemon is touched.
 Test-only host view switch (AN-21, tests/test_an_rootful.py, tests/_keeper.py): `GATEDTRAIN_TEST_HOST_VIEW=<dir>` makes
 `keeper serve` run its rootful-access detection on the fake tree `<dir>` (`HostView(root=<dir>, root_uid=<this uid>)`)
 instead of the real host. Only this wrapper reads the variable; production code has no such switch.
+
+Test-only keeper runtime switch (AN-25, tests/test_an_keeper_inference.py):
+`GATEDTRAIN_TEST_KEEPER_RUNTIME=fake:<image id>[:<state dir>]` makes `keeper serve` started with an inference image
+run its containers on `FakeRuntime` instead of Docker: the fake daemon holds `<image id>` under the configured image
+reference (so a different `--inference-image` is refused at start), its socket is the `unix://` path of
+`--docker-host` (owned by this uid), containers of that image run `subprocess_handler` (the pack's script on the
+host), and with `<state dir>` the containers and the run log live there for the test to read. Only this wrapper reads
+the variable.
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ class _ScenarioEP:
 TEST_GENERATOR_ENV = "GATEDTRAIN_TEST_GENERATOR"
 TEST_BACKEND_RUNTIME_ENV = "GATEDTRAIN_TEST_BACKEND_RUNTIME"
 TEST_HOST_VIEW_ENV = "GATEDTRAIN_TEST_HOST_VIEW"
+TEST_KEEPER_RUNTIME_ENV = "GATEDTRAIN_TEST_KEEPER_RUNTIME"
 
 
 class _EveryImage(dict):
@@ -93,6 +102,31 @@ def _fake_host_view(root: str) -> None:
 
     def serve(*args, **kwargs):
         return real(*args, **{**kwargs, "host_view": view})
+
+    server.serve = serve
+
+
+def _fake_keeper_runtime(mode: str) -> None:
+    import re
+
+    from gatedtrain.ainative.keeper import server
+    from gatedtrain.testing.fake_runtime import FakeRuntime, subprocess_handler
+
+    m = re.fullmatch(r"fake:(sha256:[0-9a-f]{64})(?::(.+))?", mode)
+    if m is None:
+        raise SystemExit(f"{TEST_KEEPER_RUNTIME_ENV}: expected fake:<image id>[:<state dir>], got {mode!r}")
+    image, state_dir = m.group(1), m.group(2)
+    real = server.serve
+
+    def serve(*args, **kwargs):
+        inference = kwargs.get("inference")
+        if inference is not None:
+            host = inference.docker_host
+            sock = os.path.realpath(host[len("unix://"):]) if host.startswith("unix://") else None
+            ref = inference.image_ref or inference.image_id
+            kwargs["runtime"] = FakeRuntime({image: subprocess_handler}, image_ids={ref: image, image: image},
+                                            state_dir=Path(state_dir) if state_dir else None, socket=sock)
+        return real(*args, **kwargs)
 
     server.serve = serve
 
@@ -152,6 +186,8 @@ def main(argv: list[str]) -> int:
         _fake_backend_runtime(os.environ[TEST_BACKEND_RUNTIME_ENV])
     if os.environ.get(TEST_HOST_VIEW_ENV):
         _fake_host_view(os.environ[TEST_HOST_VIEW_ENV])
+    if os.environ.get(TEST_KEEPER_RUNTIME_ENV):
+        _fake_keeper_runtime(os.environ[TEST_KEEPER_RUNTIME_ENV])
     eps = [_StageEP(c) for c in (pack.ProfileData, pack.ChooseTaskAndBase, pack.BuildTrainSet, pack.WriteRecipe,
                                  pack.Smoke, pack.Train)]
     stage_mod._plugin_entry_points = lambda: list(eps)

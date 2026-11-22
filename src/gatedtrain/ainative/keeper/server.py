@@ -13,8 +13,9 @@ environment record once.
 `OPS` maps an op name to its handler `(keeper, project, args, peer_uid) -> result`: `hello`, and the state ops
 `open_project`, `intake` (optional `accept_inconclusive`), `sealed_summary`, `confirm_metric`, `register`,
 `registration`, `latest_registration`, `records`, `has_record`, and the attempt ops `alpha`, `evaluate`
-(`registration_hash`, `baseline`, `candidate`), `gate` (`attempt_id`) and `report`, each taking exactly the args it
-names. A refusal after a spend (`RefusedAfterSpend`) carries the spend's signed envelopes in `result`.
+(`registration_hash`, `baseline`, `candidate`), `gate` (`attempt_id`) and `report` (optional `compute`, AN-10), each
+taking exactly the args it names. A refusal after a spend (`RefusedAfterSpend`) carries the spend's signed envelopes
+in `result`.
 
 `hello` also states the rootful-access detection (AN-21, `rootful.owner_root_docker` on `Keeper.host_view`, run per
 call): `owner_has_root_docker` and `root_docker_reasons`, and the guarantee that follows. For a project (the request
@@ -47,6 +48,8 @@ from ...errors import Problem, Refused
 from .. import signing
 from . import envcheck, protocol, rootful, texts
 from .protocol import RefusedAfterSpend
+from ..runtime import DockerCLIRuntime, Runtime
+from .inference import InferenceConfig, KeeperInference
 from .state import KEY_FILE, KeeperState  # noqa: F401  (KEY_FILE: the key's name in the state directory)
 
 _ACCEPT_POLL_S = 0.2             # how often the idle loop checks for a stop request
@@ -163,7 +166,7 @@ OPS: dict[str, Callable[[Keeper, str | None, dict, int], object]] = {
                                                                a["candidate"]),
                           ("registration_hash", "baseline", "candidate")),
     "gate": _state_op(lambda st, pr, a, peer: st.gate(pr, a["attempt_id"]), ("attempt_id",)),
-    "report": _state_op(lambda st, pr, a, peer: st.report(pr)),
+    "report": _state_op(lambda st, pr, a, peer: st.report(pr, a.get("compute")), (), ("compute",)),
 }
 
 
@@ -286,22 +289,41 @@ def check_start(state_dir: Path, keeper_uid: int, socket_dir: Path | None = None
 
 
 def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading.Event | None = None,
-          host_view: rootful.HostView | None = None) -> int:
+          host_view: rootful.HostView | None = None, inference: InferenceConfig | None = None,
+          runtime: Runtime | None = None) -> int:
     """Serve until SIGTERM (or until `stop` is set, for an in-process server); 0 on a clean stop. A start that cannot
     proceed raises Refused (AN-12; AN-13 for the environment and the state directory). `host_view` is the tree the
-    rootful-access detection reads (AN-21; the real host by default, a fake tree in tests)."""
+    rootful-access detection reads (AN-21; the real host by default, a fake tree in tests).
+
+    With `inference` (AN-25) the keeper runs batch generators in its inference container on `runtime` (default: the
+    Docker CLI at `inference.docker` on `inference.docker_host`): once it holds its state lock it refuses to start on
+    any `KeeperInference.start_problems`, removes leftover run directories and containers, and adds
+    `KeeperInference.environment()` to its environment record as `inference`. Without it a batch generator is
+    refused before the grant (AN-8)."""
     if sys.platform != "linux":
         raise protocol.refused("platform", "the keeper runs on Linux only (Unix socket, SO_PEERCRED)",
                                "run the keeper on a Linux host")
     socket_path = Path(socket_path)
     check_start(state_dir, os.geteuid(), Path(os.path.abspath(socket_path)).parent)
     view = rootful.HostView() if host_view is None else host_view
+    runner = None
+    if inference is not None:
+        if runtime is None:
+            runtime = DockerCLIRuntime(host=inference.docker_host, docker=str(inference.docker))
+        runner = KeeperInference(inference, runtime, Path(os.path.abspath(state_dir)))
     state = KeeperState(state_dir, owner_uid=owner_uid,       # refuses a second keeper on this state (AN-12)
-                        root_docker=lambda: rootful.owner_root_docker(owner_uid, view))
+                        root_docker=lambda: rootful.owner_root_docker(owner_uid, view), inference=runner)
     try:
+        record = envcheck.environment_record()
+        if runner is not None:
+            problems = runner.start_problems()
+            if problems:
+                raise Refused(_capped(problems))
+            runner.remove_leftovers()
+            record["inference"] = runner.environment()
         _prepare_socket_path(socket_path)
         stop = stop if stop is not None else threading.Event()
-        environment = signing.sign(state.key, "environment", envcheck.environment_record())
+        environment = signing.sign(state.key, "environment", record)
         state.environment_sha256 = envcheck.environment_sha256(environment["record"])
         keeper = Keeper(state_dir, owner_uid, key=state.key, environment=environment, state=state, host_view=view)
         return _serve_loop(keeper, socket_path, stop)

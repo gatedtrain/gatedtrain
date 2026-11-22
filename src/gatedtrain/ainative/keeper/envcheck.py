@@ -178,6 +178,79 @@ def path_problems(paths: Iterable[Path], keeper_uid: int) -> list[Problem]:
     return problems
 
 
+def _within(path: str, roots: list[str]) -> bool:
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def _tree_nodes(tree: Path, problems: list[Problem]) -> list[Path]:
+    """Every directory, file and link under `tree` (links not followed), in walk order; a directory the keeper cannot
+    list is a problem."""
+    def unreadable(exc: OSError) -> None:
+        problems.append(_problem("eval_tree", f"cannot list {exc.filename} in an eval tree",
+                                 "make the eval tree readable by the keeper user"))
+    nodes = [tree]
+    for dirpath, dirnames, filenames in os.walk(tree, onerror=unreadable, followlinks=False):
+        dirnames.sort()
+        for name in sorted(dirnames) + sorted(filenames):
+            nodes.append(Path(dirpath) / name)
+    return nodes
+
+
+def eval_tree_problems(trees: Iterable[Path], keeper_uid: int) -> list[Problem]:
+    """AN-13, AN-25 (revision 25): the keeper's eval trees (mounted read-only into its inference container) hold code
+    the user's account must not change. Each tree must be an existing directory (not a link); every node in it, and
+    every ancestor, passes `path_problems` (owner root or the keeper, no write by another uid, ACL-aware, links
+    followed hop by hop); and every link resolves inside the union of the configured trees (a venv's `bin/python`
+    may point at the interpreter tree, nothing may point elsewhere)."""
+    trees = [Path(os.path.abspath(t)) for t in trees]
+    roots = [os.path.realpath(t) for t in trees]
+    problems: list[Problem] = []
+    nodes: list[Path] = []
+    for tree in trees:
+        try:
+            st = os.lstat(tree)
+        except OSError:
+            problems.append(_problem("eval_tree", f"the eval tree {tree} does not exist",
+                                     "create it with `gatedtrain setup host`, or pass an existing --eval-tree"))
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            problems.append(_problem("eval_tree", f"the eval tree {tree} is not a directory",
+                                     "pass the tree's real directory, not a link or a file"))
+            continue
+        nodes += _tree_nodes(tree, problems)
+    problems += path_problems(nodes, keeper_uid)
+    for p in nodes:
+        if not os.path.islink(p):
+            continue
+        real = os.path.realpath(p)
+        if not os.path.exists(real) or not _within(real, roots):
+            problems.append(_problem("eval_tree", f"the link {p} resolves outside the eval trees",
+                                     "make the eval tree self-contained: links may point only inside the configured "
+                                     "eval trees"))
+    return problems
+
+
+def eval_tree_record(tree: Path) -> dict:
+    """`{"path", "files_sha256"}` of an eval tree for the environment record: `files_sha256` is the sha256 of the
+    canonical JSON of the sorted `[name, sha256]` pairs of its regular files and `[name, "link:" + target]` of its
+    links, named relative to the tree."""
+    tree = Path(os.path.abspath(tree))
+    pairs = []
+    for p in _tree_nodes(tree, []):
+        name = p.relative_to(tree).as_posix()
+        try:
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                pairs.append([name, "link:" + os.readlink(p)])
+            elif stat.S_ISREG(st.st_mode):
+                pairs.append([name, _file_sha256(p)])
+        except OSError:
+            raise Refused([_problem("eval_tree", f"cannot read {p} to record the environment",
+                                    "make the eval tree readable by the keeper user")]) from None
+    pairs.sort()
+    return {"path": str(tree), "files_sha256": sha256_bytes(canonical_json(pairs))}
+
+
 def state_dir_problems(state_dir: Path, keeper_uid: int) -> list[Problem]:
     """The state directory must exist, be a directory and not a link, be owned by the keeper, and have mode 0700."""
     fix = f"create it as the keeper user: mkdir -m 0700 {state_dir}"

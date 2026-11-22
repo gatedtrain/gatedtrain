@@ -28,6 +28,8 @@ Layout under the state directory (every file mode 0600, every directory 0700, ne
 - `models/<attempt hex>/<arm>/`: the keeper's copy of an arm's model files (AN-13), made before the grant under a fresh
   random hex per `evaluate` call; the generator runs only the copy. Removed once the arm is scored, on every other
   exit of `evaluate`, and (any leftover) when the keeper starts.
+- `run/<hex>/`: one inference container's items, sampler and output directory (`inference.KeeperInference`), removed
+  with the container on every path and (any leftover) when the keeper starts.
 
 Files are written by temp file plus rename, except `records.jsonl`, which is append-only: one `O_APPEND | O_NOFOLLOW`
 write per line, as step 1's ledger (a torn last line from a crash is dropped at the next start, before any append).
@@ -48,6 +50,15 @@ the set. An attempt still open at a restart is gated normally when its per-item 
 as not passed (MISSING); either happens on the next `evaluate`, `gate` or `report` on the set (preflight finding 8).
 At start, envelopes an attempt file or report holds but `records.jsonl` lacks (a crash between the two writes) are
 appended again.
+
+Batch generators (AN-25, AN-8, revision 25): when the registered generator is a scenario pack's batch generator,
+each arm runs in the keeper's inference container (`inference`, a `KeeperInference`) on the keeper's copy of its
+model files. Before the grant, a keeper without an inference container or an arm that lists no model files is
+refused (AN-8), and `inference.ready` runs after the copies, last before the grant (image, daemon, script, time
+bound, GPU wait). A container that fails after the grant is a crash (AN-9): the attempt settles as not passed. Each
+container run is noted in the attempt as `inference` (arm, image ID, seconds, GPU seconds, exit code), crashed ones
+too, and signed in its gate record; `report` sums the project's runs into `compute.keeper` and states the driver's
+optional `compute` totals as `compute.backend`, marked as the driver's (AN-10).
 
 Rootful-access detection (AN-21, preflight finding 2): `root_docker` is called at intake, sealed summary, evaluate,
 gate and report on a set (and `hello` passes its own result); a positive result is a fact about the host, so it is
@@ -80,10 +91,12 @@ from ... import gates
 from ...errors import Problem, Refused
 from ...registration import check_contents, resolved_evaluator_hash
 from .. import alpha_investing as ai, scorers, sealed_eval, signing
+from ..batch import BatchGenerator, BatchRunner
 from ..alpha_investing import PLANNING_ALPHA
 from ..project import _utc_now, _write_atomic
 from ..trust_stages import (MAX_DATA_BYTES, MAX_MARGIN, SCHEMA_POWER, SCHEMA_REPORT, SCHEMA_SEALED_SUMMARY,
-                            registered_base, registered_generator, scenario_generators, scenario_pack_of)
+                            registered_base, registered_generator, scenario_batch_generators, scenario_generators,
+                            scenario_pack_of)
 from . import envcheck, texts
 from .protocol import RefusedAfterSpend
 
@@ -134,11 +147,12 @@ def _damaged(rel: str) -> Refused:
 
 class KeeperState:
     def __init__(self, state_dir: Path, *, owner_uid: int | None = None,
-                 root_docker: Callable[[], list[str]] | None = None) -> None:
+                 root_docker: Callable[[], list[str]] | None = None, inference: BatchRunner | None = None) -> None:
         self.dir = Path(state_dir)
         self.keeper_uid = os.geteuid()
         self.owner_uid = self.keeper_uid if owner_uid is None else owner_uid
         self.root_docker = root_docker
+        self.inference = inference          # the inference container (AN-25); None: a batch generator is refused
         self._mutex = threading.RLock()
         self.environment_sha256: str | None = None     # set by `serve` once it signed the environment record
         self._lock_fd: int | None = self._take_lock()
@@ -925,7 +939,8 @@ class KeeperState:
                                "send the trained candidate's record")
             served = registered_generator(full)
             fn = scenario_generators().get(served[1]) if served else None
-            if fn is None or scenario_pack_of(served[1]) != served[0]:
+            gen = scenario_batch_generators().get(served[1]) if served else None      # AN-25: a batch generator
+            if (fn is None and gen is None) or scenario_pack_of(served[1]) != served[0]:
                 raise _problem("AN-8", "registration.base_model.generator", "the keeper does not serve the registered "
                                "scenario pack and generator", "install the registered scenario pack in the keeper")
             for arm, rec in (("baseline", base_rec), ("candidate", cand_rec)):
@@ -938,6 +953,8 @@ class KeeperState:
             if found is None or ev.get("manifest_hash") != resolved_evaluator_hash(ev):
                 raise _problem("AN-8", "registration.evaluators[0]", "the registered evaluator is not the scorer the "
                                "keeper runs", "register again with the scorer the keeper serves")
+            if gen is not None:
+                self._check_batch(base_rec, cand_rec)
             copies = self.dir / MODELS_DIR / secrets.token_hex(16)      # this attempt's copies (AN-13)
             try:
                 (self.dir / MODELS_DIR).mkdir(mode=0o700, exist_ok=True)
@@ -949,10 +966,12 @@ class KeeperState:
                     raise _problem("AN-15", "alpha", f"the next bid {ai.bid(wealth):.6g} is below the smallest "
                                    f"allowed {ai.MIN_BID}: the alpha-investing wealth of this sealed set is spent",
                                    NEW_DATA_FIX)
+                if gen is not None:
+                    self.inference.ready(gen)      # image, daemon, script, time bound, GPU wait: last before the grant
                 att = self._grant(project_id, sealed_id, registration_hash, base_sha, cand_sha, wealth,
                                   len(atts) + 1, full, ev)
                 try:
-                    self._score(att, full, found, fn, runs["baseline"], runs["candidate"], ev, copies)
+                    self._score(att, full, found, fn, runs["baseline"], runs["candidate"], ev, copies, batch=gen)
                 except Exception as exc:                    # after the grant: the attempt settles, not passed
                     problems = exc.problems if isinstance(exc, Refused) else [Problem(
                         "AN-8", "evaluate", f"the sealed evaluation failed after alpha was granted "
@@ -965,6 +984,20 @@ class KeeperState:
                 return self._claim_response(att)
             finally:
                 self._discard_copies(copies)
+
+    def _check_batch(self, base_rec: dict, cand_rec: dict) -> None:
+        """AN-8 (revision 25), before the grant: a batch generator runs only in the keeper's inference container, on
+        the copy of the model files each arm lists."""
+        if self.inference is None or not hasattr(self.inference, "ready"):
+            raise _problem("AN-8", "registration.base_model.generator", "this keeper runs no inference container",
+                           "start the keeper with an inference image (--inference-image; `gatedtrain setup host` "
+                           "prints the command), or register a per-item generator")
+        for arm, rec in (("baseline", base_rec), ("candidate", cand_rec)):
+            files = rec.get("files")
+            if not (isinstance(files, list) and files):
+                raise _problem("AN-8", f"{arm}.record.files", "a batch generator's model reference must list its "
+                               "model files (the keeper mounts its copy of them)",
+                               "list each model file with its sha256 under `files`")
 
     def _baseline_key(self, base_sha: str, full: dict, ev: dict) -> str:
         return sha256_bytes(canonical_json({"baseline_model_sha256": base_sha, "sampler": full.get("sampler"),
@@ -993,24 +1026,40 @@ class KeeperState:
         return att
 
     def _score(self, att: dict, full: dict, found: tuple[scorers.ScorerSpec, dict], fn: Any, base_rec: dict,
-               cand_rec: dict, ev: dict, copies: Path) -> None:
+               cand_rec: dict, ev: dict, copies: Path, *, batch: BatchGenerator | None = None) -> None:
         """Score both arms on the records that name the keeper's copies; each arm's copy is removed (best effort)
-        once it is scored."""
+        once it is scored. With `batch`, each arm runs in the keeper's inference container, and each container run
+        is noted in the attempt (`inference`, signed in its gate record)."""
         spec, params = found
         score = scorers.bind(spec, params)
         items = self._items(att["sealed_id"])
-        generate = _canonical_output(fn)
+        generate = _canonical_output(fn) if fn is not None else None
         set_rel = self._set_rel(att["sealed_id"])
         base_rel = f"{set_rel}/baseline/{_hex(att['baseline_key'])}.json"
         if self._read_arm(base_rel) is None:                  # scored once per set and key
-            records = sealed_eval.score_arm(items, generate, base_rec, full, score, score_range=spec.score_range,
-                                            scorer_name=spec.name)
+            records = self._score_arm(att, "baseline", items, generate, base_rec, full, score, spec, batch)
             self._write_arm(base_rel, att["baseline_model_sha256"], records)
         self._discard_copies(copies / "baseline")
-        records = sealed_eval.score_arm(items, generate, cand_rec, full, score, score_range=spec.score_range,
-                                        scorer_name=spec.name)
+        records = self._score_arm(att, "candidate", items, generate, cand_rec, full, score, spec, batch)
         self._discard_copies(copies / "candidate")
         self._write_arm(f"{set_rel}/records/{att['j']:06d}.json", att["candidate_model_sha256"], records)
+
+    def _score_arm(self, att: dict, arm: str, items: list[dict], generate: Any, rec: dict, full: dict, score: Any,
+                   spec: scorers.ScorerSpec, batch: BatchGenerator | None) -> list:
+        if batch is None:
+            return sealed_eval.score_arm(items, generate, rec, full, score, score_range=spec.score_range,
+                                         scorer_name=spec.name)
+        self.inference.last_run = None
+        try:
+            records = sealed_eval.score_arm(items, None, rec, full, score, score_range=spec.score_range,
+                                            scorer_name=spec.name, batch=batch, runner=self.inference)
+        finally:                       # a crashed container counts too: the settle signs what ran
+            run = self.inference.last_run
+            if run is not None:
+                att.setdefault("inference", []).append({**run, "arm": arm})      # the state sets the arm
+                self.inference.last_run = None
+        self._write_json(self._attempt_rel(att["sealed_id"], att["j"]), att)   # before the arm's records
+        return records
 
     # ---- attempts: gate and settle ----------------------------------------------------------------------------------
 
@@ -1062,7 +1111,8 @@ class KeeperState:
         utc = _utc_now()
         gate_record = signing.sign(self.key, "gate_record", {
             **ident, "registration_hash": att["registration_hash"],
-            "candidate_model_sha256": att["candidate_model_sha256"], "result": gate_result, "utc": utc})
+            "candidate_model_sha256": att["candidate_model_sha256"], "result": gate_result,
+            "inference": list(att.get("inference") or []), "utc": utc})
         summary = signing.sign(self.key, "gate_summary", {
             **ident, "registration_hash": att["registration_hash"], "status": status, "alpha": alpha,
             "alpha_spent": row["cost"], "alpha_earned": row["earned"], "wealth_after": row["wealth_after"],
@@ -1091,11 +1141,13 @@ class KeeperState:
 
     # ---- report (AN-10, AN-16) --------------------------------------------------------------------------------------
 
-    def report(self, project_id: str) -> dict:
+    def report(self, project_id: str, compute: dict | None = None) -> dict:
         """Settle the set's open attempt, build and sign `report.json` (`schema_version` 2) from keeper records, close
-        the sealed set (AN-16). A second call returns the stored envelope."""
+        the sealed set (AN-16). A second call returns the stored envelope. `compute` (optional, AN-10): the driver's
+        backend totals `{jobs, seconds, gpu_seconds}`, stated in the report as the driver's."""
         with self._mutex:
             doc, rec = self._taken_in(project_id)
+            backend = _backend_compute(compute)
             sealed_id = doc["sealed_id"]
             self._check_set(sealed_id)
             rel = f"{self._project_rel(project_id)}/report.json"
@@ -1111,7 +1163,7 @@ class KeeperState:
             if not mine:
                 raise _problem("AN-10", "project", "the project has no settled sealed attempt to report",
                                "evaluate a candidate and gate it first")
-            report = self._build_report(project_id, rec, atts, mine)
+            report = self._build_report(project_id, rec, atts, mine, backend)
             env = signing.sign(self.key, "report", report)
             self._close_set(sealed_id)              # before the report is stored: never a stored report on an open set
             self._write_json(rel, {"schema": SCHEMA_STORED_REPORT, "schema_version": STATE_SCHEMA_VERSION,
@@ -1119,7 +1171,8 @@ class KeeperState:
             self._append_record(project_id, env)
             return {"report": env}
 
-    def _build_report(self, project_id: str, rec: dict, atts: list[dict], mine: list[dict]) -> dict:
+    def _build_report(self, project_id: str, rec: dict, atts: list[dict], mine: list[dict],
+                      backend: dict | None = None) -> dict:
         passed = [a for a in mine if a["summary"]["record"]["status"] == gates.PASS]
         head = passed[0] if passed else mine[-1]
         stored = self._stored_registration(project_id, head["registration_hash"])
@@ -1161,7 +1214,32 @@ class KeeperState:
                 "alpha_rule": {"rule": ai.RULE, "initial_wealth": ai.INITIAL_WEALTH, "payout": ai.PAYOUT,
                                "min_bid": ai.MIN_BID, "planning_alpha": PLANNING_ALPHA, "guarantee": ai.GUARANTEE},
                 "keeper": {"fingerprint": signing.fingerprint(self.key),
-                           "environment_sha256": self.environment_sha256}}
+                           "environment_sha256": self.environment_sha256},
+                "compute": {"keeper": _keeper_compute(mine), "backend": backend}}
+
+
+MAX_COMPUTE = 2 ** 53 - 1
+COMPUTE_KEYS = frozenset({"jobs", "seconds", "gpu_seconds"})
+
+
+def _backend_compute(compute: Any) -> dict | None:
+    """AN-10: the driver's backend totals as the report states them (marked as the driver's), None when not sent."""
+    if compute is None:
+        return None
+    if not (isinstance(compute, dict) and set(compute) == COMPUTE_KEYS and all(
+            isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_COMPUTE for v in compute.values())):
+        raise _problem("AN-10", "compute", "compute is not {jobs, seconds, gpu_seconds}, each a whole number >= 0",
+                       "send the backend's job totals, or leave compute out")
+    return {"jobs": compute["jobs"], "seconds": compute["seconds"], "gpu_seconds": compute["gpu_seconds"],
+            "source": texts.COMPUTE_BACKEND_SOURCE}
+
+
+def _keeper_compute(mine: list[dict]) -> dict:
+    """AN-10: the containers, seconds and GPU seconds of the project's sealed evaluations, from the signed gate
+    records (settled attempts only, which `report` ensures)."""
+    rows = [r for a in mine for r in (a["gate_record"]["record"].get("inference") or [])]
+    return {"containers": len(rows), "seconds": sum(int(r.get("seconds") or 0) for r in rows),
+            "gpu_seconds": sum(int(r.get("gpu_seconds") or 0) for r in rows)}
 
 
 def _canonical_output(fn: Any) -> Any:

@@ -74,12 +74,20 @@ def problem(cm) -> object:
 
 class TextsTest(unittest.TestCase):
     def test_keeper_guarantee_is_the_spec_sentence(self):
-        self.assertEqual(texts.KEEPER_GUARANTEE,
+        self.assertEqual(texts.KEEPER_GUARANTEE,          # design 05 §18.9, revision 25 (pre-flight finding 5)
                          "the sealed items, registrations, claims, ledger and per-item records are held by a separate "
                          "OS user running code the user's account cannot change, and every record is signed; the "
-                         "candidate runs inside the keeper process, not in a container (a model format that executes "
-                         "code is refused); the original data file and the metric confirmation are only as strong as "
-                         "the user's own account; a root user or the keeper's own account can break all of it.")
+                         "keeper found no rootful Docker or containerd access by the user's account, nor the account "
+                         "in the docker, lxd, incus-admin or disk group, when this was stated or at any earlier check "
+                         "on this sealed set (sudo is not checked); a scenario pack's per-item generator runs the "
+                         "candidate inside the keeper process, and a batch generator runs it in a container of the "
+                         "keeper's own rootless Docker with no network, a read-only root file system and the "
+                         "predictions as its only output; either way the candidate is a copy of the model files the "
+                         "keeper hashed, and a model format that executes code is refused; an escape from that "
+                         "container through a bug in the inference code or the kernel gives the keeper's account; the "
+                         "original data file and the metric confirmation are only as strong as the user's own "
+                         "account; a root user, also one reached through sudo, or the keeper's own account can break "
+                         "all of it.")
 
     def test_separate_user_text(self):                  # preflight finding 24: the separate-user text is pinned in CI
         self.assertEqual(texts.sealed_guarantee(1001, 1000), texts.KEEPER_GUARANTEE)

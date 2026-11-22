@@ -1100,7 +1100,8 @@ def _render_head(report: dict) -> list[str]:
 
 def _render_keeper(report: dict) -> list[str]:
     """Report `schema_version` 2 (built and signed by the keeper): every attempt with its alpha, the set's ledger, the
-    alpha rule and its guarantee, and the keeper's key fingerprint."""
+    alpha rule and its guarantee, the keeper's key fingerprint, and (revision 25) the compute block: the keeper's
+    inference containers, and the backend's jobs when the driver sent them."""
     rule = report["alpha_rule"]
     ledger = {row["attempt_id"]: row for row in report["ledger"]}
     lines = ["", "## Sealed attempts of this project"]
@@ -1122,6 +1123,15 @@ def _render_keeper(report: dict) -> list[str]:
               "## Keeper",
               f"- key fingerprint: {report['keeper']['fingerprint']}",
               f"- environment: {report['keeper']['environment_sha256']}"]
+    compute = report.get("compute")
+    if isinstance(compute, dict):                     # AN-10 (revision 25): the keeper's and the driver's compute
+        k = compute["keeper"]
+        lines += ["", "## Compute",
+                  f"- keeper: {k['containers']} inference containers, {k['seconds']} s, {k['gpu_seconds']} GPU s "
+                  "(the keeper's signed records)"]
+        b = compute.get("backend")
+        if b is not None:
+            lines.append(f"- backend: {b['jobs']} jobs, {b['seconds']} s, {b['gpu_seconds']} GPU s ({b['source']})")
     return lines
 
 

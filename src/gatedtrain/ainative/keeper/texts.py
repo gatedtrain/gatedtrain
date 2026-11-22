@@ -15,7 +15,20 @@ KEEPER_GUARANTEE_V1 = ("the sealed items, registrations, claims, ledger and per-
                        "refused); the original data file and the metric confirmation are only as strong as the user's "
                        "own account; a root user or the keeper's own account can break all of it.")
 
-KEEPER_GUARANTEE = KEEPER_GUARANTEE_V1      # revision 25 text: Task 10 (it names the keeper's inference container)
+# design 05 §18.9 (revision 25), verbatim: the separate-user text, with the rootful-access check and the keeper's
+# inference container.
+KEEPER_GUARANTEE = ("the sealed items, registrations, claims, ledger and per-item records are held by a separate OS "
+                    "user running code the user's account cannot change, and every record is signed; the keeper "
+                    "found no rootful Docker or containerd access by the user's account, nor the account in the "
+                    "docker, lxd, incus-admin or disk group, when this was stated or at any earlier check on this "
+                    "sealed set (sudo is not checked); a scenario pack's per-item generator runs the candidate "
+                    "inside the keeper process, and a batch generator runs it in a container of the keeper's own "
+                    "rootless Docker with no network, a read-only root file system and the predictions as its only "
+                    "output; either way the candidate is a copy of the model files the keeper hashed, and a model "
+                    "format that executes code is refused; an escape from that container through a bug in the "
+                    "inference code or the kernel gives the keeper's account; the original data file and the metric "
+                    "confirmation are only as strong as the user's own account; a root user, also one reached "
+                    "through sudo, or the keeper's own account can break all of it.")
 
 KEEPER_ROOT_DOCKER_GUARANTEE = ("the keeper runs as a separate OS user, but the user's account can reach a rootful "
                                 "Docker or containerd daemon or holds a root-equivalent group (docker, lxd, "
@@ -27,6 +40,8 @@ KEEPER_ROOT_DOCKER_GUARANTEE = ("the keeper runs as a separate OS user, but the 
 KEEPER_SAME_USER_GUARANTEE = ("the keeper runs as the owner's own OS user, so anything running as the user can read "
                               "its state and signing key: the records are signed, but nothing is sealed (a test or "
                               "development setup)")
+
+COMPUTE_BACKEND_SOURCE = "the driver's job records (cooperative, not checked by the keeper)"   # AN-10 `compute`
 
 LIMIT_ORIGINAL_DATA = ("the original data file is the user's and stays readable to anything running as the user; run "
                        "intake before handing the project to an agent and keep the original out of its reach")

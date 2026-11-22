@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -625,11 +626,36 @@ def _krefuse(args, problems: list[Problem]) -> int:
                 human="")
 
 
+def _inference_config(args):
+    """AN-25: the keeper's inference options as an `InferenceConfig`, None without `--inference-image`; Refused
+    (AN-13) for a malformed value or an inference option without the image."""
+    from .ainative.keeper.inference import DEFAULT_DOCKER, InferenceConfig
+
+    given = [name for name, value in (("--inference-ref", args.inference_ref), ("--eval-tree", args.eval_tree),
+                                      ("--docker-host", args.docker_host), ("--docker", args.docker))
+             if value not in (None, [])]
+    if args.inference_image is None:
+        if given:
+            raise Refused([Problem("AN-13", "inference_image", f"{given[0]} needs --inference-image",
+                                   "pass the inference image ID (sha256:<64 hex>) the keeper's daemon holds")])
+        return None
+    try:
+        return InferenceConfig(image_id=args.inference_image,
+                               docker_host=args.docker_host or f"unix:///run/user/{os.geteuid()}/docker.sock",
+                               eval_trees=tuple(Path(t) for t in args.eval_tree or ()), image_ref=args.inference_ref,
+                               docker=Path(args.docker) if args.docker else DEFAULT_DOCKER)
+    except ValueError as exc:
+        raise Refused([Problem("AN-13", "inference_image", str(exc),
+                               "pass --inference-image sha256:<64 hex>, absolute --eval-tree and --docker paths, and "
+                               "--inference-ref pinned by digest")]) from None
+
+
 def cmd_keeper_serve(args) -> int:
     from .ainative.keeper.server import serve
 
     try:
-        code = serve(Path(args.state).absolute(), Path(args.socket).absolute(), args.owner_uid)
+        inference = _inference_config(args)
+        code = serve(Path(args.state).absolute(), Path(args.socket).absolute(), args.owner_uid, inference=inference)
     except Refused as exc:                               # AN-12, AN-13: the keeper does not start
         return _krefuse(args, exc.problems)
     return _kfinish(args, {}, exit_code=code)
@@ -748,6 +774,16 @@ def _add_keeper(sub) -> None:
     c.add_argument("--socket", required=True, metavar="PATH", help="the Unix socket path (at most 107 bytes)")
     c.add_argument("--owner-uid", required=True, type=int, metavar="UID",
                    help="the uid allowed to connect besides the keeper's own")
+    c.add_argument("--inference-image", metavar="ID",
+                   help="run batch generators in containers of this image ID (sha256:<64 hex>) on the keeper's own "
+                        "rootless Docker daemon (AN-25); without it a batch generator is refused")
+    c.add_argument("--inference-ref", metavar="REF",
+                   help="the reference (pinned by digest) the daemon holds the image under (default: the ID)")
+    c.add_argument("--eval-tree", action="append", metavar="DIR",
+                   help="a root-owned tree mounted read-only at its own path into the container (repeatable)")
+    c.add_argument("--docker-host", metavar="URL",
+                   help="the keeper's rootless daemon (default unix:///run/user/<keeper uid>/docker.sock)")
+    c.add_argument("--docker", metavar="PATH", help="the Docker CLI's absolute path (default /usr/bin/docker)")
     c.set_defaults(func=cmd_keeper_serve)
 
     c = ks.add_parser("fingerprint", help="print the fingerprint of the key the keeper serves; keep it out of band")
