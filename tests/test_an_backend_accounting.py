@@ -16,6 +16,7 @@ from unittest import mock
 
 from gatedtrain.ainative import backend as be
 from gatedtrain.ainative.backend import LocalBackend
+from gatedtrain.ainative.project import create_project
 from gatedtrain.ainative.runtime import GPU_BUSY_MIB
 from gatedtrain.errors import Refused
 from gatedtrain.ext import launch
@@ -325,17 +326,59 @@ class TestRoundOne(_Acc):
         self.assertGreaterEqual(b.gpu_seconds(), 3600)
 
     def test_missing_log_row_added_by_later_status(self) -> None:
-        """Minor 4: a crash cut off the log row; the next status adds it, once."""
+        """A crash cut off the log row before the job recorded it (no `gpu_log_written` row); the next status adds
+        it, once."""
         old = be.GPU_LOG_HEADER + "| old | a | b | 1.00 | 1.00 | PASS rc=0 |\n"
         self.gpu_log().write_text(old)
         jid = self.backend.submit(self.job())
         self.assertEqual(self.backend.wait(jid).state, "succeeded")
-        self.gpu_log().write_text(old)                                # the row was lost
+        self.assertEqual(len(self.of(jid, "gpu_log_written")), 1)
+        self.gpu_log().write_text(old)                                # the row was lost, and its record
+        path = self.project.root / "jobs" / jid / "attempts.jsonl"
+        kept = [l for l in path.read_text().splitlines(keepends=True) if '"gpu_log_written"' not in l]
+        path.write_text("".join(kept))
         self.backend.status(jid)
         self.backend.status(jid)
         lines = self.gpu_log().read_text().splitlines()
         self.assertEqual([l for l in lines if l.startswith(f"| {jid} (")], [lines[-1]])
         self.assertEqual(len(lines), 4)
+        self.assertEqual(len(self.of(jid, "gpu_log_written")), 1)
+
+    def test_same_job_id_in_two_projects(self) -> None:
+        """Job ids repeat across projects: a second project's row cut off by a crash is still added, although the
+        shared log holds a row of the first project's job of the same id."""
+        a = self.backend
+        ja = a.submit(self.job())
+        a.wait(ja)
+        data = self.tmp / "data.txt"
+        proj2 = create_project(self.tmp / "proj2", goal="g", data=data, pipeline="p",
+                               budget={"gpu_hours": 1.0, "llm_usd": 0})
+        b = LocalBackend(proj2, self.rt, host=self.host, sleep=lambda s: None, clock=lambda: START)
+        job = self.job()
+        job = dataclasses.replace(job, output_dir=str(b.new_output_dir("train", key=job.key())))
+        jb = b.submit(job)
+        self.assertEqual(ja, jb)
+        with mock.patch.object(LocalBackend, "_gpu_log", side_effect=OSError("crash")):
+            with self.assertRaises(OSError):
+                b.wait(jb)
+        self.assertEqual(b.status(jb).state, "succeeded")
+        rows = [l for l in self.gpu_log().read_text().splitlines() if l.startswith(f"| {ja} (")]
+        self.assertEqual(len(rows), 2)
+
+    def test_archived_log_not_recreated(self) -> None:
+        """A recorded job never opens the host's log again: a log moved away is not re-created by its status."""
+        jid = self.backend.submit(self.job())
+        self.backend.wait(jid)
+        self.gpu_log().unlink()
+        self.assertEqual(self.backend.status(jid).state, "succeeded")
+        self.assertFalse(self.gpu_log().exists())
+
+    def test_broken_log_does_not_block_status_of_recorded_job(self) -> None:
+        jid = self.backend.submit(self.job())
+        self.backend.wait(jid)
+        self.gpu_log().write_text("no table here\n")
+        self.assertEqual(self.backend.status(jid).state, "succeeded")
+        self.assertEqual(self.gpu_log().read_text(), "no table here\n")
 
     def test_inputs_changed_stops_cut_off_container(self) -> None:
         """Minor 8: a container of the due attempt runs (its `start` row was cut off); it is stopped and recorded

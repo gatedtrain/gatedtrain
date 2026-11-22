@@ -118,7 +118,8 @@ class _Base(unittest.TestCase):
         return read_jsonl(self.project.root, f"jobs/{jid}/attempts.jsonl")
 
     def events(self, jid: str) -> list[str]:
-        return [r["event"] for r in self.rows(jid)]
+        """The attempt events, without the GPU log's bookkeeping row (`gpu_log_written`)."""
+        return [r["event"] for r in self.rows(jid) if r["event"] != "gpu_log_written"]
 
     def name(self, jid: str, attempt: int = 1) -> str:
         return f"gatedtrain-{self.backend.project_hex()[:12]}-{jid}-a{attempt}"

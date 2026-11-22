@@ -6,7 +6,8 @@ the adapter's launch and argv rules), then recorded and started as a detached co
     <project>/jobs/<seq:04d>-<label>/job.json          the job (environment names only), its key, the stage, the
                                                        rootless setting, the host configuration hash, the script and
                                                        interpreter hashes, the docker argument list (names only)
-    <project>/jobs/<seq:04d>-<label>/attempts.jsonl    rows `start`, `end`, `cancel_requested`, `stop`
+    <project>/jobs/<seq:04d>-<label>/attempts.jsonl    rows `start`, `end`, `cancel_requested`, `stop`,
+                                                       `refused`, `gpu_log_written`
     <project>/jobs/<seq:04d>-<label>/attempt-<n>.log   the tail of attempt n's container log (at most 10 MiB)
     <project>/jobs/<seq:04d>-<label>/lock              the job's lock (`fcntl.flock`)
     <project>/jobs/output-dirs.jsonl                   the output directories `new_output_dir` created
@@ -705,14 +706,18 @@ class LocalBackend:
         finally:
             os.close(fd)
 
-    def _gpu_log(self, job_id: str, rec: Mapping[str, Any], status: JobStatus, *, if_missing: bool = False) -> None:
+    def _gpu_log(self, job_id: str, rec: Mapping[str, Any], status: JobStatus) -> None:
         """One row for a job that reached a terminal state, appended without following a link and under a lock on the
         log (it is the host's, shared by projects): the header and the first row in one write when the log is absent;
         after a log that does not end inside its `Running total` table (notes, headings, a blank line: free text,
         docs/gpu-step.md) a new table, header and row, so the row is the last one `launch.gpu_used_h` reads. An
-        existing log that does not parse is refused, never reset. `if_missing`: only when the log has no row of the
-        job yet (a terminal state whose row a crash cut off)."""
+        existing log that does not parse is refused, never reset. Once the row is written the job records a
+        `gpu_log_written` row in its own attempts.jsonl; a job with that row never opens the host's log again (job ids
+        repeat across projects, and the log may have been archived or edited since), so a crash between the append
+        and the record is the only way a job gets a second row."""
         rows = self._rows(job_id)
+        if any(r.get("event") == "gpu_log_written" for r in rows):
+            return
         starts = [r for r in rows if r.get("event") == "start"]
         ends = [r for r in rows if r.get("event") == "end"]
         first = next((e["started_utc"] for e in ends if e.get("started_utc")), None) or (
@@ -731,8 +736,6 @@ class LocalBackend:
             before = self._gpu_log_total(fd, path)
             size = os.fstat(fd).st_size
             text = os.pread(fd, size, 0).decode("utf-8", "replace") if size else ""
-            if if_missing and any(line.startswith(f"| {job_id} (") for line in text.splitlines()):
-                return
             row = (f"| {job_id} ({rec['job']['label']}), {len(starts)} attempt(s) | {first} | {last} | {hours:.2f} "
                    f"| {(before or 0.0) + hours:.2f} | {status.state.upper()} rc={rc} |\n")
             if before is None:
@@ -744,6 +747,7 @@ class LocalBackend:
             os.fsync(fd)
         finally:
             os.close(fd)
+        self._append(job_id, "gpu_log_written", state=status.state)
 
     # -- checks before a start ---------------------------------------------------------------------------------------
 
@@ -998,11 +1002,11 @@ class LocalBackend:
         """Under the job's lock: start a due attempt, or inspect the running one, stop it past its limit and record its
         end (then start a retry when one is due). A RuntimeFailure leaves the records as they were. A job that reaches
         a terminal state here (from `was`, default its state on entry) gets its GPU log row; a job already terminal
-        gets it when the log has none (`_gpu_log(if_missing=True)`)."""
+        gets it only when it has no `gpu_log_written` row (a row a crash cut off)."""
         view = self._view(job_id, rec)
         if (was or view.status.state) in TERMINAL:
             if view.status.state in TERMINAL:
-                self._gpu_log(job_id, rec, view.status, if_missing=True)    # a row a crash cut off
+                self._gpu_log(job_id, rec, view.status)
             return view.status
         try:
             status = self._step(job_id, rec, view, key=key, raise_budget=raise_budget)
