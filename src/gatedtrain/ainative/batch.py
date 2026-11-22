@@ -13,6 +13,10 @@ container code:
 - `read_predictions`, the strict read-back of `/out`: exactly one regular file `predictions.jsonl` of canonical JSON
   lines `{"item_id", "prediction", "seed"}`, one per item and seed. Anything else is a crash (AN-9), and the refusal
   names counts only, never a prediction (it may quote a sealed input).
+
+A standard-library script writes a line with `json.dumps(doc, sort_keys=True, separators=(",", ":"),
+ensure_ascii=False, allow_nan=False)`. That matches the reader's canonical form only when `prediction` is a string,
+an int within +/-(2**53 - 1), a bool or null; a float (`1.0`) or a larger int is not canonical and is a crash (AN-9).
 """
 
 from __future__ import annotations

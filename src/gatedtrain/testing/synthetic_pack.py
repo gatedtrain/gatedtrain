@@ -32,6 +32,7 @@ from ..ainative.stage import Proposal, StageContext
 from ..ainative.trust_stages import SCHEMA_DEPLOYMENT, SCHEMA_MODEL_REF, SCHEMA_TRAIN_PART
 from ..errors import Problem, Refused
 from ..ext.smoke import smoke_verdict
+from .synthetic_batch_generate import feature
 
 GENERATOR = "synthetic.lookup"
 # The batch form of the same model (AN-25): a standard-library script that reads `<model>/table.json`, for the
@@ -57,11 +58,6 @@ def _meta(schema: str) -> dict:
 
 def _refuse(rule: str, field_: str, message: str, fix: str) -> Refused:
     return Refused([Problem(rule, field_, message, fix)])
-
-
-def feature(text: Any) -> Any:
-    """The token a lookup model keys on: the text before the first '-'."""
-    return text.split("-", 1)[0] if isinstance(text, str) else None
 
 
 def generate(model_ref: dict, item: dict, *, sampler: dict | None = None, seed: int | None = None) -> Any:

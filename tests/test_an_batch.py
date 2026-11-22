@@ -107,6 +107,12 @@ class ProtocolTest(Base):
         self.assertTrue(mods)
         self.assertLessEqual(mods - {"__future__"}, set(sys.stdlib_module_names))
 
+    def test_feature_has_one_source(self) -> None:
+        from gatedtrain.testing import synthetic_batch_generate as script
+        self.assertIs(pack.feature, script.feature)
+        self.assertEqual(pack.feature("tok3-x-y"), "tok3")
+        self.assertIsNone(pack.feature({"q": 1}))
+
     def test_script_matches_per_item(self) -> None:
         items, model = toy_items(), toy_model()
         out = run_script(pack.BATCH.script, self.tmp, [{"input": i["input"]} for i in items], pack.SAMPLER, SEEDS,
@@ -180,6 +186,8 @@ class ReadPredictionsTest(Base):
             "missing pair": good[:-1],
             "duplicate": good + [good[0]],
             "extra pair": good + [canonical_json({"item_id": self.N, "seed": 11, "prediction": "SECRET-x"})],
+            "item out of range": good[:-1] + [canonical_json({"item_id": self.N, "seed": 12,
+                                                              "prediction": "SECRET-PRED-12-2"})],
             "unknown seed": good[:-1] + [canonical_json({"item_id": self.N - 1, "seed": 99, "prediction": "SECRET"})],
             "NaN": good[:-1] + [b'{"item_id":2,"prediction":NaN,"seed":12}'],
             "extra key": good[:-1] + [b'{"item_id":1,"seed":11,"prediction":1.0,"x":0}'],

@@ -5,9 +5,9 @@
 It is copied into the keeper's inference container, so it must not import gatedtrain. It reads the lookup table from
 `MODEL_DIR/table.json`, the items (`{"item_id", "input"}` lines) and the seeds (`{"sampler", "seeds"}`), and writes
 `OUT_DIR/predictions.jsonl`: one canonical JSON line `{"item_id", "prediction", "seed"}` per seed and item, the
-prediction equal to `synthetic_pack.generate` for a model whose `table` is that file's content (`feature` is
-duplicated here). The lines are canonical for the pack's text labels; `json.dumps` writes some floats differently from
-RFC 8785, which the keeper would read back as a crash.
+prediction equal to `synthetic_pack.generate` for a model whose `table` is that file's content. `feature` is defined
+here only and `synthetic_pack` imports it, so both forms key on the same token. The lines use the writer recipe of
+`gatedtrain.ainative.batch`, canonical for the pack's text labels.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import sys
 
 
 def feature(text):
-    """The token a lookup model keys on: the text before the first '-' (as `synthetic_pack.feature`)."""
+    """The token a lookup model keys on: the text before the first '-'."""
     return text.split("-", 1)[0] if isinstance(text, str) else None
 
 
