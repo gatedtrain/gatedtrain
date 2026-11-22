@@ -23,9 +23,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _keeper import KeeperProcess, skip_unless_linux
+from _keeper import KeeperProcess, skip_unless_linux, write_host_tree
 
-from gatedtrain.ainative.keeper import protocol, server
+from gatedtrain.ainative.keeper import protocol, rootful, server
 from gatedtrain.ainative.keeper.protocol import (MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_SOCKET_PATH,
                                                  SOCKET_TIMEOUT_S, KeeperClient, peer_allowed, read_line)
 from gatedtrain.errors import Refused
@@ -62,10 +62,11 @@ def serving(**caps):
     state.mkdir(mode=0o700)
     stop = threading.Event()
     errors: list[BaseException] = []
+    view = rootful.HostView(root=write_host_tree(tmp / "host"), root_uid=os.getuid())   # never the host's groups
 
     def run():
         try:
-            server.serve(state, sock, os.getuid(), stop=stop)
+            server.serve(state, sock, os.getuid(), stop=stop, host_view=view)
         except BaseException as exc:                        # surfaced by the context below
             errors.append(exc)
 
@@ -160,7 +161,8 @@ class TestHandle(unittest.TestCase):
     def setUp(self):
         tmp = Path(tempfile.mkdtemp(prefix="gk-"))
         self.addCleanup(shutil.rmtree, tmp, True)
-        self.keeper = server.Keeper(tmp, os.getuid())
+        self.keeper = server.Keeper(tmp, os.getuid(), host_view=rootful.HostView(root=write_host_tree(tmp / "host"),
+                                                                                 root_uid=os.getuid()))
 
     def test_hello_result(self):
         resp = self.keeper.handle(b'{"op":"hello","project":null,"args":{}}', os.getuid())
@@ -168,7 +170,8 @@ class TestHandle(unittest.TestCase):
         self.assertIs(resp["ok"], True)
         self.assertEqual(resp["problems"], [])
         self.assertEqual(set(resp["result"]), {"keeper_version", "fingerprint", "public_pem", "sealed_guarantee",
-                                               "environment_sha256", "same_user"})
+                                               "environment_sha256", "same_user", "owner_has_root_docker",
+                                               "root_docker_reasons"})                     # AN-21
         self.assertIs(resp["result"]["same_user"], True)       # the test keeper runs as the owner uid
 
     def test_bad_lines(self):

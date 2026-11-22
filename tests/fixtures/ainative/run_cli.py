@@ -20,6 +20,10 @@ Test-only backend switch (AN-24, tests/test_an_backend_stages.py): `GATEDTRAIN_T
 makes `machine.compute_backend` build its backend on `FakeRuntime(state_dir=<state dir>)`, whose containers of every
 image run `subprocess_handler`; the outcome queue is the one the test stored in the state directory (no outcomes are
 passed here), so no Docker daemon is touched.
+
+Test-only host view switch (AN-21, tests/test_an_rootful.py, tests/_keeper.py): `GATEDTRAIN_TEST_HOST_VIEW=<dir>` makes
+`keeper serve` run its rootful-access detection on the fake tree `<dir>` (`HostView(root=<dir>, root_uid=<this uid>)`)
+instead of the real host. Only this wrapper reads the variable; production code has no such switch.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ class _ScenarioEP:
 
 TEST_GENERATOR_ENV = "GATEDTRAIN_TEST_GENERATOR"
 TEST_BACKEND_RUNTIME_ENV = "GATEDTRAIN_TEST_BACKEND_RUNTIME"
+TEST_HOST_VIEW_ENV = "GATEDTRAIN_TEST_HOST_VIEW"
 
 
 class _EveryImage(dict):
@@ -78,6 +83,18 @@ def _fake_backend_runtime(mode: str) -> None:
         return real(project, runtime=rt)
 
     machine.compute_backend = compute_backend
+
+
+def _fake_host_view(root: str) -> None:
+    from gatedtrain.ainative.keeper import rootful, server
+
+    real = server.serve
+    view = rootful.HostView(root=Path(root), root_uid=os.getuid())
+
+    def serve(*args, **kwargs):
+        return real(*args, **{**kwargs, "host_view": view})
+
+    server.serve = serve
 
 
 def _test_generator(mode: str):
@@ -133,6 +150,8 @@ def main(argv: list[str]) -> int:
         _fail_candidate_record_writes()
     if os.environ.get(TEST_BACKEND_RUNTIME_ENV):
         _fake_backend_runtime(os.environ[TEST_BACKEND_RUNTIME_ENV])
+    if os.environ.get(TEST_HOST_VIEW_ENV):
+        _fake_host_view(os.environ[TEST_HOST_VIEW_ENV])
     eps = [_StageEP(c) for c in (pack.ProfileData, pack.ChooseTaskAndBase, pack.BuildTrainSet, pack.WriteRecipe,
                                  pack.Smoke, pack.Train)]
     stage_mod._plugin_entry_points = lambda: list(eps)

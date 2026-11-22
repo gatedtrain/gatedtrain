@@ -4,6 +4,10 @@
 starts `tests/fixtures/ainative/run_cli.py keeper serve --state ... --socket ... --owner-uid <os.getuid()>` (so the
 synthetic pack is injected as in step 1) and waits for `hello`. Leaving the context stops the process and removes the
 directory; a start that fails cleans up before it raises.
+
+The keeper's rootful-access detection (AN-21) reads a fake host tree, never the real host (the CI runner is in the
+`docker` group, preflight finding 19): unless `env` sets `GATEDTRAIN_TEST_HOST_VIEW`, `KeeperProcess` writes a clean
+tree (`write_host_tree`) under its directory and points the variable at it.
 """
 
 from __future__ import annotations
@@ -24,6 +28,31 @@ from gatedtrain.ainative.keeper.protocol import KeeperClient
 from gatedtrain.errors import Refused
 
 RUN_CLI = FIXTURES / "ainative" / "run_cli.py"
+HOST_VIEW_ENV = "GATEDTRAIN_TEST_HOST_VIEW"
+CLEAN_MOUNTINFO = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
+TCP_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+
+
+def write_host_tree(root: Path, *, owner_uid: int | None = None, primary_gid: int = 4242, group: str | None = None,
+                    statuses: dict[int, str] | None = None, tcp: str = "", tcp6: str | None = "",
+                    mountinfo: str = CLEAN_MOUNTINFO) -> Path:
+    """A fake host tree for `rootful.HostView(root=root, ...)`: `etc/group` (default: no group holds the owner),
+    `etc/passwd` naming the owner `owner` with `primary_gid`, `proc/self/mountinfo`, `proc/net/tcp` (header plus
+    `tcp`), `proc/net/tcp6` (left out when None) and one `proc/<pid>/status` per `statuses` entry. Returns `root`."""
+    uid = os.getuid() if owner_uid is None else owner_uid
+    (root / "etc").mkdir(parents=True, exist_ok=True)
+    (root / "proc" / "self").mkdir(parents=True, exist_ok=True)
+    (root / "proc" / "net").mkdir(parents=True, exist_ok=True)
+    (root / "etc" / "group").write_text("root:x:0:\nusers:x:100:\n" if group is None else group)
+    (root / "etc" / "passwd").write_text(f"root:x:0:0::/root:/bin/sh\nowner:x:{uid}:{primary_gid}::/home/o:/bin/sh\n")
+    (root / "proc" / "self" / "mountinfo").write_text(mountinfo)
+    (root / "proc" / "net" / "tcp").write_text(TCP_HEADER + tcp)
+    if tcp6 is not None:
+        (root / "proc" / "net" / "tcp6").write_text(TCP_HEADER + tcp6)
+    for pid, text in (statuses or {}).items():
+        (root / "proc" / str(pid)).mkdir(exist_ok=True)
+        (root / "proc" / str(pid) / "status").write_text(text)
+    return root
 START_TIMEOUT_S = 15.0
 STOP_TIMEOUT_S = 10.0
 
@@ -95,8 +124,11 @@ class KeeperProcess:
         self._log = open(self.log_path, "ab")
         cmd = [sys.executable, str(RUN_CLI), "keeper", "serve", "--state", str(self.state),
                "--socket", str(self.socket), "--owner-uid", str(self.owner_uid)]
+        env = {**cli_env(), **self.env}
+        if not env.get(HOST_VIEW_ENV):           # never the real host's docker group (preflight finding 19)
+            env[HOST_VIEW_ENV] = str(write_host_tree(self.tmp / "host", owner_uid=self.owner_uid))
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
-                                     env={**cli_env(), **self.env}, cwd=str(self.tmp))
+                                     env=env, cwd=str(self.tmp))
         deadline = time.monotonic() + START_TIMEOUT_S
         probe = KeeperClient(self.socket, timeout=2.0)
         while True:

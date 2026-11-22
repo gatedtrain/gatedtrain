@@ -16,6 +16,11 @@ environment record once.
 (`registration_hash`, `baseline`, `candidate`), `gate` (`attempt_id`) and `report`, each taking exactly the args it
 names. A refusal after a spend (`RefusedAfterSpend`) carries the spend's signed envelopes in `result`.
 
+`hello` also states the rootful-access detection (AN-21, `rootful.owner_root_docker` on `Keeper.host_view`, run per
+call): `owner_has_root_docker` and `root_docker_reasons`, and the guarantee that follows. For a project (the request
+names one) these are the project's sealed set's (positive when the detection is positive now or was recorded on the
+set, preflight finding 2); without a project, the current host state.
+
 A request whose client has already closed its end (it gave up waiting behind another connection) is dropped unread,
 so a sealed evaluation is never granted to a client that is no longer there to receive the claim.
 """
@@ -39,7 +44,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ... import __version__
 from ...errors import Problem, Refused
 from .. import signing
-from . import envcheck, protocol, texts
+from . import envcheck, protocol, rootful, texts
 from .protocol import RefusedAfterSpend
 from .state import KEY_FILE, KeeperState  # noqa: F401  (KEY_FILE: the key's name in the state directory)
 
@@ -49,13 +54,15 @@ MAX_START_PROBLEMS = 20          # start-up problems printed; the rest are count
 
 class Keeper:
     def __init__(self, state_dir: Path, owner_uid: int, *, key: Ed25519PrivateKey | None = None,
-                 environment: dict | None = None, state: KeeperState | None = None) -> None:
+                 environment: dict | None = None, state: KeeperState | None = None,
+                 host_view: rootful.HostView | None = None) -> None:
         self.state_dir = Path(state_dir)
         self.owner_uid = owner_uid
         self.keeper_uid = os.geteuid()
         self.key = key
         self.environment = environment       # the signed environment envelope (kind `environment`)
         self.state = state
+        self.host_view = rootful.HostView() if host_view is None else host_view
 
     def handle(self, line: bytes, peer: int) -> dict:
         """The response to one request line. Never raises: an unexpected exception becomes a problem with rule
@@ -81,13 +88,19 @@ def _internal(exc: BaseException) -> Problem:
 
 def _hello(keeper: Keeper, project: str | None, args: dict, peer: int) -> dict:
     key, env = keeper.key, keeper.environment
+    reasons = rootful.owner_root_docker(keeper.owner_uid, keeper.host_view)
+    root_docker = bool(reasons)
+    if project is not None and keeper.state is not None:
+        root_docker, reasons = keeper.state.root_docker_for(project, reasons)
     return {
         "keeper_version": __version__,
         "fingerprint": signing.fingerprint(key) if key is not None else None,
         "public_pem": signing.public_pem(key).decode("ascii") if key is not None else None,
-        "sealed_guarantee": texts.sealed_guarantee(keeper.keeper_uid, keeper.owner_uid),
+        "sealed_guarantee": texts.sealed_guarantee(keeper.keeper_uid, keeper.owner_uid, root_docker=root_docker),
         "environment_sha256": envcheck.environment_sha256(env["record"]) if env is not None else None,
         "same_user": keeper.keeper_uid == keeper.owner_uid,
+        "owner_has_root_docker": root_docker,
+        "root_docker_reasons": reasons,
     }
 
 
@@ -269,21 +282,25 @@ def check_start(state_dir: Path, keeper_uid: int, socket_dir: Path | None = None
         raise Refused(_capped(problems))
 
 
-def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading.Event | None = None) -> int:
+def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading.Event | None = None,
+          host_view: rootful.HostView | None = None) -> int:
     """Serve until SIGTERM (or until `stop` is set, for an in-process server); 0 on a clean stop. A start that cannot
-    proceed raises Refused (AN-12; AN-13 for the environment and the state directory)."""
+    proceed raises Refused (AN-12; AN-13 for the environment and the state directory). `host_view` is the tree the
+    rootful-access detection reads (AN-21; the real host by default, a fake tree in tests)."""
     if sys.platform != "linux":
         raise protocol.refused("platform", "the keeper runs on Linux only (Unix socket, SO_PEERCRED)",
                                "run the keeper on a Linux host")
     socket_path = Path(socket_path)
     check_start(state_dir, os.geteuid(), Path(os.path.abspath(socket_path)).parent)
-    state = KeeperState(state_dir, owner_uid=owner_uid)       # refuses a second keeper on this state (AN-12)
+    view = rootful.HostView() if host_view is None else host_view
+    state = KeeperState(state_dir, owner_uid=owner_uid,       # refuses a second keeper on this state (AN-12)
+                        root_docker=lambda: rootful.owner_root_docker(owner_uid, view))
     try:
         _prepare_socket_path(socket_path)
         stop = stop if stop is not None else threading.Event()
         environment = signing.sign(state.key, "environment", envcheck.environment_record())
         state.environment_sha256 = envcheck.environment_sha256(environment["record"])
-        keeper = Keeper(state_dir, owner_uid, key=state.key, environment=environment, state=state)
+        keeper = Keeper(state_dir, owner_uid, key=state.key, environment=environment, state=state, host_view=view)
         return _serve_loop(keeper, socket_path, stop)
     finally:
         state.close()

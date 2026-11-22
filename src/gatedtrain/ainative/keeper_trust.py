@@ -195,11 +195,14 @@ class KeeperTrust:
     def check(self) -> dict:
         """Ask the keeper's key (`hello`) and refuse (AN-14) another key than the binding's; returns the hello.
 
+        The `hello` names the project, so its guarantee is the one for the project's sealed set (AN-21: downgraded
+        for good once rootful access was seen on the set), the text its intake summary and report state.
+
         The keeper serves one connection at a time, so this `hello` may queue behind another client's evaluation: it
         waits with the long-op deadline (`protocol.LONG_OP_TIMEOUT_S`, read at call time) unless the client has an
         explicit timeout. A keeper that is not running still fails at once (the connect is refused, AN-12)."""
         timeout = self.client.timeout if self.client.timeout is not None else protocol.LONG_OP_TIMEOUT_S
-        hello = KeeperClient(self.client.socket_path, timeout=timeout).call("hello", None, {})
+        hello = KeeperClient(self.client.socket_path, timeout=timeout).call("hello", self.binding.project_id, {})
         fp, _ = _hello_key(hello)
         if fp != self.binding.fingerprint:
             raise _anchor("keeper", "the keeper at the socket serves another key than the one this project was bound "
