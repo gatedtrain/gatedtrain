@@ -10,10 +10,12 @@ holding them, so the driver logs the spend.
 
 Client deadlines: the keeper serves one connection at a time, and a client's deadline starts before it connects. The
 ops that split, score or gate (`LONG_OPS`: intake of up to 64 MiB, evaluate, gate, report) get `LONG_OP_TIMEOUT_S`,
-longer than any request the keeper is expected to spend on the synthetic pack and on a CPU scorer; every other op
-keeps `SOCKET_TIMEOUT_S`. A client that gives up while
-its request waits behind another is not served: the keeper drops a request whose peer has already closed. A client
-that gives up during its own evaluation can send the identical request again and gets the stored claim.
+3900 s: a sealed evaluation of a batch generator waits for the GPU (at most 900 s) and runs one container per arm (at
+most the generator's time limit each), and the keeper refuses before the grant a generator whose time limit would not
+fit (900 s + 2 time limits + 600 s, pre-flight finding 11); every other op keeps `SOCKET_TIMEOUT_S`. A client that
+gives up while its request waits behind another is not served: the keeper drops a request whose peer has already
+closed. A client that gives up during its own evaluation can send the identical request again and gets the stored
+claim.
 
 The server reads the caps and the timeout from this module at call time, so a test can patch them for an in-process
 server.
@@ -35,7 +37,7 @@ MAX_REQUEST_BYTES = 96 * 1024 * 1024          # a 64 MiB data file in base64 plu
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 SOCKET_TIMEOUT_S = 60.0
 LONG_OPS = frozenset({"intake", "evaluate", "gate", "report"})
-LONG_OP_TIMEOUT_S = 3600.0
+LONG_OP_TIMEOUT_S = 3900.0      # >= a batch evaluation: GPU wait 900 s + 2 x 1200 s time limits + 600 s (AN-25)
 MAX_SOCKET_PATH = 107                         # sun_path is 108 bytes including the terminating NUL
 
 RULE = "AN-12"
