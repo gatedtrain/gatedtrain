@@ -25,7 +25,7 @@ from _support import (EXIT_GATE_NOT_PASS, EXIT_OK, EXIT_REFUSED, describe, file_
 
 import yaml
 
-from gatedtrain import ANALYSIS_CODE_VERSION
+from gatedtrain import ANALYSIS_CODE_VERSION, ANALYSIS_VERSION, PACKAGE, __version__
 from gatedtrain.canonical import canonical_json, sha256_bytes
 from gatedtrain.ext.registry import EVALUATOR_ROWS
 from gatedtrain.ledger import WRITER_ID
@@ -39,8 +39,8 @@ OLDEST_VERSION = "ptc-skel 0.1.0"    # the version before the first rename
 class TestNewNames(unittest.TestCase):
 
     def test_identifiers(self):
-        self.assertEqual(ANALYSIS_CODE_VERSION, "gatedtrain 0.3.0")
-        self.assertEqual(WRITER_ID, "gatedtrain.ledger@0.3.0")
+        self.assertEqual(ANALYSIS_CODE_VERSION, "gatedtrain 0.3.0")   # the analysis code version, not the package's
+        self.assertEqual(WRITER_ID, f"gatedtrain.ledger@{__version__}")  # provenance: the package that wrote the ledger
         self.assertEqual(PRE_RENAME_VERSIONS, (OLDEST_VERSION, OLD_VERSION))
 
     def test_name_map_is_the_published_map(self):
@@ -53,6 +53,28 @@ class TestNewNames(unittest.TestCase):
                          b"gatedtrain.item_eval gatedtrain_recipe_x gatedtrain-recipe-x gatedtrain")
         self.assertEqual(apply_name_map(b"ptc-mm ptc_mm.cut"), b"ptc-mm ptc_mm.cut", "no other name is mapped")
         self.assertEqual(len(NAME_MAP), 13)
+
+
+class TestAnalysisVersion(unittest.TestCase):
+    """The analysis code version (05 section 3.7, design revision 24) names the gate statistics and registration
+    semantics, not the package release: a package release that leaves them unchanged leaves it, and so every existing
+    registration, unchanged."""
+
+    def test_does_not_follow_the_package_version(self):
+        self.assertEqual(__version__, "0.4.0")
+        self.assertEqual(ANALYSIS_VERSION, "0.3.0")
+        self.assertEqual(ANALYSIS_CODE_VERSION, f"{PACKAGE} {ANALYSIS_VERSION}")
+        self.assertNotEqual(ANALYSIS_CODE_VERSION, f"{PACKAGE} {__version__}")
+
+    def test_stub_evaluator_identity_follows_the_analysis_version(self):
+        """A Tier A registration pins the stand-in evaluator's identity hash; a package release must not change it."""
+        from gatedtrain.runner import stub_evaluator_hash
+
+        with mock.patch("gatedtrain.runner.__version__", "9.9.9"):
+            pinned = stub_evaluator_hash()
+        self.assertEqual(stub_evaluator_hash(), pinned)
+        with mock.patch("gatedtrain.runner.ANALYSIS_VERSION", "9.9.9"):
+            self.assertNotEqual(stub_evaluator_hash(), pinned)
 
 
 class RenameCase(unittest.TestCase):

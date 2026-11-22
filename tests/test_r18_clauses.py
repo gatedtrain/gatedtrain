@@ -35,7 +35,7 @@ import _r18
 from _ext import EVALUATOR_ID, ExtScenario, baseline_score, build_arm, candidate_score, evaluator_identity_hash
 from _support import (EXIT_GATE_NOT_PASS, EXIT_OK, EXIT_REFUSED, SKEL_ROOT, VENV_PYTHON, cli_env, describe,
                       parse_errors, parse_run_dir)
-from gatedtrain import gates
+from gatedtrain import ANALYSIS_CODE_VERSION, gates
 from gatedtrain import items as items_mod
 from gatedtrain.registration import (check_against_gate, check_contents, clause_for_evaluator, clause_list, is_multi,
                                   normalize, pilot_for)
@@ -75,7 +75,7 @@ def tts_registration() -> dict:
         "sampler": {"name": "deployment", "temperature": 1.0, "max_new_tokens": 2048},
         "evaluators": [{"id": WER_ID, "manifest_hash": HASH}, {"id": SIM_ID, "manifest_hash": HASH}],
         "multiplicity": {"plan": "all_clauses_must_pass"},
-        "analysis_code_version": "gatedtrain 0.3.0",
+        "analysis_code_version": ANALYSIS_CODE_VERSION,
         "bootstrap": {"replicates": 10000, "seed": 20261117},
         "pairing": {"max_unpaired": 0},
     }

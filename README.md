@@ -6,9 +6,25 @@ to find which checkpoints may have consumed a training shard, for example after 
 
 This is a prototype. Outputs carry the tags `prototype` and `unpromotable`.
 
-## Changes since 0.3.0
+## Changes in 0.4.0
 
-Not released yet. Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs/findings.md,
+The analysis code version stays `gatedtrain 0.3.0`. A registration records `analysis_code_version` and is refused
+when it differs from the running code; from this release that version names the gate statistics and registration
+semantics, not the package release (`gatedtrain.ANALYSIS_VERSION`; design 05 section 3.7). It changes only when that
+code's behaviour changes, so registrations made with 0.3.0 stay valid under 0.4.0. The stand-in evaluator's identity
+hash names the analysis version too, so the demo registrations are unchanged. Lockfile backends, the ledger
+`writer_id`, the keeper's `keeper_version` and `--version` still name the package release that wrote them.
+
+New in this release:
+
+- Resumable external runs (EXT-RES-1 to EXT-RES-7): `ext-collect` reads a resumed run as a chain of attempts with
+  their cuts, keeps the records after a non-final attempt's last committed cut in the ledger as `orphaned` (consumption
+  ledger schema 1.1; a 1.0 ledger reads as kept rows), and `impact --json` adds an `orphaned` section for resumed runs.
+- AI-native projects, a preview: step 1, `gatedtrain project` (in process, CPU only), and step 2, the keeper daemon
+  that holds the sealed items, registrations and alpha ledger and signs its records (`keeper`, `setup keeper`,
+  `verify`, Linux only). See "AI-native projects (preview)" below.
+
+Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs/findings.md,
 "Review of the 3.12 path fix" and "Review of PR 2"):
 
 - A symbolic link anywhere in an `output_ref` path, or as an arm's `items.jsonl`, `eval_meta.json` or `merge.json`,

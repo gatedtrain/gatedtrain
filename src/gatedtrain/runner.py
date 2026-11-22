@@ -26,7 +26,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import ANALYSIS_CODE_VERSION, PACKAGE, STUB_MARK, TAGS, __version__
+from . import ANALYSIS_CODE_VERSION, ANALYSIS_VERSION, PACKAGE, STUB_MARK, TAGS, __version__
 from .canonical import (canonical_json, entries_hash, file_sha256, manifest_document, manifest_entries, manifest_hash,
                         sha256_bytes, text_lines, write_canonical)
 from .errors import Problem, Refused
@@ -66,12 +66,14 @@ def _utc_now() -> str:
 
 def stub_evaluator_hash() -> str:
     """Identity of the stand-in evaluator: hashes of its code files. The report records it as `evaluator_hash`,
-    and a Tier A registration carries it as the deciding evaluator's `manifest_hash` (R10A-2, R11A-24)."""
+    and a Tier A registration carries it as the deciding evaluator's `manifest_hash` (R10A-2, R11A-24). It names
+    the analysis version, not the package release, so a package release that changes neither the stand-in code nor
+    the analysis version leaves registrations valid (05 section 3.7, design revision 24)."""
     from .stubs import evaluator, model, task
 
     files = {Path(m.__file__).name: file_sha256(Path(m.__file__)) for m in (evaluator, model, task)}
     return sha256_bytes(canonical_json({"evaluator": evaluator.EVALUATOR_ID, "backend": "cpu_stub",
-                                        "package": PACKAGE, "version": __version__, "code": files}))
+                                        "package": PACKAGE, "version": ANALYSIS_VERSION, "code": files}))
 
 
 def preflight(wf: Workflow) -> dict[str, Any]:

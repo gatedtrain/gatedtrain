@@ -50,6 +50,7 @@ from _support import (
     stage_dir,
     train_step_files,
 )
+from gatedtrain import ANALYSIS_CODE_VERSION, __version__
 from test_pairing import upstream_load_paired_records
 
 # NeMo Evaluator per-sample record keys (eval_loop.py:790-803 at ea35ba3),
@@ -223,7 +224,7 @@ class SlowE2EPass(unittest.TestCase):
         final_step, final_dir = checkpoint_dirs(self.run_dir)[-1]
         self.assertEqual(rep["candidate_checkpoint_hash"], manifest_hash(final_dir))
         self.assertEqual(rep["lockfile_hash"], file_sha256(self.run_dir / "lockfile.json"))
-        self.assertEqual(rep["analysis_code_version"], "gatedtrain 0.3.0")
+        self.assertEqual(rep["analysis_code_version"], ANALYSIS_CODE_VERSION)
 
     def test_text_report(self):
         text = (self.run_dir / "report" / "gate_report.txt").read_text(encoding="utf-8")
@@ -306,7 +307,7 @@ class SlowE2EPass(unittest.TestCase):
             b = lock["backend"][role]
             self.assertEqual(b["name"], "cpu_stub")
             self.assertEqual(b["package"], "gatedtrain")
-            self.assertEqual(b["package_version"], "0.3.0")
+            self.assertEqual(b["package_version"], __version__)   # provenance: the package that ran
             self.assertEqual(b["torch_version"], torch.__version__)
         for name in MANIFEST_NAMES:
             if name in ("gate_report",):
