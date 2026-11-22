@@ -45,9 +45,10 @@ def sealed_guarantee(keeper_uid: int, owner_uid: int, *, root_docker: bool = Fal
 
 # ---- report v2 known limits (spec §5.4; preflight finding 16) -----------------------------------------------------
 
-LIMIT_KEEPER_MODEL_REFERENCE = ("a model reference must content-address its weights; the keeper hashes the model files "
-                                "a reference lists (`files`) when it scores, not weights the reference reaches in any "
-                                "other way")
+LIMIT_KEEPER_MODEL_REFERENCE = ("a model reference must content-address its weights: the keeper copies the files a "
+                                "reference lists (`files`) into its own state, hashes the copy and runs only the copy, "
+                                "so the hash in the claim is the hash of what ran; weights the reference reaches in "
+                                "any other way are not covered")
 
 LIMIT_ALPHA_RULE = ("the test level of each attempt is set by alpha-investing (Foster-Stine) over every sealed "
                     "evaluation on this sealed set, from every project that uses it; the guarantee is the marginal "

@@ -25,6 +25,9 @@ Layout under the state directory (every file mode 0600, every directory 0700, ne
   its sealed attempts); `projects/<project hex>/registrations/<hash hex>.json`: each registration with its envelope;
   `projects/<project hex>/records.jsonl`: every envelope the keeper signed for the project and showed its driver, in
   order (not the gate records); `projects/<project hex>/report.json`: the project's signed report.
+- `models/<attempt hex>/<arm>/`: the keeper's copy of an arm's model files (AN-13), made before the grant under a fresh
+  random hex per `evaluate` call; the generator runs only the copy. Removed once the arm is scored, on every other
+  exit of `evaluate`, and (any leftover) when the keeper starts.
 
 Files are written by temp file plus rename, except `records.jsonl`, which is append-only: one `O_APPEND | O_NOFOLLOW`
 write per line, as step 1's ledger (a torn last line from a crash is dropped at the next start, before any append).
@@ -62,6 +65,8 @@ import json
 import os
 import pwd
 import re
+import secrets
+import shutil
 import stat
 import threading
 from collections.abc import Callable
@@ -84,6 +89,7 @@ from .protocol import RefusedAfterSpend
 
 KEY_FILE = "keeper.key"
 LOCK_FILE = "lock"
+MODELS_DIR = "models"
 STATE_SCHEMA_VERSION = 1
 ARTIFACT_SCHEMA_VERSION = 2        # keeper-mode bodies of the step 1 `sealed_summary` and `power` records
 SCHEMA_INTAKE = "gatedtrain.ainative.keeper_intake"
@@ -138,6 +144,7 @@ class KeeperState:
         self._lock_fd: int | None = self._take_lock()
         try:
             self.key = self._signing_key()
+            self._remove_copies(self.dir / MODELS_DIR)          # leftovers of a keeper that stopped while scoring
             self._load_index()
         except BaseException:
             self.close()
@@ -779,9 +786,18 @@ class KeeperState:
             return bool(st.st_mode & stat.S_IRGRP)
         return bool(st.st_mode & stat.S_IROTH)
 
-    def _model_files(self, arm: str, record: dict) -> None:
+    @staticmethod
+    def _remove_copies(path: Path) -> None:
+        """Remove a model copy directory (never following a link)."""
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+
+    def _model_files(self, arm: str, record: dict, dest: Path) -> dict:
         """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read
-        (the keeper is never a way to read a file the owner cannot), and pass `envcheck.check_model_files`."""
+        (the keeper is never a way to read a file the owner cannot); `envcheck.copy_model_files` then copies them into
+        `dest` and checks the copy. Returns the record the generator receives (the copies' paths)."""
         problems = []
         entries = record.get("files", [])
         state = os.path.realpath(self.dir)
@@ -803,17 +819,18 @@ class KeeperState:
             try:
                 st = os.stat(path)
             except OSError:
-                continue                                  # check_model_files names it
+                continue                                  # copy_model_files names it
             if not self._owner_can_read(st):
                 problems.append(Problem(envcheck.RULE, field, f"{name} is not readable by the owner uid",
                                         "pass a file the user the keeper serves can read"))
         if problems:
             raise Refused(problems)
         try:
-            envcheck.check_model_files(record)
+            envcheck.copy_model_files(record, dest)
         except Refused as exc:
             raise Refused([Problem(p.rule, f"{arm}.record.{p.field}", p.message, p.fix) for p in exc.problems]) \
                 from None
+        return envcheck.copied_record(record, dest)
 
     def _arm_args(self, arm: str, value: Any) -> tuple[dict, str]:
         if not (isinstance(value, dict) and set(value) == {"record", "sha256"} and isinstance(value["record"], dict)):
@@ -894,26 +911,33 @@ class KeeperState:
             if found is None or ev.get("manifest_hash") != resolved_evaluator_hash(ev):
                 raise _problem("AN-8", "registration.evaluators[0]", "the registered evaluator is not the scorer the "
                                "keeper runs", "register again with the scorer the keeper serves")
-            for arm, rec in (("baseline", base_rec), ("candidate", cand_rec)):
-                self._model_files(arm, rec)
-            wealth = self._wealth(atts)
-            if not ai.can_bid(wealth):
-                raise _problem("AN-15", "alpha", f"the next bid {ai.bid(wealth):.6g} is below the smallest allowed "
-                               f"{ai.MIN_BID}: the alpha-investing wealth of this sealed set is spent", NEW_DATA_FIX)
-            att = self._grant(project_id, sealed_id, registration_hash, base_sha, cand_sha, wealth, len(atts) + 1,
-                              full, ev)
+            copies = self.dir / MODELS_DIR / secrets.token_hex(16)      # this attempt's copies (AN-13)
             try:
-                self._score(att, full, found, fn, base_rec, cand_rec, ev)
-            except Exception as exc:                        # after the grant: the attempt settles, not passed
-                problems = exc.problems if isinstance(exc, Refused) else [Problem(
-                    "AN-8", "evaluate", f"the sealed evaluation failed after alpha was granted ({type(exc).__name__}); "
-                    "the attempt settles as not passed", "check the keeper (its disk and its scenario pack), then "
-                    "train a new candidate")]           # class name only: the message may hold a sealed item
-                settled = self._settle(att)
-                raise RefusedAfterSpend(problems, {**self._claim_response(settled),
-                                                       "summary": settled["summary"],
-                                                       "settle": settled["settle"]}) from None
-            return self._claim_response(att)
+                (self.dir / MODELS_DIR).mkdir(mode=0o700, exist_ok=True)
+                copies.mkdir(mode=0o700)
+                runs = {arm: self._model_files(arm, rec, copies / arm)    # before the grant: a refusal spends nothing
+                        for arm, rec in (("baseline", base_rec), ("candidate", cand_rec))}
+                wealth = self._wealth(atts)
+                if not ai.can_bid(wealth):
+                    raise _problem("AN-15", "alpha", f"the next bid {ai.bid(wealth):.6g} is below the smallest "
+                                   f"allowed {ai.MIN_BID}: the alpha-investing wealth of this sealed set is spent",
+                                   NEW_DATA_FIX)
+                att = self._grant(project_id, sealed_id, registration_hash, base_sha, cand_sha, wealth,
+                                  len(atts) + 1, full, ev)
+                try:
+                    self._score(att, full, found, fn, runs["baseline"], runs["candidate"], ev, copies)
+                except Exception as exc:                    # after the grant: the attempt settles, not passed
+                    problems = exc.problems if isinstance(exc, Refused) else [Problem(
+                        "AN-8", "evaluate", f"the sealed evaluation failed after alpha was granted "
+                        f"({type(exc).__name__}); the attempt settles as not passed", "check the keeper (its disk "
+                        "and its scenario pack), then train a new candidate")]  # class name only: may hold an item
+                    settled = self._settle(att)
+                    raise RefusedAfterSpend(problems, {**self._claim_response(settled),
+                                                           "summary": settled["summary"],
+                                                           "settle": settled["settle"]}) from None
+                return self._claim_response(att)
+            finally:
+                self._remove_copies(copies)
 
     def _baseline_key(self, base_sha: str, full: dict, ev: dict) -> str:
         return sha256_bytes(canonical_json({"baseline_model_sha256": base_sha, "sampler": full.get("sampler"),
@@ -942,7 +966,9 @@ class KeeperState:
         return att
 
     def _score(self, att: dict, full: dict, found: tuple[scorers.ScorerSpec, dict], fn: Any, base_rec: dict,
-               cand_rec: dict, ev: dict) -> None:
+               cand_rec: dict, ev: dict, copies: Path) -> None:
+        """Score both arms on the records that name the keeper's copies; each arm's copy is removed once it is
+        scored."""
         spec, params = found
         score = scorers.bind(spec, params)
         items = self._items(att["sealed_id"])
@@ -953,8 +979,10 @@ class KeeperState:
             records = sealed_eval.score_arm(items, generate, base_rec, full, score, score_range=spec.score_range,
                                             scorer_name=spec.name)
             self._write_arm(base_rel, att["baseline_model_sha256"], records)
+        self._remove_copies(copies / "baseline")
         records = sealed_eval.score_arm(items, generate, cand_rec, full, score, score_range=spec.score_range,
                                         scorer_name=spec.name)
+        self._remove_copies(copies / "candidate")
         self._write_arm(f"{set_rel}/records/{att['j']:06d}.json", att["candidate_model_sha256"], records)
 
     # ---- attempts: gate and settle ----------------------------------------------------------------------------------
