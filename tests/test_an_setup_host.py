@@ -86,7 +86,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         script = self.script()
         cmds = commands_only(script)
         self.assertTrue(script.startswith("#!/bin/bash\n"), script[:80])
-        self.assertIn("set -euo pipefail\numask 022", cmds)
+        self.assertIn("set -euo pipefail\ncd /\numask 022", cmds)      # no program runs in the caller's cwd
         self.assertIn("gatedtrain-host-setup.sh", script.split("set -euo pipefail")[0])     # header: save, run, delete
         # the checks, then the changes in the order the brief and preflight finding 4 give
         self.assert_order(cmds, ['"$(id -u)"', 'id -u "$OWNER"', "nvidia.com/gpu", "apt-get install -y uidmap",
@@ -106,16 +106,37 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         self.assertIn("XDG_RUNTIME_DIR=/run/user/", cmds)
         self.assertIn("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/", cmds)
         self.assertIn("unix:///run/user/1234/docker.sock", cmds)
-        # no inference, no eval venv, no drop-in
-        for absent in ("inference.conf", "--inference-image", "--eval-tree", "-m venv", "--require-hashes"):
+        # no inference, no eval venv; an earlier inference drop-in is removed (fix round 1, item 4)
+        for absent in ("--inference-image", "--eval-tree", "-m venv", "--require-hashes", "cat > /etc/systemd"):
             self.assertNotIn(absent, cmds)
+        self.assert_order(cmds, [f"rm -f {hostsetup.DROPIN_PATH}", "systemctl daemon-reload",
+                                 "systemctl try-restart gatedtrain-keeper.service"])
+        self.assertNotIn("systemctl restart gatedtrain-keeper.service", cmds)
         # closing comments, as the owner
         tail = script[script.rindex("systemctl --user restart docker"):]
         for text in ("systemctl restart user@1234.service", "rootless = true",
                      f'output_root = "{hostsetup.DEFAULT_HANDOFF}"', "host.toml", "docker --context gatedtrain",
                      "gatedtrain keeper fingerprint"):
             self.assertIn(text, tail)
+        self.assertIn("without --eval-requirements passes no --eval-tree", " ".join(tail.split()))
         self.assert_bash_parses(script)
+
+    def test_fix_round_1_checks_and_extras_hold(self):
+        cmds = commands_only(self.script())
+        # a rootless network driver is checked before any change (item 7)
+        self.assert_order(cmds, ["cd /", "command -v slirp4netns", "command -v pasta", "apt-get install -y uidmap"])
+        # the extras: skipped at the right version, unheld and held again around the install (item 1)
+        self.assert_order(cmds, ["apt-get install -y uidmap",
+                                 "dpkg-query -W -f='${Version}' docker-ce-rootless-extras",
+                                 '"$EXTRAS_VERSION" != "$DOCKER_CE_VERSION"',
+                                 "apt-mark showhold docker-ce-rootless-extras",
+                                 "apt-mark unhold docker-ce-rootless-extras",
+                                 '--allow-downgrades --no-install-recommends '
+                                 '"docker-ce-rootless-extras=$DOCKER_CE_VERSION"',
+                                 "apt-mark hold docker-ce-rootless-extras", "usr.bin.rootlesskit"])
+        # a replaced daemon.json is reported with its backup (item 5)
+        self.assertIn("daemon.json.before-gatedtrain", cmds[cmds.index("echo ", cmds.index("as_owner cp")):])
+        self.assertRegex(cmds, r'echo "[^"\n]*replaced[^"\n]*daemon\.json\.before-gatedtrain')
 
     def test_plain_mode_prints_the_script_only(self):
         with no_processes():
@@ -139,11 +160,17 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         venv = hostsetup.DEFAULT_EVAL_VENV
         # the interpreter tree is checked before any change; the venv is built from it, root-owned
         self.assert_order(cmds, [f"PYROOT={PYROOT}", "-perm /022", "apt-get install -y uidmap",
-                                 f"-m venv --clear {venv}", "--require-hashes --no-deps",
+                                 f"-m venv --clear {venv}", "--require-hashes",
                                  f"chmod -R go-w {venv}", "docker pull", "image inspect -f '{{.Id}}'",
                                  "^sha256:[0-9a-f]{64}$", "inference.conf", "systemctl daemon-reload",
-                                 "systemctl restart gatedtrain-keeper.service"])
-        self.assertIn(f'"$EVAL_PYTHON" -m venv --clear {venv}', cmds)
+                                 "systemctl try-restart gatedtrain-keeper.service"])
+        # root runs the interpreter isolated from the cwd and the environment (fix round 1, items 2 and 3)
+        self.assertIn(f'"$EVAL_PYTHON" -I -m venv --clear {venv}', cmds)
+        pip = next(line for line in cmds.splitlines() if "--require-hashes" in line)
+        for text in ("PIP_CONFIG_FILE=/dev/null", "--isolated", "--only-binary :all:", "--require-hashes",
+                     "--no-deps"):
+            self.assertIn(text, pip)
+        self.assertLess(cmds.index("cd /"), cmds.index("apt-get"))
         self.assertIn(f"EVAL_PYTHON={EVAL_PYTHON}", cmds)
         self.assertIn(REQS.decode(), script)                           # embedded verbatim
         self.assertIn("uv python install", script)                       # how root installs the interpreter

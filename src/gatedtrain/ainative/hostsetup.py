@@ -1,19 +1,22 @@
 """AN-20: `gatedtrain setup host` prints the root bash script that sets up rootless Docker; it never runs it.
 
 `host_script` returns one script the user saves as `SCRIPT_NAME`, reads, runs once with `sudo bash` and deletes. Every
-check comes before the first change: the script runs as root, the owner has the uid it was printed for, an NVIDIA CDI
-spec (`nvidia.com/gpu`) exists in `CDI_SPEC_DIRS`, the eval interpreter tree (with `--eval-requirements`) is
-root-owned and not group- or other-writable, and the parents of the directories it creates are root-owned and not
-group- or other-writable. Then, in order: `uidmap`; `docker-ce-rootless-extras` at the installed `docker-ce` version
-(the rootful daemon is not restarted); the AppArmor profile Ubuntu 24.04 requires for rootlesskit (only when no
-profile names `/usr/bin/rootlesskit`); the keeper user when missing (as `setup keeper` creates it) and its home; the
-data roots and the hand-off directory; a subuid/subgid range for each user that has none; the owner leaves the rootful
-`docker` group, before any user manager or rootless daemon of the owner starts, since `runuser` and the user manager
-take the owner's groups when they start (preflight finding 4); lingering; for each user a rootless daemon with
-its own data root and Docker's native CDI; the owner's context `gatedtrain`; with `--eval-requirements` the keeper's
-root-owned eval venv from the hash-pinned requirements; with `--inference-image` the keeper's daemon pulls the image
-and a drop-in of the keeper's unit passes its ID and the eval trees to `keeper serve` (the serve command comes from
-`setup.serve_argv`, the builder of the unit's own `ExecStart=`), ordered after the keeper's user manager.
+check comes before the first change (the script first moves to `/`, so no program root runs reads the caller's
+directory): the script runs as root, the owner has the uid it was printed for, an NVIDIA CDI spec (`nvidia.com/gpu`)
+exists in `CDI_SPEC_DIRS`, `slirp4netns` or `pasta` is installed, the eval interpreter tree (with
+`--eval-requirements`) is root-owned and not group- or other-writable, and the parents of the directories it creates
+are root-owned and not group- or other-writable. Then, in order: `uidmap`; `docker-ce-rootless-extras` at the
+installed `docker-ce` version unless it is there already (unheld and held again when it was held; the rootful daemon
+is not restarted); the AppArmor profile Ubuntu 24.04 requires for rootlesskit (only when no profile names
+`/usr/bin/rootlesskit`); the keeper user when missing (as `setup keeper` creates it) and its home; the data roots and
+the hand-off directory; a subuid/subgid range for each user that has none; the owner leaves the rootful `docker`
+group, before any user manager or rootless daemon of the owner starts, since `runuser` and the user manager take the
+owner's groups when they start (preflight finding 4); lingering; for each user a rootless daemon with its own data
+root and Docker's native CDI; the owner's context `gatedtrain`; with `--eval-requirements` the keeper's root-owned
+eval venv from the hash-pinned requirements (`python -I`, `pip --isolated --only-binary :all:`); with
+`--inference-image` the keeper's daemon pulls the image and a drop-in of the keeper's unit passes its ID and the eval
+trees to `keeper serve` (the serve command comes from `setup.serve_argv`, the builder of the unit's own `ExecStart=`),
+ordered after the keeper's user manager; without it an earlier inference drop-in is removed.
 
 Nothing here starts a process or writes a file; values are printed shell-quoted, and a path is refused unless it is
 made of letters, digits, `/`, `.`, `_`, `-`, `+` and `@` (so it reads the same in a unit and in an unquoted heredoc).
@@ -184,11 +187,15 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         f"#   {COMMAND}",
         "# and delete it afterwards. Every check comes before the first change; a failing step stops the script.",
         "set -euo pipefail",
-        "umask 022           # the keeper reads the eval venv and the drop-in; nothing created here is group-writable",
+        "# no program root runs here reads modules or configuration from the caller's directory; the keeper reads",
+        "# the eval venv and the drop-in, and nothing created here is group- or other-writable",
+        "cd /",
+        "umask 022",
         "",
         f"OWNER={q(owner)}",
         f"OWNER_UID={owner_uid}",
         f"KEEPER={q(keeper)}",
+        "KEEPER_STOPPED=",
         "fail() { echo \"gatedtrain host setup: $*\" >&2; exit 1; }",
         "",
         "# ---- checks (nothing has changed yet)",
@@ -204,6 +211,9 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml\"",
         "DOCKER_CE_VERSION=$(dpkg-query -W -f='${Version}' docker-ce 2>/dev/null || true)",
         '[ -n "$DOCKER_CE_VERSION" ] || fail "docker-ce is not installed"',
+        "# rootlesskit needs a user-mode network driver",
+        "command -v slirp4netns >/dev/null || command -v pasta >/dev/null \\",
+        '  || fail "neither slirp4netns nor pasta is installed; install one first: apt-get install slirp4netns"',
     ]
     if requirements is not None:
         L += [
@@ -229,8 +239,18 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "",
         "# ---- changes",
         "apt-get install -y uidmap",
-        "# docker-ce-rootless-extras at the installed docker-ce version; the rootful daemon is not restarted",
-        'apt-get install -y --allow-downgrades --no-install-recommends "docker-ce-rootless-extras=$DOCKER_CE_VERSION"',
+        "# docker-ce-rootless-extras at the installed docker-ce version, kept on hold when it was held; the rootful",
+        "# daemon is not restarted",
+        "EXTRAS_VERSION=$(dpkg-query -W -f='${Version}' docker-ce-rootless-extras 2>/dev/null || true)",
+        'if [ "$EXTRAS_VERSION" != "$DOCKER_CE_VERSION" ]; then',
+        "  EXTRAS_HELD=$(apt-mark showhold docker-ce-rootless-extras)",
+        '  [ -z "$EXTRAS_HELD" ] || apt-mark unhold docker-ce-rootless-extras',
+        '  apt-get install -y --allow-downgrades --no-install-recommends '
+        '"docker-ce-rootless-extras=$DOCKER_CE_VERSION" \\',
+        '    || { [ -z "$EXTRAS_HELD" ] || apt-mark hold docker-ce-rootless-extras; '
+        'fail "docker-ce-rootless-extras=$DOCKER_CE_VERSION did not install"; }',
+        '  [ -z "$EXTRAS_HELD" ] || apt-mark hold docker-ce-rootless-extras',
+        "fi",
         "# the AppArmor profile Ubuntu 24.04 requires for rootlesskit, only when no profile names it yet",
         "if [ -d /etc/apparmor.d ] && ! grep -qsE '^[[:space:]]*(profile[[:space:]]+[^[:space:]]+[[:space:]]+)?"
         "\"?/usr/bin/rootlesskit\"?[[:space:]]' /etc/apparmor.d/*; then",
@@ -258,7 +278,8 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         f'install -d -o "$KUID" -g "$KGID" -m 0700 {q(khome)}',
         f'if [ "$(getent passwd "$KEEPER" | cut -d: -f6)" != {q(khome)} ]; then',
         "  # usermod does not change the home of a user that runs a process: stop the keeper first (restarted below)",
-        f"  systemctl stop {setup.UNIT_NAME} 2>/dev/null || true",
+        f"  if systemctl is-active --quiet {setup.UNIT_NAME}; then systemctl stop {setup.UNIT_NAME}; "
+        "KEEPER_STOPPED=1; fi",
         f'  usermod -d {q(khome)} "$KEEPER"',
         "fi",
         f'install -d -o "$KUID" -g "$KGID" -m 0700 {q(kroot)}',
@@ -298,6 +319,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
     ]
     for who, home, root in (("owner", '"$OWNER_HOME"', oroot), ("keeper", q(khome), kroot)):
         cfg = f"{home}/.config/docker"
+        cfg_text = ("$OWNER_HOME" if who == "owner" else khome) + "/.config/docker"      # inside double quotes
         daemon = json.dumps({"data-root": root, "features": {"cdi": True}, "cdi-spec-dirs": list(CDI_SPEC_DIRS)},
                             indent=2)
         L += [
@@ -305,6 +327,8 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
             f"as_{who} mkdir -p {cfg}",
             f"if as_{who} test -e {cfg}/daemon.json && ! as_{who} test -e {cfg}/daemon.json.before-gatedtrain; then",
             f"  as_{who} cp {cfg}/daemon.json {cfg}/daemon.json.before-gatedtrain",
+            f'  echo "gatedtrain host setup: the {who}\'s daemon.json is replaced; the old one is kept as '
+            f'{cfg_text}/daemon.json.before-gatedtrain"',
             "fi",
             f"as_{who} tee {cfg}/daemon.json >/dev/null <<'JSON'",
             daemon,
@@ -326,11 +350,12 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         trees = [DEFAULT_EVAL_PYTHON_ROOT, venv]
         L += [
             "# the keeper's eval venv: root-owned, from the interpreter checked above and the hash-pinned requirements",
-            f'"$EVAL_PYTHON" -m venv --clear {q(venv)}',
+            f'"$EVAL_PYTHON" -I -m venv --clear {q(venv)}',
             "REQ=$(mktemp)",
             f"cat > \"$REQ\" <<'{REQUIREMENTS_EOF}'",
             requirements + REQUIREMENTS_EOF,
-            f'{q(venv + "/bin/pip")} install --no-cache-dir --require-hashes --no-deps -r "$REQ"',
+            f'PIP_CONFIG_FILE=/dev/null {q(venv + "/bin/pip")} --isolated install --no-cache-dir --require-hashes '
+            '--no-deps --only-binary :all: -r "$REQ"',
             'rm -f "$REQ"',
             f"chmod -R go-w {q(venv)}",
         ]
@@ -354,10 +379,14 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
             "ExecStart=" + " ".join(serve),
             "DROPIN",
         ]
+    else:
+        L += ["# no inference image: an inference drop-in of an earlier run goes",
+              f"rm -f {DROPIN_PATH}"]
     L += [
         "systemctl daemon-reload",
         f"if [ -f {setup.UNIT_PATH} ]; then",
-        f"  systemctl restart {setup.UNIT_NAME}",
+        f'  if [ -n "$KEEPER_STOPPED" ]; then systemctl start {setup.UNIT_NAME}; '
+        f"else systemctl try-restart {setup.UNIT_NAME}; fi",
         "else",
         f'  echo "gatedtrain host setup: {setup.UNIT_NAME} is not installed; install it with gatedtrain setup keeper"',
         "fi",
@@ -373,6 +402,9 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "#      docker --context gatedtrain pull <image>   (or docker --context gatedtrain build ...)",
         f"# 4. As {owner}: gatedtrain keeper fingerprint --socket {p['--socket']}",
         "#    and check it against the fingerprint you keep out of band.",
+        "#    Note: a script printed again by `gatedtrain setup host` with --inference-image but",
+        "#    without --eval-requirements passes no --eval-tree to the keeper, and one printed",
+        "#    without --inference-image removes the inference drop-in.",
         f"# 5. Delete {SCRIPT_NAME}.",
     ]
     return "\n".join(L) + "\n"
