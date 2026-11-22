@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ..errors import Problem, Refused
 from .project import ArtifactRef, Project
 
-if TYPE_CHECKING:  # defined by the trust module
+if TYPE_CHECKING:  # defined by the trust and backend modules
+    from .backend import StageBackend
     from .trust import AlphaLedger, TrustBackend
 
 STAGE_ENTRY_POINT_GROUP = "gatedtrain.stages"
@@ -40,7 +41,7 @@ class StageContext:
     """What a stage sees. `stage` is the stage's ref name in the pipeline (not its type): a stage writes its outputs
     under it (`project.write_artifact(ctx.stage, ...)`), so two refs of one stage type keep apart, and the machine
     refuses an output written under another name. The machine always sets it; it is empty only in a context built by
-    hand."""
+    hand. `backend` (AN-24) is the project's job backend for a pack stage; trust stages get None."""
 
     project: Project
     inputs: dict[str, ArtifactRef]
@@ -48,6 +49,7 @@ class StageContext:
     trust: "TrustBackend"
     ledger: "AlphaLedger"
     stage: str = ""
+    backend: "StageBackend | None" = None
 
 
 class Stage(Protocol):

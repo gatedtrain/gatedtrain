@@ -15,6 +15,11 @@ whose `label` is `base` is the baseline; every other model is a candidate.
 - `slow:<seconds>`: every candidate call sleeps that long first;
 - `write_error`: the generator is the pack's, but the keeper cannot write a candidate's per-item records (`OSError`),
   an exception after the grant that is not a refusal.
+
+Test-only backend switch (AN-24, tests/test_an_backend_stages.py): `GATEDTRAIN_TEST_BACKEND_RUNTIME=fake:<state dir>`
+makes `machine.compute_backend` build its backend on `FakeRuntime(state_dir=<state dir>)`, whose containers of every
+image run `subprocess_handler`; the outcome queue is the one the test stored in the state directory (no outcomes are
+passed here), so no Docker daemon is touched.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 
 from gatedtrain import cli
 from gatedtrain.ainative import stage as stage_mod, trust_stages
@@ -45,6 +51,33 @@ class _ScenarioEP:
 
 
 TEST_GENERATOR_ENV = "GATEDTRAIN_TEST_GENERATOR"
+TEST_BACKEND_RUNTIME_ENV = "GATEDTRAIN_TEST_BACKEND_RUNTIME"
+
+
+class _EveryImage(dict):
+    """A handler table that runs `subprocess_handler` for any image."""
+
+    def get(self, key, default=None):
+        from gatedtrain.testing.fake_runtime import subprocess_handler
+
+        return subprocess_handler
+
+
+def _fake_backend_runtime(mode: str) -> None:
+    from gatedtrain.ainative import machine
+    from gatedtrain.testing.fake_runtime import FakeRuntime
+
+    kind, _, arg = mode.partition(":")
+    if kind != "fake" or not arg:
+        raise SystemExit(f"{TEST_BACKEND_RUNTIME_ENV}: expected fake:<state dir>, got {mode!r}")
+    real = machine.compute_backend
+
+    def compute_backend(project, *, runtime=None):
+        rt = FakeRuntime(state_dir=Path(arg))
+        rt.handlers = _EveryImage()
+        return real(project, runtime=rt)
+
+    machine.compute_backend = compute_backend
 
 
 def _test_generator(mode: str):
@@ -98,6 +131,8 @@ def _fail_candidate_record_writes() -> None:
 def main(argv: list[str]) -> int:
     if os.environ.get(TEST_GENERATOR_ENV) == "write_error":
         _fail_candidate_record_writes()
+    if os.environ.get(TEST_BACKEND_RUNTIME_ENV):
+        _fake_backend_runtime(os.environ[TEST_BACKEND_RUNTIME_ENV])
     eps = [_StageEP(c) for c in (pack.ProfileData, pack.ChooseTaskAndBase, pack.BuildTrainSet, pack.WriteRecipe,
                                  pack.Smoke, pack.Train)]
     stage_mod._plugin_entry_points = lambda: list(eps)
