@@ -311,7 +311,7 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
     if inference is not None:
         if runtime is None:
             runtime = DockerCLIRuntime(host=inference.docker_host, docker=str(inference.docker))
-        runner = KeeperInference(inference, runtime, Path(os.path.abspath(state_dir)))
+        runner = KeeperInference(inference, runtime, Path(os.path.abspath(state_dir)), owner_uid=owner_uid)
     state = KeeperState(state_dir, owner_uid=owner_uid,       # refuses a second keeper on this state (AN-12)
                         root_docker=lambda: rootful.owner_root_docker(owner_uid, view), inference=runner)
     try:

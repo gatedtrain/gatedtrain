@@ -13,8 +13,9 @@ empty keeper-owned output directory `/out`. Nothing about the items is passed in
 - `start_problems` (AN-13, at `serve`): waits up to 60 s for the daemon's socket (the keeper user's daemon may start
   after the keeper), then refuses a daemon that is not rootless or whose socket is not owned by the keeper uid under a
   directory of mode 0700 (pre-flight finding 3), an image ID other than the configured one, an eval tree that fails
-  `envcheck.eval_tree_problems`, and (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that fails the
-  keeper's ownership check;
+  `envcheck.eval_tree_problems`, (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that fails the
+  keeper's ownership check, and a subordinate id range of the owner that covers the keeper's uid or gid (or one of
+  the keeper's that covers the owner's), read from /etc/subuid and /etc/subgid (an unreadable file refuses);
 - `environment`: what the signed environment record holds under `inference`;
 - `ready` (before the grant, so a refusal spends nothing): the generator's time limit fits the driver's wait for an
   evaluation, eval trees are configured when it needs them and its interpreter is a regular file inside one, its script is a file of a distribution the keeper runs,
@@ -33,6 +34,7 @@ empty keeper-owned output directory `/out`. Nothing about the items is passed in
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -60,6 +62,7 @@ KEEPER_ENV = (("DO_NOT_TRACK", "1"), ("HF_HUB_OFFLINE", "1"), ("HOME", "/tmp"), 
 KEEPER_LABEL = ("gatedtrain.keeper", "inference")      # every keeper container; leftovers are removed at start
 NAME_PREFIX = "gatedtrain-keeper-"
 RUN_DIR = "run"
+SUBID_FILES = ("/etc/subuid", "/etc/subgid")
 CONTAINER_USER = "0:0"           # the keeper uid on the host under the keeper's rootless daemon (05 §18.10)
 SHM_SIZE = "8g"
 SOCKET_WAIT_S = 60.0             # pre-flight finding 20
@@ -127,6 +130,22 @@ def _seconds(st: ContainerState | None) -> int | None:
     return max(0, int((b - a).total_seconds()))
 
 
+def _subids_cover(lines: list[str], users: tuple[str, ...], ident: int) -> bool:
+    """Whether a `name:start:count` line of one of `users` (a name or a uid) covers `ident`; a malformed line of
+    such a user counts as covering (fail closed)."""
+    for line in lines:
+        parts = line.strip().split(":")
+        if len(parts) < 3 or parts[0] not in users:
+            continue
+        try:
+            start, count = int(parts[1]), int(parts[2])
+        except ValueError:
+            return True
+        if start <= ident < start + count:
+            return True
+    return False
+
+
 def _open_up(path: Path, st: os.stat_result) -> None:
     """Give a directory (already `lstat`ed: not a link) its owner's read, write and search permission."""
     mode = stat.S_IMODE(st.st_mode)
@@ -162,8 +181,10 @@ class KeeperInference:
     absolute path; `sleep` and `clock` drive every wait (the socket, the GPU, a running container)."""
 
     def __init__(self, config: InferenceConfig, runtime: Runtime, state_dir: Path, *, probe: GpuProbe | None = None,
-                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 owner_uid: int | None = None) -> None:
         self.config = config
+        self.owner_uid = owner_uid
         self.runtime = runtime
         self.state_dir = Path(state_dir)
         self.keeper_uid = os.geteuid()
@@ -257,6 +278,38 @@ class KeeperInference:
             problems += envcheck.path_problems([self.config.nvidia_smi], self.keeper_uid)
         return problems
 
+    def _subid_problems(self) -> list[Problem]:
+        """No subordinate uid (gid) range of the owner covers the keeper's uid (gid), nor one of the keeper's the
+        owner's: the owner's rootless containers could otherwise act as the keeper on the host (or the keeper's as the
+        owner). Read from `SUBID_FILES`; a file that cannot be read, or a user without a passwd entry, refuses
+        (fail closed). Skipped without an owner uid, and for a keeper that runs as the owner (nothing is sealed from
+        the owner then)."""
+        if self.owner_uid is None or self.owner_uid == self.keeper_uid:
+            return []
+        fix = ("give the owner and the keeper user subordinate id ranges that cover neither user's own ids "
+               "(/etc/subuid, /etc/subgid), then start the keeper again")
+        try:
+            owner, keeper = pwd.getpwuid(self.owner_uid), pwd.getpwuid(self.keeper_uid)
+        except KeyError:
+            return [_problem(RULE_ENV, "subids", "the owner or the keeper user has no passwd entry, so their "
+                             "subordinate id ranges cannot be checked", fix)]
+        problems = []
+        for path, kind, owner_id, keeper_id in ((SUBID_FILES[0], "uid", owner.pw_uid, keeper.pw_uid),
+                                                (SUBID_FILES[1], "gid", owner.pw_gid, keeper.pw_gid)):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except OSError as exc:
+                problems.append(_problem(RULE_ENV, "subids", f"{path} cannot be read ({type(exc).__name__}), so the "
+                                         "subordinate id ranges cannot be checked", fix))
+                continue
+            for who, user, other_name, other_id in (("owner", owner, "keeper", keeper_id),
+                                                    ("keeper", keeper, "owner", owner_id)):
+                if _subids_cover(lines, (user.pw_name, str(user.pw_uid)), other_id):
+                    problems.append(_problem(RULE_ENV, "subids", f"a subordinate {kind} range of the {who} in {path} "
+                                             f"covers the {other_name}'s {kind} {other_id}", fix))
+        return problems
+
     def start_problems(self) -> list[Problem]:
         """AN-13 at start; [] when the keeper may serve."""
         problems = self._wait_for_socket()
@@ -267,6 +320,7 @@ class KeeperInference:
         if self.config.eval_trees:
             problems += envcheck.eval_tree_problems(self.config.eval_trees, self.keeper_uid)
         problems += self._cli_problems()
+        problems += self._subid_problems()
         return problems
 
     def remove_leftovers(self) -> list[Problem]:

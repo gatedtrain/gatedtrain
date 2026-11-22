@@ -4,14 +4,16 @@
 check comes before the first change (the script first moves to `/`, so no program root runs reads the caller's
 directory): the script runs as root, the owner has the uid it was printed for, an NVIDIA CDI spec (`nvidia.com/gpu`)
 exists in `CDI_SPEC_DIRS`, `slirp4netns` or `pasta` is installed, the eval interpreter tree (with
-`--eval-requirements`) is root-owned and not group- or other-writable, and the parents of the directories it creates
-are root-owned and not group- or other-writable. Then, in order: `uidmap`; `docker-ce-rootless-extras` at the
+`--eval-requirements`) is root-owned and not group- or other-writable, no subordinate id range of the owner or an
+existing keeper user covers the other's uid or gid (checked again once the keeper user exists), and the parents of the directories it creates
+are root-owned and not group- or other-writable. Then, in order: `apt-get update` and `uidmap`; `docker-ce-rootless-extras` at the
 installed `docker-ce` version unless it is there already (unheld and held again when it was held; the rootful daemon
 is not restarted); the AppArmor profile Ubuntu 24.04 requires for rootlesskit (only when no profile names
 `/usr/bin/rootlesskit`); the keeper user when missing (as `setup keeper` creates it) and its home; the data roots and
 the hand-off directory; a subuid/subgid range for each user that has none; the owner leaves the rootful `docker`
 group, before any user manager or rootless daemon of the owner starts, since `runuser` and the user manager take the
-owner's groups when they start (preflight finding 4); lingering; for each user a rootless daemon with its own data
+owner's groups when they start (a user manager of the owner that already runs keeps the group: the script warns
+and the closing comments say to restart it once the owner's sessions end); lingering; for each user a rootless daemon with its own data
 root and Docker's native CDI; the owner's context `gatedtrain`; with `--eval-requirements` the keeper's root-owned
 eval venv from the hash-pinned requirements (`python -I`, `pip --isolated --only-binary :all:`); with
 `--inference-image` the keeper's daemon pulls the image and a drop-in of the keeper's unit passes its ID and the eval
@@ -196,7 +198,27 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         f"OWNER_UID={owner_uid}",
         f"KEEPER={q(keeper)}",
         "KEEPER_STOPPED=",
+        "OWNER_MANAGER_WAS_ACTIVE=",
         "fail() { echo \"gatedtrain host setup: $*\" >&2; exit 1; }",
+        "# covers FILE USER UID ID: a subordinate range of USER (by name or uid) in FILE covers ID",
+        "covers() {",
+        "  awk -F: -v u=\"$2\" -v n=\"$3\" -v id=\"$4\" "
+        "'($1 == u || $1 == n) && NF >= 3 && id + 0 >= $2 + 0 && id + 0 < $2 + $3 { f = 1 } END { exit !f }' "
+        '"$1" 2>/dev/null',
+        "}",
+        "# a user's subordinate ids must not cover the other user's uid or gid: the user's rootless containers could",
+        "# then act as the other user on the host",
+        "check_subids() {",
+        '  local kuid kgid ogid; kuid=$(id -u "$KEEPER"); kgid=$(id -g "$KEEPER"); ogid=$(id -g "$OWNER")',
+        '  ! covers /etc/subuid "$OWNER" "$OWNER_UID" "$kuid" || fail "($1) a subuid range of $OWNER '
+        'covers the keeper\'s uid $kuid; give $OWNER a range that does not (/etc/subuid)"',
+        '  ! covers /etc/subuid "$KEEPER" "$kuid" "$OWNER_UID" || fail "($1) a subuid range of $KEEPER '
+        'covers the owner\'s uid $OWNER_UID; give $KEEPER a range that does not (/etc/subuid)"',
+        '  ! covers /etc/subgid "$OWNER" "$OWNER_UID" "$kgid" || fail "($1) a subgid range of $OWNER '
+        'covers the keeper\'s gid $kgid; give $OWNER a range that does not (/etc/subgid)"',
+        '  ! covers /etc/subgid "$KEEPER" "$kuid" "$ogid" || fail "($1) a subgid range of $KEEPER '
+        'covers the owner\'s gid $ogid; give $KEEPER a range that does not (/etc/subgid)"',
+        "}",
         "",
         "# ---- checks (nothing has changed yet)",
         '[ "$(id -u)" -eq 0 ] || fail "run this script as root"',
@@ -205,7 +227,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "DOCKER_GID=$(getent group docker | cut -d: -f3 || true)",
         '[ -z "$DOCKER_GID" ] || [ "$(id -g "$OWNER")" != "$DOCKER_GID" ] || fail "docker is the primary group of '
         '$OWNER; give $OWNER another primary group first (usermod -g)"',
-        "# GPU through Docker's native CDI: a spec naming nvidia.com/gpu must exist (preflight finding 26)",
+        "# GPU through Docker's native CDI: a spec naming nvidia.com/gpu must exist",
         f"grep -qsE '\"?kind\"?[[:space:]]*:[[:space:]]*\"?nvidia\\.com/gpu' {cdi_globs} \\",
         f"  || fail \"no NVIDIA CDI spec (kind nvidia.com/gpu) in {' or '.join(CDI_SPEC_DIRS)}; generate one as root: "
         "nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml\"",
@@ -214,6 +236,8 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "# rootlesskit needs a user-mode network driver",
         "command -v slirp4netns >/dev/null || command -v pasta >/dev/null \\",
         '  || fail "neither slirp4netns nor pasta is installed; install one first: apt-get install slirp4netns"',
+        "# overlapping subordinate id ranges of the owner and an existing keeper user",
+        'if id -u "$KEEPER" >/dev/null 2>&1; then check_subids before-changes; fi',
     ]
     if requirements is not None:
         L += [
@@ -238,6 +262,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "done",
         "",
         "# ---- changes",
+        "apt-get update",
         "apt-get install -y uidmap",
         "# docker-ce-rootless-extras at the installed docker-ce version, kept on hold when it was held; the rootful",
         "# daemon is not restarted",
@@ -273,6 +298,8 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "fi",
         'KUID=$(id -u "$KEEPER")',
         'KGID=$(id -g "$KEEPER")',
+        "# a keeper user created just now: its uid against the owner's existing ranges",
+        "check_subids after-keeper-created",
         'OGID=$(id -g "$OWNER")',
         'OWNER_HOME=$(getent passwd "$OWNER" | cut -d: -f6)',
         f'install -d -o "$KUID" -g "$KGID" -m 0700 {q(khome)}',
@@ -309,6 +336,15 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
     L += [
         "if getent group docker | cut -d: -f4 | tr ',' '\\n' | grep -x -- \"$OWNER\" >/dev/null; then",
         '  gpasswd -d "$OWNER" docker',
+        "fi",
+        "# a user manager of the owner that already runs (the owner ran sudo from a session) keeps the docker group,",
+        "# and the owner's rootless daemon below starts under it",
+        'if systemctl is-active --quiet "user@$OWNER_UID.service"; then',
+        "  OWNER_MANAGER_WAS_ACTIVE=1",
+        '  echo "gatedtrain host setup: warning: the user manager of $OWNER (user@$OWNER_UID.service) is already '
+        'running and keeps the docker group, so the owner\'s rootless daemon starts with it; after all sessions of '
+        '$OWNER have ended run: systemctl restart user@$OWNER_UID.service (or reboot), before expecting gatedtrain '
+        'keeper fingerprint to show no rootful access" >&2',
         "fi",
         'loginctl enable-linger "$OWNER" "$KEEPER"',
         'systemctl start "user@$OWNER_UID.service" "user@$KUID.service"',
@@ -390,11 +426,17 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "else",
         f'  echo "gatedtrain host setup: {setup.UNIT_NAME} is not installed; install it with gatedtrain setup keeper"',
         "fi",
+        '[ -z "$OWNER_MANAGER_WAS_ACTIVE" ] || echo "gatedtrain host setup: warning: the user manager of $OWNER was '
+        'already running; after all sessions of $OWNER have ended run: systemctl restart user@$OWNER_UID.service (or '
+        'reboot), before expecting gatedtrain keeper fingerprint to show no rootful access" >&2',
         'echo "gatedtrain host setup: done; the next steps are the comments at the end of this script"',
         "",
         "# Next steps:",
         f"# 1. After every old session of {owner} has ended (they keep the docker group), as root:",
         f"#      sudo systemctl restart user@{owner_uid}.service   (or reboot)",
+        f"#    This matters most when the script warned that the user manager of {owner} was already running:",
+        "#    the owner's rootless daemon then started with the docker group, and `gatedtrain keeper fingerprint`",
+        "#    reports rootful access until the restart.",
         f"# 2. As {owner}, no sudo: in ~/.config/gatedtrain/host.toml set",
         "#      rootless = true",
         f"#      output_root = \"{handoff}\"",
