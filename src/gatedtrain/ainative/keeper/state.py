@@ -47,9 +47,11 @@ At start, envelopes an attempt file or report holds but `records.jsonl` lacks (a
 appended again.
 
 Rootful-access detection (AN-21, preflight finding 2): `root_docker` is called at intake, sealed summary, evaluate,
-gate and report on a set (and by `hello` for a project); a positive result is recorded once for the set and stays, so
-the intake summary, the report and `hello` for every project on that set state the downgraded guarantee from then on,
-also after the access ended. Without `root_docker` (tests that construct the state in process) nothing is detected.
+gate and report on a set (and `hello` passes its own result); a positive result is a fact about the host, so it is
+recorded once on every sealed set not yet closed, whichever set the op touched (a closed set and an existing record
+are never changed). The intake summary, the report and `hello` for every project on such a set state the downgraded
+guarantee from then on, also after the access ended. Without `root_docker` (tests that construct the state in
+process) nothing is detected.
 """
 
 from __future__ import annotations
@@ -428,16 +430,31 @@ class KeeperState:
         """The set's `root_docker_seen` record (`{first_utc, reasons}`), or None."""
         return self._read_json(f"{self._set_rel(sealed_id)}/root_docker_seen.json", SCHEMA_ROOT_DOCKER_SEEN)
 
+    def _open_sets(self) -> list[str]:
+        """The ids of the sealed sets that hold their items and are not closed."""
+        d = self.dir / "sets"
+        names = sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+        return [f"sha256:{n}" for n in names if re.fullmatch(r"[0-9a-f]{64}", n)
+                and os.path.lexists(d / n / "items.json") and not self._closed(f"sha256:{n}")]
+
+    def record_root_docker(self, reasons: list[str]) -> None:
+        """A positive detection (fix round 1, finding 1): write `root_docker_seen` once on every open set that has
+        none; closed sets and existing records stay as they are. Nothing for an empty `reasons`."""
+        if not reasons:
+            return
+        with self._mutex:
+            for sealed_id in self._open_sets():
+                if self.root_docker_seen(sealed_id) is None:
+                    self._write_json(f"{self._set_rel(sealed_id)}/root_docker_seen.json", {
+                        "schema": SCHEMA_ROOT_DOCKER_SEEN, "schema_version": STATE_SCHEMA_VERSION,
+                        "sealed_id": sealed_id, "first_utc": _utc_now(), "reasons": list(reasons)})
+
     def _check_set(self, sealed_id: str, reasons: list[str] | None = None) -> bool:
-        """Run the detection (or take `reasons`), record a positive result once for the set; True when the set was
-        ever seen with rootful access."""
+        """Run the detection (or take `reasons`) and record a positive result on every open set; True when the set
+        was ever seen with rootful access (recorded) or the detection is positive now."""
         reasons = self.detect_root_docker() if reasons is None else reasons
-        seen = self.root_docker_seen(sealed_id)
-        if reasons and seen is None:
-            seen = {"schema": SCHEMA_ROOT_DOCKER_SEEN, "schema_version": STATE_SCHEMA_VERSION, "sealed_id": sealed_id,
-                    "first_utc": _utc_now(), "reasons": list(reasons)}
-            self._write_json(f"{self._set_rel(sealed_id)}/root_docker_seen.json", seen)
-        return seen is not None
+        self.record_root_docker(reasons)
+        return self.root_docker_seen(sealed_id) is not None or bool(reasons)
 
     def _guarantee(self, sealed_id: str) -> str:
         """The guarantee for the set (its recorded detection; run `_check_set` first)."""

@@ -19,7 +19,8 @@ names. A refusal after a spend (`RefusedAfterSpend`) carries the spend's signed 
 `hello` also states the rootful-access detection (AN-21, `rootful.owner_root_docker` on `Keeper.host_view`, run per
 call): `owner_has_root_docker` and `root_docker_reasons`, and the guarantee that follows. For a project (the request
 names one) these are the project's sealed set's (positive when the detection is positive now or was recorded on the
-set, preflight finding 2); without a project, the current host state.
+set, preflight finding 2); without a project, the current host state. A positive result is recorded on every sealed
+set not yet closed, with or without a project (so `keeper fingerprint` records it too).
 
 A request whose client has already closed its end (it gave up waiting behind another connection) is dropped unread,
 so a sealed evaluation is never granted to a client that is no longer there to receive the claim.
@@ -90,8 +91,10 @@ def _hello(keeper: Keeper, project: str | None, args: dict, peer: int) -> dict:
     key, env = keeper.key, keeper.environment
     reasons = rootful.owner_root_docker(keeper.owner_uid, keeper.host_view)
     root_docker = bool(reasons)
-    if project is not None and keeper.state is not None:
-        root_docker, reasons = keeper.state.root_docker_for(project, reasons)
+    if keeper.state is not None:
+        keeper.state.record_root_docker(reasons)      # a host-level fact: every open set (fix round 1, finding 1)
+        if project is not None:
+            root_docker, reasons = keeper.state.root_docker_for(project, reasons)
     return {
         "keeper_version": __version__,
         "fingerprint": signing.fingerprint(key) if key is not None else None,

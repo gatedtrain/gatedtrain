@@ -9,6 +9,7 @@ with an owner uid other than the test user's, so the separate-user texts are the
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -22,7 +23,7 @@ from _keeper import HOST_VIEW_ENV, KeeperProcess, skip_unless_linux, write_host_
 import test_an_keeper_attempts as att
 from test_an_keeper_attempts import BASE, TOY, arm, registration
 from test_an_keeper_cli import CliProject, run
-from test_an_keeper_intake import confirm_args, project_id
+from test_an_keeper_intake import confirm_args, jsonl, project_id
 
 from gatedtrain.ainative import signing
 from gatedtrain.ainative.keeper import rootful, server, texts
@@ -39,9 +40,10 @@ GID = os.getgid()
 OTHER_GID = 4242 if GID != 4242 else 4243          # a primary gid no fake group makes risky
 
 
-def status(uid: int, groups: list[int], name: str = "bash") -> str:
+def status(uid: int, groups: list[int], name: str = "bash", gids: tuple[int, int, int, int] | None = None) -> str:
+    g = gids or (OTHER_GID,) * 4
     return (f"Name:\t{name}\nUmask:\t0022\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
-            f"Gid:\t{OTHER_GID}\t{OTHER_GID}\t{OTHER_GID}\t{OTHER_GID}\nGroups:\t{' '.join(map(str, groups))}\n")
+            f"Gid:\t{g[0]}\t{g[1]}\t{g[2]}\t{g[3]}\nGroups:\t{' '.join(map(str, groups))}\n")
 
 
 def tcp_line(port: int, state: str, *, v6: bool = False) -> str:
@@ -197,6 +199,70 @@ class DetectionTest(Tree):
             gl.assert_called_with("owner", OTHER_GID)
             self.assertEqual(self.reasons(), [])                          # a fake tree never asks the name service
 
+    def test_effective_and_saved_gid(self):          # fix round 1, finding 4: `Gid:` too, not only `Groups:`
+        group = "root:x:0:\ndocker:x:998:\n"
+        for gids in ((OTHER_GID, 998, OTHER_GID, OTHER_GID), (OTHER_GID, OTHER_GID, 998, OTHER_GID)):
+            with self.subTest(gids=gids):
+                self.tree(group=group, statuses={31: status(UID, [100], name="sg", gids=gids)})
+                self.assertEqual(self.reasons(), [f"pid 31 (sg) of uid {UID} carries gid 998 (group docker)"])
+        self.tree(group=group, statuses={31: status(UID, [998], name="sg", gids=(OTHER_GID, 998, 998, 998))})
+        self.assertEqual(len(self.reasons()), 1)                         # one reason per gid
+
+    def test_socket_acl_counts(self):                   # fix round 1, finding 2
+        self.tree()
+        self.bind()
+        real = os.listxattr
+
+        def acl(path, *a, **k):
+            return ["system.posix_acl_access"] if str(path).endswith("docker.sock") else real(path, *a, **k)
+        with mock.patch.object(rootful.os, "listxattr", acl):
+            self.assertEqual(self.reasons(), ["/run/docker.sock is a rootful daemon socket with a POSIX access ACL "
+                                              "(system.posix_acl_access), which can grant other users access: "
+                                              "counted as rootful access"])
+        for code, positive in ((errno.ENOTSUP, False), (errno.ENODATA, False), (errno.EIO, True),
+                               (errno.EACCES, True)):
+            with self.subTest(errno=code), mock.patch.object(rootful.os, "listxattr",
+                                                             side_effect=OSError(code, "x")):
+                reasons = self.reasons()
+                self.assertEqual(bool(reasons), positive, reasons)
+                if positive:
+                    cls = type(OSError(code, "x")).__name__           # EACCES makes a PermissionError
+                    self.assertEqual(reasons, [f"cannot list the extended attributes of /run/docker.sock ({cls}): "
+                                               "counted as rootful access (fail closed)"])
+        with mock.patch.object(rootful.os, "listxattr", return_value=["user.x"]):
+            self.assertEqual(self.reasons(), [])
+
+    def test_lookup_errors_fail_closed(self):          # fix round 1, finding 3
+        self.tree(group="root:x:0:\n")
+        with mock.patch.object(rootful.grp, "getgrnam", side_effect=OSError(errno.EIO, "x")), \
+                mock.patch.object(rootful.os, "getgrouplist", return_value=[OTHER_GID]):
+            reasons = self.reasons(nss=True)
+        self.assertEqual(len(reasons), len(rootful.ROOT_EQUIVALENT_GROUPS), reasons)
+        self.assertEqual(reasons[0], "cannot look up group docker in the name service (OSError): counted as "
+                                     "rootful access (fail closed)")
+        with mock.patch.object(rootful.grp, "getgrnam", side_effect=KeyError("docker")), \
+                mock.patch.object(rootful.os, "getgrouplist", side_effect=OSError(errno.EIO, "x")):
+            reasons = self.reasons(nss=True)
+        self.assertEqual(reasons, [f"cannot list the groups of uid {UID} in the name service (OSError): counted "
+                                   "as rootful access (fail closed)"])
+        self.bind()
+        real = os.stat
+
+        def bad_stat(path, *a, **k):
+            if str(path).endswith("docker.sock"):
+                raise OSError(errno.EACCES, "x")
+            return real(path, *a, **k)
+        with mock.patch.object(rootful.os, "stat", bad_stat):
+            self.assertEqual(self.reasons(), ["cannot stat /run/docker.sock (PermissionError): counted as rootful "
+                                              "access (fail closed)"])
+
+        def gone(path, *a, **k):
+            if str(path).endswith("docker.sock"):
+                raise FileNotFoundError(errno.ENOENT, "x")
+            return real(path, *a, **k)
+        with mock.patch.object(rootful.os, "stat", gone):
+            self.assertEqual(self.reasons(), [])                          # vanished between glob and stat
+
     def test_reasons_hold_no_names_but_ids_and_paths(self):
         self.tree(group="root:x:0:\ndocker:x:998:owner\n", statuses={9: status(UID, [998])})
         for r in self.reasons():
@@ -327,6 +393,51 @@ class StickyTest(unittest.TestCase):
         a = self.state.evaluate(pid, reg, arm(BASE), self.candidate(r, 0))
         self.state.gate(pid, a["attempt_id"])
         self.assertEqual(self.state.sealed_summary(pid)["guarantee"], texts.KEEPER_ROOT_DOCKER_GUARANTEE)
+
+    FRESH = jsonl([{"input": f"fresh-{i}", "label": "x"} for i in range(400)])
+
+    def two_sets(self):
+        """Project p2 on toy.jsonl (set Y, registered) and project px on other data (set X, opened only)."""
+        pid_y, r_y, reg_y = self.ready_as_owner()
+        pid_x = project_id("px")
+        self.state.open_project(pid_x)
+        return pid_y, r_y, reg_y, pid_x
+
+    def test_positive_check_marks_every_open_set(self):     # fix round 1, finding 1
+        self.positive = False
+        pid_y, r_y, reg_y, pid_x = self.two_sets()
+        self.assertIsNone(self.state.root_docker_seen(r_y["sealed_id"]))
+        self.positive = True                             # an op on set X only
+        r_x = self.state.intake(pid_x, self.FRESH, sha256_bytes(self.FRESH), accept_inconclusive=True)
+        self.assertIsNotNone(self.state.root_docker_seen(r_x["sealed_id"]))
+        self.assertIsNotNone(self.state.root_docker_seen(r_y["sealed_id"]))
+        self.positive = False
+        a = self.state.evaluate(pid_y, reg_y, arm(BASE), self.candidate(r_y, 0))
+        self.state.gate(pid_y, a["attempt_id"])
+        report = signing.verify(self.state.report(pid_y)["report"], self.state.key.public_key(), kind="report")
+        self.assertEqual(report["sealed_guarantee"], texts.KEEPER_ROOT_DOCKER_GUARANTEE)
+
+    def test_hello_without_project_marks_open_sets_not_closed_ones(self):     # fix round 1, finding 1
+        self.positive = False
+        pid_y, r_y, reg_y, pid_x = self.two_sets()
+        a = self.state.evaluate(pid_y, reg_y, arm(BASE), self.candidate(r_y, 0))
+        self.state.gate(pid_y, a["attempt_id"])
+        self.state.report(pid_y)                         # closes set Y, clean
+        r_x = self.state.intake(pid_x, self.FRESH, sha256_bytes(self.FRESH), accept_inconclusive=True)
+        y_dir = self.dir / "sets" / r_y["sealed_id"].removeprefix("sha256:")
+        before = sorted(p.name for p in y_dir.iterdir())
+        hv = Path(tempfile.mkdtemp(prefix="gr-"))
+        self.addCleanup(shutil.rmtree, hv, True)
+        keeper = server.Keeper(self.dir, self.OWNER, key=self.state.key, state=self.state, host_view=HostView(
+            root=write_host_tree(hv, owner_uid=self.OWNER, group="root:x:0:\ndocker:x:998:owner\n"), root_uid=UID))
+        hello = self.handle(keeper, "hello", None)       # the path `keeper fingerprint` takes
+        self.assertIs(hello["owner_has_root_docker"], True)
+        seen = self.state.root_docker_seen(r_x["sealed_id"])
+        self.assertEqual(seen["reasons"], hello["root_docker_reasons"])
+        self.assertEqual(sorted(p.name for p in y_dir.iterdir()), before)          # a closed set is not modified
+        self.assertIsNone(self.state.root_docker_seen(r_y["sealed_id"]))
+        self.handle(keeper, "hello", None)
+        self.assertEqual(self.state.root_docker_seen(r_x["sealed_id"]), seen)       # write-once
 
     def test_failing_detector_fails_closed(self):
         self.state.root_docker = lambda: 1 / 0
