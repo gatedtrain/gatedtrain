@@ -7,6 +7,7 @@ and a host layout in a temporary directory (`GATEDTRAIN_EXT_*` and a host file).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -96,15 +97,19 @@ class _Base(unittest.TestCase):
         return LocalBackend(self.project, rt or self.rt, host=self.host, sleep=lambda s: None)
 
     def job(self, name: str = "train", **kw) -> Job:
-        out = kw.pop("output_dir", None) or str(self.backend.new_output_dir(name))
+        """A job of the stand-in adapter; without `output_dir`, the directory `new_output_dir` keeps for its key."""
+        out = kw.pop("output_dir", None)
         base = dict(label=name, adapter=standin.NAME, runtime={"kind": "container", "image": IMAGE},
                     framework={"name": standin.FRAMEWORK_PACKAGE, "version": "0.1", "commit": None},
                     argv=(standin.IMAGE_PYTHON, f"/inputs/code/{SCRIPT}", "--out", "/out"),
                     env={"HF_HUB_OFFLINE": "1", "HOME": f"/tmp/{SECRET}"},
-                    mounts=(Mount(str(self.inputs), "/inputs/code"),), output_dir=out, output_container="/out",
+                    mounts=(Mount(str(self.inputs), "/inputs/code"),), output_dir=out or "", output_container="/out",
                     tmpfs=("/tmp",))
         base.update(kw)
-        return Job(**base)
+        job = Job(**base)
+        if out is None:
+            job = dataclasses.replace(job, output_dir=str(self.backend.new_output_dir(name, key=job.key())))
+        return job
 
     def rows(self, jid: str) -> list[dict]:
         return read_jsonl(self.project.root, f"jobs/{jid}/attempts.jsonl")
@@ -247,12 +252,11 @@ class TestLifecycle(_Base):
         rt = FakeRuntime({IMAGE: _train}, outcomes=["hang"])
         job = self.job()
         jid = self.make_backend(rt).submit(job)
-        Path(job.output_dir, "a1").chmod(0o755)
-        os.chmod(self.inputs / SCRIPT, 0o644)
-        (self.inputs / ".env").write_text("x")                                 # a credential file in an input now
-        with self.assertRaises(Refused) as cm:
-            self.make_backend(rt).submit(job)
-        self.assertEqual(cm.exception.problems[0].rule, "AN-22")
+        names = ("HF_HUB_OFFLINE",)                                            # the adapter no longer allows HOME
+        with mock.patch.dict(registry.TRAINER_ROWS[standin.NAME], {"env_names": names, "env_paths": ()}):
+            with self.assertRaises(Refused) as cm:
+                self.make_backend(rt).submit(job)
+        self.assertEqual([(p.rule, p.field) for p in cm.exception.problems], [("AN-22", "job.env.HOME")])
         self.assertEqual(len(rt.runs), 1)
         self.assertEqual(self.make_backend(rt).status(jid).state, "running")
 
@@ -373,6 +377,135 @@ class TestLifecycle(_Base):
         self.assertEqual(b.jobs()[0].state, "queued")
         self.assertEqual(b.wait("0001-train").state, "succeeded")              # the next poll starts it
 
+    def _gap(self, action) -> LocalBackend:
+        """A backend that runs `action` after the job's record is written and before it takes the job's lock to
+        start it (the gap between the project lock and the job lock)."""
+        outer = self
+
+        class Gap(LocalBackend):
+            pending = True
+
+            @contextlib.contextmanager
+            def _lock(self, rel):
+                if self.pending and rel.endswith("/lock") and rel != "jobs/lock":
+                    self.pending = False
+                    action()
+                with LocalBackend._lock(self, rel):
+                    yield
+        return Gap(outer.project, outer.rt_gap, host=outer.host, sleep=lambda s: None)
+
+    def test_start_race_second_driver(self) -> None:
+        """Review round 1: another driver reattaches and starts attempt 1 in the gap; no second container."""
+        self.rt_gap = FakeRuntime({IMAGE: _train}, outcomes=["hang", "hang"])
+        job = self.job()
+        other = self.make_backend(self.rt_gap)
+
+        def race():
+            self.assertEqual(other.submit(job), "0001-train")
+            self.assertEqual(other.status("0001-train").state, "running")
+        jid = self._gap(race).submit(job)
+        self.assertEqual(len(self.rt_gap.runs), 1)
+        self.assertEqual(self.events(jid), ["start"])
+
+    def test_start_race_cancel(self) -> None:
+        """Review round 1: a cancel in the gap; the job never starts."""
+        self.rt_gap = FakeRuntime({IMAGE: _train})
+        other = self.make_backend(self.rt_gap)
+        jid = self._gap(lambda: other.cancel("0001-train")).submit(self.job())
+        self.assertEqual(self.rt_gap.runs, [])
+        self.assertEqual(self.events(jid), ["cancel_requested"])
+        self.assertEqual(other.status(jid).state, "cancelled")
+
+    def test_changed_inputs_new_key_and_output(self) -> None:
+        """Review round 1: a changed script, small input or large input is another job with a fresh output
+        directory; unchanged inputs (a small file rewritten with the same bytes included) reattach."""
+        (self.inputs / "table.json").write_text('{"a": 1}')
+        big = self.inputs / "big.bin"
+        big.write_bytes(b"\0" * (be.SMALL_FILE_BYTES + 1))
+        first = self.job()
+        jid = self.backend.submit(first)
+        self.assertEqual(self.backend.wait(jid).state, "succeeded")
+        (self.inputs / "table.json").write_text('{"a": 1}')                    # same bytes, new mtime
+        self.assertEqual(self.job(), first)
+        self.assertEqual(self.backend.submit(self.job()), jid)
+        st = big.stat()
+        changes = {"script": lambda: (self.inputs / SCRIPT).write_text("print('train v2')\n"),
+                   "small input": lambda: (self.inputs / "table.json").write_text('{"a": 2}'),
+                   "large input": lambda: os.utime(big, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))}
+        seen_keys, seen_dirs = {first.key()}, {first.output_dir}
+        for what, change in changes.items():
+            with self.subTest(what):
+                change()
+                job = self.job()
+                self.assertNotIn(job.key(), seen_keys)
+                self.assertNotIn(job.output_dir, seen_dirs)
+                seen_keys.add(job.key())
+                seen_dirs.add(job.output_dir)
+                self.assertNotEqual(self.backend.submit(job), jid)
+        self.assertEqual(len(self.rt.runs), 4)
+        self.assertEqual(sorted(Path(d).name for d in seen_dirs), ["train", "train.2", "train.3", "train.4"])
+
+    def test_large_script_hashed_by_content(self) -> None:
+        """The script argv names is hashed whole, even past SMALL_FILE_BYTES with its size and mtime restored."""
+        script = self.inputs / SCRIPT
+        script.write_text("#" * be.SMALL_FILE_BYTES + "\nprint(1)\n")
+        st = script.stat()
+        key = self.job().key()
+        script.write_text("#" * be.SMALL_FILE_BYTES + "\nprint(2)\n")
+        os.utime(script, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertNotEqual(self.job().key(), key)
+
+    def test_fingerprint_bounded_and_no_links_followed(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "f").write_text("1")
+        os.symlink(outside, self.inputs / "link")
+        key = self.job().key()
+        (outside / "f").write_text("2")                                         # behind a link: not read
+        self.assertEqual(self.job().key(), key)
+        with mock.patch.object(be, "MAX_INPUT_ENTRIES", 2), self.assertRaises(Refused) as cm:
+            self.job().key()
+        self.assertEqual((cm.exception.problems[0].rule, cm.exception.problems[0].field), ("AN-22", "job.mounts"))
+
+    def test_reattach_refuses_tampered_record(self) -> None:
+        rt = FakeRuntime({IMAGE: _train}, outcomes=["hang"])
+        job = self.job()
+        jid = self.make_backend(rt).submit(job)
+        path = self.project.root / "jobs" / jid / "job.json"
+        good = path.read_bytes()
+        rec = json.loads(good)
+        rec["job"]["time_limit_s"] = 1
+        path.write_text(json.dumps(rec))
+        with self.assertRaises(Refused) as cm:
+            self.make_backend(rt).submit(job)
+        self.assertEqual([p.field for p in cm.exception.problems], [f"jobs/{jid}/job.json"])
+        path.write_bytes(good)
+        cases = {"host_config_sha256": dataclasses.replace(self.host, extra_daemon_configs=(str(self.tmp / "d.json"),)),
+                 "rootless": dataclasses.replace(self.host, rootless=False)}
+        for k, host in cases.items():
+            with self.subTest(k), self.assertRaises(Refused) as cm:
+                LocalBackend(self.project, rt, host=host).submit(job)
+            self.assertIn(f"jobs/{jid}/job.json.{k}", [p.field for p in cm.exception.problems])
+        self.assertEqual(self.make_backend(rt).submit(job), jid)
+        self.assertEqual(len(rt.runs), 1)
+
+    def test_failed_start_adopts_container_that_ran(self) -> None:
+        class RanThenFails(FakeRuntime):
+            def run(self, spec):
+                super().run(spec)
+                raise RuntimeFailure("run", -1)                                # the CLI timed out after the start
+        rt = RanThenFails({IMAGE: _train})
+        b = self.make_backend(rt)
+        jid = b.submit(self.job())
+        self.assertEqual(b.wait(jid).state, "succeeded")
+        self.assertEqual((len(rt.runs), self.events(jid)), (1, ["start", "end"]))
+
+    def test_jobs_skips_directory_without_record(self) -> None:
+        jid = self.backend.submit(self.job())
+        (self.project.root / "jobs" / "0002-cut").mkdir()
+        self.assertEqual([s.job_id for s in self.backend.jobs()], [jid])
+        self.assertEqual(self.backend.submit(self.job("next")), "0003-next")
+
     def test_jobs_reads_records_only(self) -> None:
         jid = self.backend.submit(self.job())
 
@@ -455,6 +588,14 @@ class TestOutputs(_Base):
         self.assertEqual(oct(d.stat().st_mode & 0o777), oct(0o755))
         self.assertEqual(oct(d.parent.stat().st_mode & 0o777), oct(0o755))
         self.assertEqual(self.make_backend().new_output_dir("x"), d)           # the same project: returned again
+        k1, k2 = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+        self.assertEqual(self.backend.new_output_dir("x", key=k1), d.parent / "x.2")   # "x" is taken (no key)
+        self.assertEqual(self.backend.new_output_dir("x", key=k2), d.parent / "x.3")
+        self.assertEqual(self.make_backend().new_output_dir("x", key=k1), d.parent / "x.2")
+        with self.assertRaises(Refused):
+            self.backend.new_output_dir("x.2")                                 # a job's directory, not a keyless one
+        with self.assertRaises(Refused):
+            self.backend.new_output_dir("y", key="sha256:short")
         (d.parent / "foreign").mkdir()
         os.symlink(d, d.parent / "link")
         for name in ("foreign", "link", "../x", "", ".", "a/b"):

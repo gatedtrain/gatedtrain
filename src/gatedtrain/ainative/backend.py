@@ -68,6 +68,8 @@ LOCK, JOB_FILE, ATTEMPTS, OUTPUT_DIRS = "lock", "job.json", "attempts.jsonl", "o
 DIR_MODE = 0o755
 LABEL_PROJECT, LABEL_JOB = "gatedtrain.project", "gatedtrain.job"
 FIX = "fix the job and submit it again"
+MAX_INPUT_ENTRIES = 100_000             # a read-only mount the job key fingerprints holds at most this many entries
+SMALL_FILE_BYTES = 1 << 20              # inputs up to this size are fingerprinted by content, larger ones by mtime
 
 
 def _problem(field: str, message: str, fix: str = FIX) -> Problem:
@@ -130,7 +132,79 @@ class Job:
                 "max_attempts": self.max_attempts}
 
     def key(self) -> str:
-        return sha256_bytes(canonical_json(self.doc()))
+        """`sha256:` of the canonical JSON of the job without its output directory, the fingerprint of its read-only
+        inputs (`input_fingerprint`) and the hashes of the files `argv[0:3]` name in them (interpreter, script): a job
+        whose inputs changed has another key, so it neither reattaches nor gets the old output directory. Reads the
+        inputs; Refused (AN-22) for a mount over MAX_INPUT_ENTRIES entries."""
+        doc = self.doc()
+        del doc["output_dir"]
+        return sha256_bytes(canonical_json({"job": doc, "inputs": input_fingerprint(self.mounts),
+                                            "argv_files": _argv_file_hashes(self.argv, self.mounts)}))
+
+
+def _text(name: str) -> str:
+    """A file name as canonical JSON text (bytes that are not UTF-8 escaped, never refused)."""
+    return os.fsencode(name).decode("utf-8", "backslashreplace")
+
+
+def input_fingerprint(mounts: tuple[Mount, ...]) -> list[dict[str, Any]]:
+    """Per read-only mount, its entries in sorted relative path order, never following a link (`lstat`): a directory,
+    a link with its target, a regular file with its size and sha256 (at most SMALL_FILE_BYTES) or size and mtime_ns
+    (larger), anything else as its kind. Refused (AN-22) past MAX_INPUT_ENTRIES entries in all."""
+    out: list[dict[str, Any]] = []
+    count = 0
+    for m in mounts:
+        if not m.read_only:
+            continue
+        entries: list[list[Any]] = []
+        stack = [(os.path.realpath(m.host), "")]
+        while stack:
+            path, rel = stack.pop()
+            count += 1
+            if count > MAX_INPUT_ENTRIES:
+                raise Refused([_problem(f"job.mounts", f"the read-only inputs hold more than {MAX_INPUT_ENTRIES} "
+                                        "entries; the job key fingerprints every input",
+                                        "mount fewer, larger inputs (an archive, a dataset file)")])
+            try:
+                st = os.lstat(path)
+            except OSError:
+                entries.append([rel, "missing"])
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                entries.append([rel, "link", _text(os.readlink(path))])
+            elif stat.S_ISDIR(st.st_mode):
+                entries.append([rel, "dir"])
+                try:
+                    names = sorted(os.listdir(path), reverse=True)
+                except OSError:
+                    entries.append([rel, "unreadable"])
+                    continue
+                stack += [(os.path.join(path, n), f"{rel}/{_text(n)}" if rel else _text(n)) for n in names]
+            elif stat.S_ISREG(st.st_mode):
+                if st.st_size <= SMALL_FILE_BYTES:
+                    try:
+                        entries.append([rel, "file", st.st_size, _sha256_nofollow(path)])
+                    except OSError:
+                        entries.append([rel, "unreadable"])
+                else:
+                    entries.append([rel, "file", st.st_size, str(st.st_mtime_ns)])   # beyond 2^53: text
+            else:
+                entries.append([rel, "other"])
+        out.append({"container": m.container, "entries": sorted(entries, key=lambda e: e[0])})
+    return out
+
+
+def _argv_file_hashes(argv: tuple[str, ...], mounts: tuple[Mount, ...]) -> list[str | None]:
+    """The sha256 of the file each of argv[0:3] names in a read-only mount (as the container resolves it), else None."""
+    table = [{"host": m.host, "container": m.container, "mode": "ro"} for m in mounts if m.read_only]
+    out: list[str | None] = []
+    for a in list(argv)[:3]:
+        hit = launch.container_file(a, table) if isinstance(a, str) else None
+        try:
+            out.append(file_sha256(Path(hit[1])) if hit else None)
+        except OSError:
+            out.append(None)
+    return out
 
 
 def _record_doc(job: Job) -> dict[str, Any]:
@@ -542,7 +616,9 @@ class LocalBackend:
             job_id = self._new_job(job, cfg, key, stage)
         self._jobs[job_id] = job
         with self._lock(self._rel(job_id, LOCK)):
-            self._start(job_id, self._record(job_id), job, 1, checked=True)
+            # Re-read under the job's lock: another driver may have reattached and started attempt 1, or a cancel may
+            # have come, between the record and this lock (review finding, round 1).
+            self._advance(job_id, self._record(job_id))
         return job_id
 
     def _new_job(self, job: Job, cfg: HostConfig, key: str, stage: str) -> str:
@@ -551,18 +627,21 @@ class LocalBackend:
         job_id = f"{seq:04d}-{job.label}"
         jdir = self.project.root / JOBS_DIR / job_id
         os.mkdir(jdir, DIR_MODE)
-        out_dir = os.path.join(job.output_dir, "a1")
-        self._fresh_attempt_dir(out_dir, cfg)
         binding, _ = launch.bind_argv(list(job.argv), job_request(job, cfg)["mounts"], interpreter=cfg.interpreter,
                                       trees=cfg.interpreter_trees, image_interpreters=cfg.image_interpreters,
                                       interpreter_flags=cfg.interpreter_flags)
-        spec = self._spec(job, cfg, job_id, 1, out_dir)
+        # The record is written before `a1` exists (the start creates it), so a crash leaves a queued job, never an
+        # output directory without a record; the recorded `-v` names `a1` under the output's resolved path.
+        spec = self._spec(job, cfg, job_id, 1, job.output_dir)
+        real_out = launch.mount_source(job.output_dir)
+        argv = [f"{real_out}/a1{t[len(real_out):]}" if t == f"{real_out}:{job.output_container}:rw" else t
+                for t in docker_run_argv(spec, context=launch.DOCKER_CONTEXT)]
         rec = {"schema": JOB_SCHEMA, "schema_version": SCHEMA_VERSION, "job_id": job_id, "key": key, "stage": stage,
                "job": _record_doc(job), "rootless": cfg.rootless, "host_config_sha256": launch.host_config_sha256(cfg),
                "script_sha256": file_sha256(Path(binding.script_host)),
                "interpreter_sha256": (file_sha256(Path(binding.interpreter_host))
                                       if binding.interpreter_host is not None else None),
-               "docker_argv": _record_argv(docker_run_argv(spec, context=launch.DOCKER_CONTEXT)),
+               "docker_argv": _record_argv(argv),
                "utc": self._utc()}
         rel = self._rel(job_id, JOB_FILE)
         _refuse_links(self.project.root, rel)
@@ -575,7 +654,7 @@ class LocalBackend:
                checked: bool = False) -> None:
         """Start attempt `attempt` under the job's lock. A container of that attempt the daemon already holds (a
         start whose `start` row a crash cut off) is adopted when it is running or exited, and removed when it was only
-        created; a container a failed start left behind is removed (or adopted when it runs after all)."""
+        created; after a failed start, a container left only created is removed, one that ran is adopted."""
         if job is None or job.key() != rec["key"]:
             raise Refused([_problem("job_id", f"job {job_id} has an attempt due, and its environment values are "
                                     "never recorded", "submit the job again (the same job reattaches) and poll it")])
@@ -597,10 +676,10 @@ class LocalBackend:
         except RuntimeFailure:
             with contextlib.suppress(RuntimeFailure):
                 left = self.runtime.inspect(name)
-                if left.status == "running":                        # started after all (a CLI timeout)
+                if left.status in ("running", "exited"):            # it ran after all (a CLI timeout): adopt
                     self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir)
                     return
-                if left.status != "missing":
+                if left.status == "created":
                     self.runtime.remove(name)
             raise
         self._append(job_id, "start", attempt=attempt, container=cid, name=name, output=out_dir)
@@ -695,18 +774,27 @@ class LocalBackend:
         """Every job's state from its records alone (no runtime)."""
         out = []
         for job_id in self._job_ids():
+            if not (self.project.root / JOBS_DIR / job_id / JOB_FILE).exists():
+                continue                                        # a submit cut short before its record
             rec = self._record(job_id)
             out.append(self._view(job_id, rec).status)
         return out
 
     # -- outputs -----------------------------------------------------------------------------------------------------
 
-    def new_output_dir(self, name: str) -> Path:
-        """`<output_root>/gatedtrain-<project id prefix>/<name>` (owner, 0755): created, or returned again when it is
-        a plain owner directory this project created (pre-flight finding 1); otherwise refused."""
+    def new_output_dir(self, name: str, *, key: str | None = None) -> Path:
+        """`<output_root>/gatedtrain-<project id prefix>/<name>` (owner, 0755).
+
+        Without `key` (a job's inputs directory, which the stage rewrites): created, or returned again when it is a
+        plain owner directory this project created. With `key` (`Job.key()` of the job the directory is the output
+        of; review round 1): the directory recorded for this name and key is returned again, so a stage re-run of the
+        same job reattaches; a job with another key gets a fresh directory, `<name>` when free, else `<name>.<n>`.
+        Anything else is refused (pre-flight finding 1)."""
         if not (isinstance(name, str) and NAME_RE.fullmatch(name)):
             raise Refused([_problem("name", f"{name!r} is not a plain name (letters, digits, _ . -; first a letter or "
                                     "digit; at most 100 characters)", "pass a plain directory name")])
+        if key is not None and not (isinstance(key, str) and launch.SHA_RE.fullmatch(key)):
+            raise Refused([_problem("key", f"{key!r} is not a job key (sha256:<64 hex>)", "pass Job.key()")])
         cfg = self.host()
         uid = launch.owner_uid(cfg)
         root = cfg.output_root
@@ -714,31 +802,49 @@ class LocalBackend:
             raise Refused([_problem("output_root", f"the output root {root} is not a directory",
                                     "create it, or set `output_root` in the host file")])
         base = os.path.join(root, f"gatedtrain-{self.project_hex()[:12]}")
-        target = os.path.join(base, name)
         self._jobs_dir()
         rel = self._rel(OUTPUT_DIRS)
+
+        def plain(path: str) -> bool:
+            st = os.lstat(path)
+            return stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+
+        def create(path: str) -> Path:
+            os.mkdir(path, DIR_MODE)
+            os.chmod(path, DIR_MODE)
+            append_jsonl(self.project.root, rel, {"schema": OUTPUT_DIR_SCHEMA, "schema_version": SCHEMA_VERSION,
+                                                  "name": name, "key": key, "path": path, "utc": self._utc()})
+            return Path(path)
+
         with self._lock(self._rel(LOCK)):
-            try:
+            with contextlib.suppress(FileExistsError):
                 os.mkdir(base, DIR_MODE)
                 os.chmod(base, DIR_MODE)
-            except FileExistsError:
-                pass
-            st = os.lstat(base)
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            if not plain(base) or os.path.islink(base):
                 raise Refused([_problem("output_root", f"{base} is not a directory of the owner (uid {uid})",
                                         "remove it; the backend creates it")])
-            mine = any(r.get("path") == target for r in read_jsonl(self.project.root, rel))
-            try:
-                st = os.lstat(target)
-            except FileNotFoundError:
-                os.mkdir(target, DIR_MODE)
-                os.chmod(target, DIR_MODE)
-                append_jsonl(self.project.root, rel, {"schema": OUTPUT_DIR_SCHEMA, "schema_version": SCHEMA_VERSION,
-                                                      "name": name, "path": target, "utc": self._utc()})
-                return Path(target)
-            if not (mine and stat.S_ISDIR(st.st_mode) and st.st_uid == uid):
+            rows = read_jsonl(self.project.root, rel)
+            if key is not None:
+                for r in rows:
+                    if r.get("name") == name and r.get("key") == key:
+                        path = r.get("path")
+                        if not (isinstance(path, str) and os.path.lexists(path) and plain(path)):
+                            raise Refused([_problem("name", f"the output directory {path} of this job is gone or "
+                                                    "not a plain directory of the owner", "restore or remove it")])
+                        return Path(path)
+                n = 1
+                while True:
+                    path = os.path.join(base, name if n == 1 else f"{name}.{n}")
+                    if not os.path.lexists(path):
+                        return create(path)
+                    n += 1
+            target = os.path.join(base, name)
+            if not os.path.lexists(target):
+                return create(target)
+            mine = any(r.get("path") == target and r.get("key") is None for r in rows)
+            if not (mine and plain(target)):
                 raise Refused([_problem("name", f"{target} exists and is not a plain directory of the owner that "
-                                        "this project created", "pick another name")])
+                                        "this project created for no job", "pick another name")])
             return Path(target)
 
     def _succeeded_dir(self, job_id: str, op: str) -> str:
