@@ -158,7 +158,9 @@ rootless daemon, without `gpu-step.sh` and without `gpu-guard.log`. It appends i
   the row comes with a new header, so it is the last row `launch.gpu_used_h` reads;
 - an existing log that does not parse is refused (AN-23) and never reset: before a new job is recorded, so a job's
   end never fails on it after GPU time was spent; fix the log by hand;
-- a job whose terminal state was recorded but whose row a crash cut off gets its row at a later `status` of the job.
+- after the append the job records a `gpu_log_written` row in its own `attempts.jsonl`; a job with that row never
+  opens the log again (job ids repeat across projects, and the log may since have been archived or edited), and a job
+  whose terminal state was recorded without it (a crash cut the row off) gets its row at a later `status` of the job.
 
 The row of a backend GPU job raises the running total, so a launch record `ext-launch` wrote before it fails
 `ext-launch --recheck` (EXT-82); launch again once the backend's GPU jobs have ended.
