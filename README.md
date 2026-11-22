@@ -6,6 +6,29 @@ to find which checkpoints may have consumed a training shard, for example after 
 
 This is a prototype. Outputs carry the tags `prototype` and `unpromotable`.
 
+## Changes since 0.4.0 (unreleased)
+
+AI-native step 3a, a preview on Linux (see "Rootless containers, the local backend and the keeper's container (step
+3a)" below):
+
+- Rootless host setup: `gatedtrain setup host` prints one root script that sets up a rootless Docker daemon for the
+  owner and one for the keeper user and removes the owner from the rootful `docker` group. gatedtrain never runs it.
+- The local job backend: pack stages run their jobs in containers on the owner's rootless daemon (`ctx.backend`),
+  with GPU accounting against the project's budget and a row per job in the host's GPU log; `gatedtrain project job
+  list | logs | cancel` show and stop them.
+- The keeper's container: `keeper serve --inference-image ...` runs a scenario pack's batch generator in a container
+  of the keeper's own rootless daemon, on a copy of the model files the keeper hashed.
+
+Behaviour that changes for 0.4.0 users:
+
+- `verify` exits 1 for a report signed by a 0.4.0 keeper: that report states the 0.4.0 guarantee, which was stated
+  before rootful Docker access was checked. It also exits 1 against a 0.4.0 keeper (its `hello` does not state
+  `owner_has_root_docker`), and for a report of a keeper that runs as the owner's own user (a test or development
+  setup; before, only `--keeper` against such a keeper exited 1). `verify` exits 0 only when every report states the
+  separate-user guarantee.
+- Upgrade the keeper's environment (the venv `setup keeper` installed) together with the driver: the driver now sends
+  the project with `hello`, and a 0.4.0 keeper states no rootful-access check.
+
 ## Changes in 0.4.0
 
 The analysis code version stays `gatedtrain 0.3.0`. A registration records `analysis_code_version` and is refused
@@ -201,7 +224,8 @@ serves, and that the project holds every record the keeper signed for it; `--fin
 fingerprint held out of band, offline, and cannot detect a deleted record (it says so). It exits 0 when every record
 checks, 3 on a bad signature, an edited record, a replaced `trust/keeper.pub` or another fingerprint (AN-14), and 1
 without either anchor or against a keeper that runs as the owner's own uid (consistency only: the owner can read that
-keeper's key). The driver keeps every envelope the keeper signed for the project: after each `evaluate_sealed`, `gate`
+keeper's key), and also, under any anchor, when a report states any guarantee but the separate-user one above (the
+same-user text, the downgraded text of the rootful-access check below, or the 0.4.0 text), with a warning naming it. The driver keeps every envelope the keeper signed for the project: after each `evaluate_sealed`, `gate`
 and `report`, and on `project report`, it fetches the keeper's list and adds what it lacks (for example the claim of an
 evaluation it stopped waiting for), each verified first. A record the keeper signed that the project still lacks fails
 `verify --keeper` with exit 3.
@@ -221,7 +245,8 @@ gatedtrain project job list ./proj                # also: job logs ./proj JOB_ID
 
 **Host.** `setup host` prints one bash script for root. All its checks come before its first change: it runs as root,
 the owner has the uid it was printed for, an NVIDIA CDI specification of `nvidia.com/gpu` exists in `/etc/cdi` or
-`/var/run/cdi`, `slirp4netns` or `pasta` is installed, and the parents of the directories it creates are root-owned and
+`/var/run/cdi`, `slirp4netns` or `pasta` is installed, no subordinate id range of the owner or the keeper user
+covers the other's uid or gid, and the parents of the directories it creates are root-owned and
 not writable by others. It then installs `uidmap` and `docker-ce-rootless-extras` at the installed `docker-ce`
 version, adds the AppArmor profile rootlesskit needs on Ubuntu 24.04, creates the keeper user (as `setup keeper`) and
 the subordinate id ranges, removes the owner from the `docker` group before any of the owner's user services start
@@ -232,7 +257,9 @@ directory `/srv/gatedtrain/out` (the owner's, mode 0755). With `--inference-imag
 and a drop-in of the keeper's systemd unit starts `keeper serve` with its image ID; with `--eval-requirements`
 (hash-pinned, binary wheels only) the script builds a root-owned eval environment (`/opt/gatedtrain-keeper/eval-venv`)
 from an interpreter under `/opt/gatedtrain-keeper/python`, mounted read-only into the keeper's containers. A login
-session keeps the `docker` group until it ends, so log out everywhere afterwards. Then set in the host file (see
+session keeps the `docker` group until it ends, so log out everywhere afterwards; when the owner's user manager
+was already running (the script warns), restart it once those sessions have ended (`sudo systemctl restart
+user@<uid>.service`, or reboot), since the owner's rootless daemon started under it with the group. Then set in the host file (see
 "Configuration"):
 
 ```toml
@@ -258,7 +285,7 @@ stage run again with unchanged inputs gets the same job, so after the driver die
 on the way), the `files` of a model reference.
 
 **The keeper's container.** `keeper serve --inference-image sha256:<64 hex> [--eval-tree DIR ...] [--docker-host
-URL]` runs a scenario pack's batch generator in a container of the keeper's own rootless daemon, one container per arm
+URL] [--docker PATH] [--nvidia-smi PATH]` runs a scenario pack's batch generator in a container of the keeper's own rootless daemon, one container per arm
 for all registered seeds, with `--user 0:0 --cap-drop ALL --security-opt no-new-privileges --read-only --network none
 --log-driver none` and Docker's default seccomp profile. Before any alpha is spent the keeper copies the model files a
 reference lists into its own state and checks their hashes; the container gets only that copy, read-only at
@@ -268,17 +295,18 @@ block states the keeper's containers and their seconds from the keeper's signed 
 the driver sends with the report request, marked "the driver's job records (cooperative, not checked by the
 keeper)".
 
-**Rootful access.** At every request the keeper checks whether the owner's account can reach a rootful Docker or
-containerd daemon: membership of `docker`, `lxd`, `incus-admin` or `disk` or of a rootful socket's group, a process of
+**Rootful access.** At every `hello`, intake, sealed summary, evaluate, gate and report request the keeper checks
+whether the owner's account can reach a rootful Docker or containerd daemon: membership of `docker`, `lxd`, `incus-admin` or `disk` or of a rootful socket's group, a process of
 an old session that still carries such a group, a rootful socket writable by everyone or carrying an access control
-list, a listener on TCP port 2375 or 2376. A check it cannot complete counts as positive. `keeper fingerprint` shows
+list, a listener on TCP port 2375 or 2376. A check it cannot complete counts as positive, and so does a process
+table it cannot fully see (`/proc` mounted with `hidepid`, or no PID 1 and no process of another user). `keeper fingerprint` shows
 `owner_has_root_docker` and the reasons. While the check is positive, and for good on every sealed set in use at a
 positive check, a separate-user keeper states instead: "the keeper runs as a separate OS user, but the user's account
 can reach a rootful Docker or containerd daemon or holds a root-equivalent group (docker, lxd, incus-admin or disk), or
 did at a check while this sealed set was in use, and through that can read the keeper's state and signing key: the
 records are signed, but nothing is sealed from the user's account; remove the user from those groups, end the sessions
 that still carry them, and take in new data". `verify` exits 1 against a keeper whose `hello` says
-`owner_has_root_docker`, and on a report that states this text.
+`owner_has_root_docker`, and on a report that states any text but the separate-user guarantee.
 
 **What is cooperative.** The job records, the GPU budget, the GPU log and the `ctx.backend` rules (a GPU job only from
 a stage that declares `needs: gpu`, no job and no output directory from `plan`) hold for drivers and stages that use
