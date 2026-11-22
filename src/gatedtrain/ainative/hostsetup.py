@@ -5,20 +5,20 @@ check comes before the first change (the script first moves to `/`, so no progra
 directory): the script runs as root, the owner has the uid it was printed for, an NVIDIA CDI spec (`nvidia.com/gpu`)
 exists in `CDI_SPEC_DIRS`, `slirp4netns` or `pasta` is installed, the eval interpreter tree (with `--eval-requirements`)
 is root-owned and not group- or other-writable, no subordinate id range of the owner or an existing keeper user covers
-the other's uid or gid (checked again once the keeper user exists), and the parents of the directories it creates are
-root-owned and not group- or other-writable. Then, in order: `apt-get update` and `uidmap`; `docker-ce-rootless-extras`
-at the installed `docker-ce` version unless it is there already (unheld and held again when it was held; the rootful
-daemon is not restarted); the AppArmor profile Ubuntu 24.04 requires for rootlesskit (only when no profile names
-`/usr/bin/rootlesskit`); the keeper user when missing (as `setup keeper` creates it) and its home; the data roots and
-the hand-off directory; a subuid/subgid range for each user that has none; the owner leaves the rootful `docker` group,
-before any user manager or rootless daemon of the owner starts, since `runuser` and the user manager take the owner's
-groups when they start (a user manager of the owner that already runs keeps the group: the script warns and the closing
-comments say to restart it once the owner's sessions end); lingering; for each user a rootless daemon with its own data
-root and Docker's native CDI; the owner's context `gatedtrain`; with `--eval-requirements` the keeper's root-owned eval
-venv from the hash-pinned requirements (`python -I`, `pip --isolated --only-binary :all:`); with `--inference-image` the
-keeper's daemon pulls the image and a drop-in of the keeper's unit passes its ID and the eval trees to `keeper serve`
-(the serve command comes from `setup.serve_argv`, the builder of the unit's own `ExecStart=`), ordered after the
-keeper's user manager; without it an earlier inference drop-in is removed.
+the other's uid or gid (checked again once the keeper user exists and once the ranges are allocated), and the parents of
+the directories it creates are root-owned and not group- or other-writable. Then, in order: `apt-get update` and
+`uidmap`; `docker-ce-rootless-extras` at the installed `docker-ce` version unless it is there already (unheld and held
+again when it was held; the rootful daemon is not restarted); the AppArmor profile Ubuntu 24.04 requires for rootlesskit
+(only when no profile names `/usr/bin/rootlesskit`); the keeper user when missing (as `setup keeper` creates it) and its
+home; the data roots and the hand-off directory; a subuid/subgid range for each user that has none; the owner leaves the
+rootful `docker` group, before any user manager or rootless daemon of the owner starts, since `runuser` and the user
+manager take the owner's groups when they start (a user manager of the owner that already runs keeps the group: the
+script warns and the closing comments say to restart it once the owner's sessions end); lingering; for each user a
+rootless daemon with its own data root and Docker's native CDI; the owner's context `gatedtrain`; with
+`--eval-requirements` the keeper's root-owned eval venv from the hash-pinned requirements (`python -I`, `pip --isolated
+--only-binary :all:`); with `--inference-image` the keeper's daemon pulls the image and a drop-in of the keeper's unit
+passes its ID and the eval trees to `keeper serve` (the serve command comes from `setup.serve_argv`, the builder of the
+unit's own `ExecStart=`), ordered after the keeper's user manager; without it an earlier inference drop-in is removed.
 
 Nothing here starts a process or writes a file; values are printed shell-quoted, and a path is refused unless it is
 made of letters, digits, `/`, `.`, `_`, `-`, `+` and `@` (so it reads the same in a unit and in an unquoted heredoc).
@@ -328,6 +328,8 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         '  grep -qE "^($u|$n):" /etc/subuid 2>/dev/null || usermod --add-subuids "$start-$end" "$u"',
         '  grep -qE "^($u|$n):" /etc/subgid 2>/dev/null || usermod --add-subgids "$start-$end" "$u"',
         "done",
+        "# the ranges as they are now, before any rootless daemon uses them",
+        "check_subids after-allocation",
         "# the owner leaves the rootful docker group before any user manager or rootless daemon of the owner starts:",
         "# runuser and the user manager take the owner's groups when they start",
     ]
