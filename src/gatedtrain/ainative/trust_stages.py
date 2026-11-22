@@ -47,6 +47,7 @@ from ..canonical import sha256_bytes
 from ..errors import Problem, Refused
 from ..registration import check_contents, resolved_evaluator_hash
 from . import alpha_investing, scorers, sealed_eval, signing
+from .batch import BatchGenerator
 from .keeper import texts as keeper_texts
 from .project import ArtifactRef, Project, _refuse_links, _utc_now, _write_atomic
 from .stage import Proposal, StageContext
@@ -530,8 +531,10 @@ class Preregister:
 # The generation functions of the scenario packs, by the name a model reference gives in `generator`. A scenario pack
 # is a plugin of the entry point group `gatedtrain.scenarios`: the loaded object carries `generators`, a mapping of
 # name -> `generate(model_ref, item, *, sampler, seed) -> prediction`; `item` is `{"input": ...}` only, the label
-# stays with the scorer. There is no run-time registration: a stage cannot add or replace a generator, only the
-# installed distributions can.
+# stays with the scorer. A pack may also carry `batch_generators`, a mapping of name -> `BatchGenerator` (AN-25): a
+# declaration the keeper runs in its inference container, never in process. A name is a per-item or a batch generator
+# of one pack. There is no run-time registration: a stage cannot add or replace a generator, only the installed
+# distributions can.
 SCENARIO_ENTRY_POINT_GROUP = "gatedtrain.scenarios"
 
 
@@ -543,7 +546,7 @@ def _scenario_entry_points() -> list[Any]:
 # (this snapshot, `_scenario_entry_points`, the scorers). What is closed here is the ordinary path: a pack's own
 # mutable `generators` dict is copied once and never re-read. Enforcement against hostile in-process code comes with
 # the step-2 keeper, which runs the sealed evaluation outside the stages' process.
-_SCENARIO_SNAPSHOT: tuple[MappingProxyType, MappingProxyType, MappingProxyType] | None = None
+_SCENARIO_SNAPSHOT: tuple[MappingProxyType, MappingProxyType, MappingProxyType, MappingProxyType] | None = None
 
 
 def _reset_scenario_snapshot() -> None:
@@ -552,17 +555,21 @@ def _reset_scenario_snapshot() -> None:
     _SCENARIO_SNAPSHOT = None
 
 
-def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType, MappingProxyType]:
-    """(generator name -> function, generator name -> pack name, scorer name -> (pack name, declaration)) of every
-    installed scenario pack, loaded once per process and frozen. A pack that fails to load, has no `generators`
-    mapping of callables or reuses a generator name is refused (`AN-8`) without echoing its message; a pack whose
-    `scorers` is not a mapping of name to declaration, or that reuses another pack's scorer name, is refused
-    (`AN-17`). The declarations themselves are checked by `scorers.resolve`."""
+def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType, MappingProxyType, MappingProxyType]:
+    """(generator name -> function, generator name -> pack name, scorer name -> (pack name, declaration), batch
+    generator name -> `BatchGenerator`) of every installed scenario pack, loaded once per process and frozen; the
+    pack names cover per-item and batch generators alike. A pack that fails to load, has no `generators` mapping of
+    callables or reuses a generator name is refused (`AN-8`) without echoing its message; a pack whose
+    `batch_generators` is not a mapping of name to `BatchGenerator`, or a name that is both a per-item and a batch
+    generator or a batch generator of two packs, is refused (`AN-25`); a pack whose `scorers` is not a mapping of
+    name to declaration, or that reuses another pack's scorer name, is refused (`AN-17`). The declarations
+    themselves are checked by `scorers.resolve`."""
     global _SCENARIO_SNAPSHOT
     if _SCENARIO_SNAPSHOT is not None:
         return _SCENARIO_SNAPSHOT
     fns: dict[str, Callable[..., Any]] = {}
     packs: dict[str, str] = {}
+    batches: dict[str, BatchGenerator] = {}
     pack_scorers: dict[str, tuple[str, MappingProxyType]] = {}
     for ep in _scenario_entry_points():
         try:
@@ -578,7 +585,26 @@ def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType, MappingPro
             if name in fns:
                 raise _refuse("AN-8", f"entry point {ep.name}", f"generator {name!r} is provided by two scenario packs",
                               "give each generator a unique name")
+            if name in batches:
+                raise _refuse("AN-25", f"entry point {ep.name}", f"generator {name!r} is both a per-item and a batch "
+                              "generator", "give each generator a unique name")
             fns[name] = fn
+            packs[name] = ep.name
+        bgens = getattr(pack, "batch_generators", None)
+        bgens = {} if bgens is None else bgens
+        if not (isinstance(bgens, Mapping) and all(isinstance(k, str) and isinstance(v, BatchGenerator)
+                                                   for k, v in bgens.items())):
+            raise _refuse("AN-25", f"entry point {ep.name}", "the scenario pack's `batch_generators` is not a mapping "
+                          "of name to BatchGenerator", "expose `batch_generators = {name: BatchGenerator(...)}` or "
+                          "leave it out")
+        for name, gen in dict(bgens).items():
+            if name in batches:
+                raise _refuse("AN-25", f"entry point {ep.name}", f"batch generator {name!r} is provided by two "
+                              "scenario packs", "give each generator a unique name")
+            if name in fns:
+                raise _refuse("AN-25", f"entry point {ep.name}", f"generator {name!r} is both a per-item and a batch "
+                              "generator", "give each generator a unique name")
+            batches[name] = gen
             packs[name] = ep.name
         decls = getattr(pack, "scorers", None)
         decls = {} if decls is None else decls
@@ -591,12 +617,18 @@ def _scenario_snapshot() -> tuple[MappingProxyType, MappingProxyType, MappingPro
                 raise _refuse("AN-17", f"entry point {ep.name}", f"scorer {name!r} is provided by two scenario packs",
                               "give each pack scorer a unique name")
             pack_scorers[name] = (ep.name, MappingProxyType(dict(decl)))
-    _SCENARIO_SNAPSHOT = (MappingProxyType(fns), MappingProxyType(packs), MappingProxyType(pack_scorers))
+    _SCENARIO_SNAPSHOT = (MappingProxyType(fns), MappingProxyType(packs), MappingProxyType(pack_scorers),
+                          MappingProxyType(batches))
     return _SCENARIO_SNAPSHOT
 
 
 def scenario_generators() -> Mapping[str, Callable[..., Any]]:
     return _scenario_snapshot()[0]
+
+
+def scenario_batch_generators() -> Mapping[str, BatchGenerator]:
+    """Batch generator name -> declaration of the installed scenario packs (AN-25)."""
+    return _scenario_snapshot()[3]
 
 
 def scenario_scorers() -> Mapping[str, tuple[str, Mapping]]:
@@ -606,7 +638,7 @@ def scenario_scorers() -> Mapping[str, tuple[str, Mapping]]:
 
 
 def scenario_pack_of(generator: Any) -> str | None:
-    """The name of the entry point whose pack provides the generator, or None."""
+    """The name of the entry point whose pack provides the generator (per-item or batch), or None."""
     return _scenario_snapshot()[1].get(generator) if isinstance(generator, str) else None
 
 
@@ -754,6 +786,11 @@ class EvaluateSealed:
                           "register again with preregister, with a base model whose `generator` a scenario pack serves")
         if _keeper(ctx):
             return self._run_keeper(ctx, reg, served[1], item_set)
+        if served[1] in scenario_batch_generators():
+            # AN-8 (revision 25): a batch generator runs only in the keeper's inference container. Refused here,
+            # before the claim, so the project's one sealed scoring is not used up.
+            raise _refuse("AN-8", "registration.base_model.generator",
+                          "a batch generator runs in the keeper's inference container", "bind the project to a keeper")
         fn = scenario_generators().get(served[1])
         if fn is None or scenario_pack_of(served[1]) != served[0]:
             raise _refuse("AN-8", "registration.base_model.generator",

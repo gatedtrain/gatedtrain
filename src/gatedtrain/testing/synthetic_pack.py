@@ -26,6 +26,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from ..ainative import scorers
+from ..ainative.batch import BatchGenerator
 from ..ainative.project import ArtifactRef
 from ..ainative.stage import Proposal, StageContext
 from ..ainative.trust_stages import SCHEMA_DEPLOYMENT, SCHEMA_MODEL_REF, SCHEMA_TRAIN_PART
@@ -33,6 +34,11 @@ from ..errors import Problem, Refused
 from ..ext.smoke import smoke_verdict
 
 GENERATOR = "synthetic.lookup"
+# The batch form of the same model (AN-25): a standard-library script that reads `<model>/table.json`, for the
+# keeper's inference container. `synthetic_pack.generate` stays the per-item form.
+BATCH_GENERATOR = "synthetic_table_batch"
+BATCH = BatchGenerator(script=Path(__file__).resolve().with_name("synthetic_batch_generate.py"),
+                       interpreter="/usr/local/bin/python3", time_limit_s=600)
 SCHEMA_VERSION = 1
 SCHEMA_PROFILE = "gatedtrain.ainative.synthetic.profile"
 SCHEMA_RECIPE = "gatedtrain.ainative.synthetic.recipe"
@@ -302,17 +308,21 @@ class Scenario:
     """What the `gatedtrain.scenarios` entry point exposes: the generation functions of the pack, by the name a
     model reference gives in `generator`, the path of the pack's pipeline file, and the pack's scorers registered by
     reference (`{name: {id, fn, code_sha256, planning_sd, direction, range, what, unit[, label_ok]}}`, AN-17; this
-    pack declares none)."""
+    pack declares none), and its batch generators by name (`BatchGenerator` declarations, AN-25; a name is either a
+    per-item or a batch generator)."""
 
     name: str
     generators: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     pipeline: Path | None = None
     scorers: Mapping[str, dict] = field(default_factory=dict)
+    batch_generators: Mapping[str, BatchGenerator] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "generators", MappingProxyType(dict(self.generators)))
+        object.__setattr__(self, "batch_generators", MappingProxyType(dict(self.batch_generators)))
         object.__setattr__(self, "scorers", MappingProxyType({k: MappingProxyType(dict(v))
                                                               for k, v in self.scorers.items()}))
 
 
-SCENARIO = Scenario("synthetic", {GENERATOR: generate}, Path(__file__).with_name("synthetic_pack.yaml"))
+SCENARIO = Scenario("synthetic", {GENERATOR: generate}, Path(__file__).with_name("synthetic_pack.yaml"),
+                    batch_generators={BATCH_GENERATOR: BATCH})
