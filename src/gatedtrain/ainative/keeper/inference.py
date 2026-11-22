@@ -13,22 +13,22 @@ empty keeper-owned output directory `/out`. Nothing about the items is passed in
 - `start_problems` (AN-13, at `serve`): waits up to 60 s for the daemon's socket (the keeper user's daemon may start
   after the keeper), then refuses a daemon that is not rootless or whose socket is not owned by the keeper uid under a
   directory of mode 0700, an image ID other than the configured one, an eval tree that fails
-  `envcheck.eval_tree_problems`, (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that fails the
-  keeper's ownership check, and a subordinate id range of the owner that covers the keeper's uid or gid (or one of
-  the keeper's that covers the owner's), read from /etc/subuid and /etc/subgid (an unreadable file refuses);
+  `envcheck.eval_tree_problems`, (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that fails the keeper's
+  ownership check, and a subordinate id range of the owner that covers the keeper's uid or gid (or one of the keeper's
+  that covers the owner's), read from /etc/subuid and /etc/subgid (an unreadable file refuses);
 - `environment`: what the signed environment record holds under `inference`;
 - `ready` (before the grant, so a refusal spends nothing): the generator's time limit fits the driver's wait for an
-  evaluation, eval trees are configured when it needs them and its interpreter is a regular file inside one, its script is a file of a distribution the keeper runs,
-  the daemon and the image are unchanged, and for a GPU generator the GPU is free (AN-23's bounded wait; no
-  `nvidia-smi` refuses);
-- `run_batch` (`batch.BatchRunner`): runs one container and reads `/out` back with `batch.read_predictions`. The
-  daemon is checked again just before the start. Every failure of the container, the runtime or the files around it
-  is a crash (AN-9), a daemon that changed since `ready` too, whose message names an exit code, a time limit, the
-  daemon check or an exception class, never a path into the
-  keeper's state, an item or a prediction. The container and its run directory `state/run/<hex>/` are removed on
-  every path (best effort: a failed removal never changes the outcome; `remove_leftovers` at the next start, before
-  the start checks, removes what is left). `last_run` is `{"arm", "image_id", "seconds", "gpu_seconds", "rc"}` of the last container started
-  (`arm` None: the keeper's state sets it), or None when none started.
+  evaluation, eval trees are configured when it needs them and its interpreter is a regular file inside one, its script
+  is a file of a distribution the keeper runs, the daemon and the image are unchanged, and for a GPU generator the GPU
+  is free (AN-23's bounded wait; no `nvidia-smi` refuses);
+- `run_batch` (`batch.BatchRunner`): runs one container and reads `/out` back with `batch.read_predictions`. The daemon
+  is checked again just before the start. Every failure of the container, the runtime or the files around it is a crash
+  (AN-9), a daemon that changed since `ready` too, whose message names an exit code, a time limit, the daemon check or
+  an exception class, never a path into the keeper's state, an item or a prediction. The container and its run directory
+  `state/run/<hex>/` are removed on every path (best effort: a failed removal never changes the outcome;
+  `remove_leftovers` at the next start, before the start checks, removes what is left). `last_run` is `{"arm",
+  "image_id", "seconds", "gpu_seconds", "rc"}` of the last container started (`arm` None: the keeper's state sets it),
+  or None when none started.
 """
 
 from __future__ import annotations
@@ -97,10 +97,10 @@ def _plain_abs(p: Path, what: str) -> Path:
 
 @dataclass(frozen=True)
 class InferenceConfig:
-    """`keeper serve --inference-image ID [--inference-ref REF] [--eval-tree DIR]... [--docker-host URL] [--docker
-    PATH] [--nvidia-smi PATH]`: the image ID (`sha256:<64 hex>`) the keeper runs and refuses any other; the reference the daemon knows it by
-    (default: the ID); the eval trees (absolute directories, mounted read-only at their own paths); the daemon; the
-    Docker CLI and `nvidia-smi` the keeper calls by absolute path."""
+    """`keeper serve --inference-image ID [--inference-ref REF] [--eval-tree DIR]... [--docker-host URL] [--docker PATH]
+    [--nvidia-smi PATH]`: the image ID (`sha256:<64 hex>`) the keeper runs and refuses any other; the reference the
+    daemon knows it by (default: the ID); the eval trees (absolute directories, mounted read-only at their own paths);
+    the daemon; the Docker CLI and `nvidia-smi` the keeper calls by absolute path."""
 
     image_id: str
     docker_host: str

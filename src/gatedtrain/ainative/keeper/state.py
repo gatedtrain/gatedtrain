@@ -864,10 +864,11 @@ class KeeperState:
         return None
 
     def _model_files(self, arm: str, record: dict, dest: Path) -> dict:
-        """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read,
-        under directories the owner can search (the keeper is never a way to read a file the owner cannot). The checks on the paths here are an early filter;
-        `envcheck.copy_model_files` repeats them on each opened descriptor (`_opened_ok`, authoritative), copies the
-        files into `dest` and checks the copy. Returns the record the generator receives (the copies' paths)."""
+        """AN-13: model files must be absolute paths outside the keeper's state directory that the owner can read, under
+        directories the owner can search (the keeper is never a way to read a file the owner cannot). The checks on the
+        paths here are an early filter; `envcheck.copy_model_files` repeats them on each opened descriptor
+        (`_opened_ok`, authoritative), copies the files into `dest` and checks the copy. Returns the record the
+        generator receives (the copies' paths)."""
         problems = []
         entries = record.get("files", [])
         state = os.path.realpath(self.dir)
