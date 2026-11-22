@@ -152,50 +152,59 @@ class Project:
         return json.loads(data.decode("utf-8"))
 
     def append_attempt(self, event: dict) -> None:
-        """One `O_APPEND` write per line. An unterminated last line (a crash in the middle of an earlier append) is
-        not a row: `read_attempts` ignores it, and it is cut here before the new line is written, so it never ends
-        up in the middle of the log."""
+        """One `O_APPEND` line in `attempts.jsonl` (`append_jsonl`)."""
         row = {**event, "schema": ATTEMPT_SCHEMA, "schema_version": SCHEMA_VERSION}   # event keys cannot override
-        line = canonical_json(row) + b"\n"
-        _refuse_links(self.root, "attempts.jsonl")
-        fd = os.open(self.root / "attempts.jsonl", os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
-        try:
-            size = os.fstat(fd).st_size
-            if size and os.pread(fd, 1, size - 1) != b"\n":
-                data = os.pread(fd, size, 0)
-                os.ftruncate(fd, data.rfind(b"\n") + 1)
-            os.write(fd, line)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        append_jsonl(self.root, "attempts.jsonl", row)
 
     def read_attempts(self) -> list[dict]:
-        """The attempt log in order; an absent log is empty; a line that is not a JSON object is refused. An
-        unterminated last line is a write cut short by a crash and is ignored (see `append_attempt`); every other
-        line must be a complete row."""
-        _refuse_links(self.root, "attempts.jsonl")
+        """The attempt log in order (`read_jsonl`)."""
+        return read_jsonl(self.root, "attempts.jsonl")
+
+
+def append_jsonl(root: Path, rel: str, row: dict) -> None:
+    """One `O_APPEND` write per line of the log `rel` under `root`, never through a symbolic link. An unterminated last
+    line (a crash in the middle of an earlier append) is not a row: `read_jsonl` ignores it, and it is cut here before
+    the new line is written, so it never ends up in the middle of the log."""
+    line = canonical_json(row) + b"\n"
+    _refuse_links(Path(root), rel)
+    fd = os.open(Path(root) / rel, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            data = os.pread(fd, size, 0)
+            os.ftruncate(fd, data.rfind(b"\n") + 1)
+        os.write(fd, line)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_jsonl(root: Path, rel: str) -> list[dict]:
+    """The log `rel` under `root` in order; an absent log is empty; a line that is not a JSON object is refused. An
+    unterminated last line is a write cut short by a crash and is ignored (see `append_jsonl`); every other line must
+    be a complete row."""
+    _refuse_links(Path(root), rel)
+    try:
+        raw = (Path(root) / rel).read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise _refuse(rel, f"cannot read the log ({type(exc).__name__})", "check the file permissions") from None
+    rows: list[dict] = []
+    lines = raw.split(b"\n")
+    lines.pop()                           # after the last newline: empty, or an unterminated (cut) write
+    for n, line in enumerate(lines, 1):
+        if not line:
+            continue
         try:
-            raw = (self.root / "attempts.jsonl").read_bytes()
-        except FileNotFoundError:
-            return []
-        except OSError as exc:
-            raise _refuse("attempts.jsonl", f"cannot read the attempt log ({type(exc).__name__})",
-                          "check the file permissions") from None
-        rows: list[dict] = []
-        lines = raw.split(b"\n")
-        lines.pop()                           # after the last newline: empty, or an unterminated (cut) write
-        for n, line in enumerate(lines, 1):
-            if not line:
-                continue
-            try:
-                row = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                row = None
-            if not isinstance(row, dict):
-                raise _refuse(f"attempts.jsonl line {n}", "the line is not a JSON object",
-                              "the log was damaged; restore it from a copy")
-            rows.append(row)
-        return rows
+            row = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            row = None
+        if not isinstance(row, dict):
+            raise _refuse(f"{rel} line {n}", "the line is not a JSON object",
+                          "the log was damaged; restore it from a copy")
+        rows.append(row)
+    return rows
 
 
 PIPELINE_COPY = "pipeline.yaml"
