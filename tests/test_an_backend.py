@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ IMAGE = "sha256:" + "ab" * 32
 FAKE_GID = 2**31 - 3                     # the owner's primary group: no Docker socket's group on any host
 SCRIPT = "synthetic_train_job.py"
 SECRET = "s3cr3t-value"
+CLOCK = datetime.datetime(2026, 11, 22, tzinfo=datetime.timezone.utc)
 
 
 def _train(spec, host_path) -> int:
@@ -53,7 +55,7 @@ def setUpModule() -> None:
     the recipe adapters."""
     from gatedtrain import spec
 
-    for table in (registry.ADAPTERS, registry.TRAINER_ROWS, spec.TRAINER_BACKENDS):
+    for table in (registry.ADAPTERS, registry.TRAINER_ROWS, registry.EVALUATOR_ROWS, spec.TRAINER_BACKENDS):
         _PATCHES.append(mock.patch.dict(table))
         _PATCHES[-1].start()
     standin.install()
@@ -94,7 +96,8 @@ class _Base(unittest.TestCase):
         (self.inputs / SCRIPT).write_text("print('train')\n")
 
     def make_backend(self, rt: FakeRuntime | None = None) -> LocalBackend:
-        return LocalBackend(self.project, rt or self.rt, host=self.host, sleep=lambda s: None)
+        """The clock is fixed at the fake runtime's first start, so no attempt reaches its time limit (AN-23)."""
+        return LocalBackend(self.project, rt or self.rt, host=self.host, sleep=lambda s: None, clock=lambda: CLOCK)
 
     def job(self, name: str = "train", **kw) -> Job:
         """A job of the stand-in adapter; without `output_dir`, the directory `new_output_dir` keeps for its key."""
@@ -392,7 +395,7 @@ class TestLifecycle(_Base):
                     action()
                 with LocalBackend._lock(self, rel):
                     yield
-        return Gap(outer.project, outer.rt_gap, host=outer.host, sleep=lambda s: None)
+        return Gap(outer.project, outer.rt_gap, host=outer.host, sleep=lambda s: None, clock=lambda: CLOCK)
 
     def test_start_race_second_driver(self) -> None:
         """Review round 1: another driver reattaches and starts attempt 1 in the gap; no second container."""

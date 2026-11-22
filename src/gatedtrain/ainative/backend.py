@@ -18,6 +18,18 @@ project returns that job (a stage re-run after the driver died reattaches to its
 current attempt and records its end once; a daemon error (`RuntimeFailure`) leaves the job's records unchanged.
 Environment values are never recorded or printed: a job's start needs them, so a job this process did not submit
 (or re-submit) is not started here.
+
+AN-23: an attempt's GPU seconds are its container's run time (0 for a CPU job). Every start of a GPU attempt is refused
+when the committed GPU time (the recorded GPU seconds plus the estimates of the project's other queued or running GPU
+jobs) plus the job's estimate exceeds `budget.gpu_hours`; a refused start is a `refused` row and ends the job
+`budget_exhausted`. A running attempt is stopped at its time limit, a GPU attempt also once it used the budget left when
+it started (`stop` rows, while a driver polls). Before a GPU attempt starts the backend waits for a free GPU (the
+`probe`; none: no wait). `failed`, `preempted` and `lost` attempts are retried while attempts remain, under the job lock
+that records the end. Each job that reaches a terminal state appends one row to `<host_work>/gpu-log.md`.
+
+The budget and the records are cooperative: they hold for drivers that use this backend, and they are not a guarantee
+against an agent that runs containers itself or edits the project's records (spec §5.8.3). The keeper's own container
+time is the checked figure.
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -42,8 +55,8 @@ from ..ext import launch
 from ..ext.launch import HostConfig
 from .keeper_trust import project_id
 from .project import Project, _refuse_links, _write_atomic, append_jsonl, read_jsonl
-from .runtime import (TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount, RunSpec, Runtime,
-                      RuntimeFailure, docker_run_argv)
+from .runtime import (GPU_BUSY_MIB, GPU_WAIT_S, TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount,
+                      RunSpec, Runtime, RuntimeFailure, docker_run_argv, wait_for_gpu)
 
 JOB_SCHEMA = "gatedtrain.ainative.job"
 JOB_ATTEMPT_SCHEMA = "gatedtrain.ainative.job_attempt"
@@ -51,6 +64,9 @@ OUTPUT_DIR_SCHEMA = "gatedtrain.ainative.output_dir"
 SCHEMA_VERSION = 1
 JOBS_DIR = "jobs"
 RULE = "AN-22"
+RULE_GPU = "AN-23"
+GPU_LOG_HEADER = ("| Step | Started (UTC) | Ended (UTC) | GPU-hours | Running total | Outcome |\n"
+                  "|---|---|---|---|---|---|\n")                # docs/gpu-step.md
 
 STATES = ("queued", "running", "succeeded", "failed", "cancelled", "timed_out", "budget_exhausted")
 TERMINAL = ("succeeded", "failed", "cancelled", "timed_out", "budget_exhausted")
@@ -150,40 +166,54 @@ def _text(name: str) -> str:
 def input_fingerprint(mounts: tuple[Mount, ...]) -> list[dict[str, Any]]:
     """Per read-only mount, its entries in sorted relative path order, never following a link (`lstat`): a directory,
     a link with its target, a regular file with its size and sha256 (at most SMALL_FILE_BYTES) or size and mtime_ns
-    (larger), anything else as its kind. Refused (AN-22) past MAX_INPUT_ENTRIES entries in all."""
+    (larger), anything else as its kind. Refused (AN-22) past MAX_INPUT_ENTRIES entries in all (the walk stops there),
+    and when an entry changes while it is read (a link removed, a file swapped for a FIFO)."""
     out: list[dict[str, Any]] = []
     count = 0
+
+    def counted() -> None:
+        nonlocal count
+        count += 1
+        if count > MAX_INPUT_ENTRIES:
+            raise Refused([_problem("job.mounts", f"the read-only inputs hold more than {MAX_INPUT_ENTRIES} entries; "
+                                    "the job key fingerprints every input",
+                                    "mount fewer, larger inputs (an archive, a dataset file)")])
     for m in mounts:
         if not m.read_only:
             continue
         entries: list[list[Any]] = []
+        counted()
         stack = [(os.path.realpath(m.host), "")]
         while stack:
             path, rel = stack.pop()
-            count += 1
-            if count > MAX_INPUT_ENTRIES:
-                raise Refused([_problem(f"job.mounts", f"the read-only inputs hold more than {MAX_INPUT_ENTRIES} "
-                                        "entries; the job key fingerprints every input",
-                                        "mount fewer, larger inputs (an archive, a dataset file)")])
             try:
                 st = os.lstat(path)
             except OSError:
                 entries.append([rel, "missing"])
                 continue
             if stat.S_ISLNK(st.st_mode):
-                entries.append([rel, "link", _text(os.readlink(path))])
+                try:
+                    target = os.readlink(path)
+                except OSError:
+                    raise Refused([_changed(path)]) from None
+                entries.append([rel, "link", _text(target)])
             elif stat.S_ISDIR(st.st_mode):
                 entries.append([rel, "dir"])
+                names: list[str] = []
                 try:
-                    names = sorted(os.listdir(path), reverse=True)
+                    with os.scandir(path) as it:
+                        for e in it:
+                            counted()
+                            names.append(e.name)
                 except OSError:
                     entries.append([rel, "unreadable"])
                     continue
-                stack += [(os.path.join(path, n), f"{rel}/{_text(n)}" if rel else _text(n)) for n in names]
+                stack += [(os.path.join(path, n), f"{rel}/{_text(n)}" if rel else _text(n))
+                          for n in sorted(names, reverse=True)]
             elif stat.S_ISREG(st.st_mode):
                 if st.st_size <= SMALL_FILE_BYTES:
                     try:
-                        entries.append([rel, "file", st.st_size, _sha256_nofollow(path)])
+                        entries.append([rel, "file", st.st_size, _sha256_nofollow(path, field="job.mounts")])
                     except OSError:
                         entries.append([rel, "unreadable"])
                 else:
@@ -194,14 +224,20 @@ def input_fingerprint(mounts: tuple[Mount, ...]) -> list[dict[str, Any]]:
     return out
 
 
+def _changed(path: str) -> Problem:
+    return _problem("job.mounts", f"the input {path} changed while the job key was computed",
+                    "submit the job again once its inputs stay unchanged")
+
+
 def _argv_file_hashes(argv: tuple[str, ...], mounts: tuple[Mount, ...]) -> list[str | None]:
-    """The sha256 of the file each of argv[0:3] names in a read-only mount (as the container resolves it), else None."""
+    """The sha256 of the file each of argv[0:3] names in a read-only mount (as the container resolves it), else None
+    (also for a file that is not regular: a FIFO is never opened for reading in blocking mode)."""
     table = [{"host": m.host, "container": m.container, "mode": "ro"} for m in mounts if m.read_only]
     out: list[str | None] = []
     for a in list(argv)[:3]:
         hit = launch.container_file(a, table) if isinstance(a, str) else None
         try:
-            out.append(file_sha256(Path(hit[1])) if hit else None)
+            out.append(_sha256_regular(hit[1], follow=True) if hit else None)
         except OSError:
             out.append(None)
     return out
@@ -318,21 +354,32 @@ class JobStatus:
     reason: str | None
 
 
+class _BudgetRefused(Refused):
+    """A start refused by the GPU budget (AN-23): the job ended `budget_exhausted` (its `refused` row is written)."""
+
+
 @dataclass(frozen=True)
 class _View:
     status: JobStatus
     pending: bool                   # an attempt is due to start (the first, or a retry)
     stop_reason: str | None         # the current attempt's `stop` row reason
+    limit: tuple[int, str] | None   # the current attempt's run-time limit in seconds and its stop reason
 
 
 def _summarize(job_id: str, max_attempts: int, rows: list[dict]) -> _View:
-    """The job's state from its attempt rows alone (no runtime)."""
+    """The job's state from its attempt rows alone (no runtime). A `refused` row (a start refused for good) ends the
+    job: `budget_exhausted` for the budget (AN-23), else `failed`."""
     starts = [r for r in rows if r.get("event") == "start"]
     ends = {r["attempt"]: r for r in rows if r.get("event") == "end"}
     cancel = any(r.get("event") == "cancel_requested" for r in rows)
+    refused = [r for r in rows if r.get("event") == "refused"]
     attempt = max((r["attempt"] for r in starts), default=0)
     stops = [r for r in rows if r.get("event") == "stop" and r.get("attempt") == attempt]
     stop_reason = stops[-1]["reason"] if stops else None
+    current = [r for r in starts if r["attempt"] == attempt]
+    limit = None
+    if current and _int(current[-1].get("limit_s")) and current[-1].get("limit_reason") in STOP_REASONS:
+        limit = (current[-1]["limit_s"], current[-1]["limit_reason"])
     gpu = sum(int(e.get("gpu_seconds") or 0) for e in ends.values())
     secs = sum(int(e.get("seconds") or 0) for e in ends.values())
     last = ends.get(attempt)
@@ -340,9 +387,13 @@ def _summarize(job_id: str, max_attempts: int, rows: list[dict]) -> _View:
     outcome = last.get("outcome") if last else None
     pending = False
     reason = None
-    if attempt == 0:
-        state, pending = ("cancelled", False) if cancel else ("queued", True)
-        reason = "cancelled before it started" if cancel else None
+    if attempt == 0 and cancel:
+        state, reason = "cancelled", "cancelled before it started"
+    elif refused and (attempt == 0 or last is not None):
+        state = "budget_exhausted" if refused[-1].get("rule") == RULE_GPU else "failed"
+        reason = f"attempt {refused[-1].get('attempt')} was refused: {refused[-1].get('reason')}"
+    elif attempt == 0:
+        state, pending = "queued", True
     elif last is None:
         state = "running"
     elif outcome in RETRIED and attempt < max_attempts:
@@ -352,7 +403,7 @@ def _summarize(job_id: str, max_attempts: int, rows: list[dict]) -> _View:
         state = OUTCOME_STATE.get(outcome, "failed")
         if state != "succeeded":
             reason = f"attempt {attempt} ended {outcome}" + (f" (rc {rc})" if rc is not None else "")
-    return _View(JobStatus(job_id, state, attempt, rc, outcome, gpu, secs, reason), pending, stop_reason)
+    return _View(JobStatus(job_id, state, attempt, rc, outcome, gpu, secs, reason), pending, stop_reason, limit)
 
 
 def _outcome(st: ContainerState, cancel: bool, stop_reason: str | None) -> str:
@@ -379,13 +430,26 @@ def _seconds(started: str | None, finished: str | None) -> int:
     return max(0, int((b - a).total_seconds()))
 
 
-def _sha256_nofollow(path: str) -> str:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+def _sha256_regular(path: str, *, follow: bool = False) -> str | None:
+    """The sha256 of a regular file, None when what the open found is not one. Opened non-blocking (a file swapped for
+    a FIFO after a check does not block the open) and checked with `fstat`; `follow` False refuses a link (ELOOP)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW))
     with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
         h = hashlib.sha256()
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return "sha256:" + h.hexdigest()
+
+
+def _sha256_nofollow(path: str, *, field: str = "path") -> str:
+    """The sha256 of the regular file `path` (no link followed); Refused (AN-22) when it is not a regular file."""
+    got = _sha256_regular(path)
+    if got is None:
+        raise Refused([_problem(field, f"{path} is not a regular file (it changed after it was checked)",
+                                "write regular files only, and do not change them while they are read")])
+    return got
 
 
 def _record_argv(argv: list[str]) -> list[str]:
@@ -395,6 +459,19 @@ def _record_argv(argv: list[str]) -> list[str]:
         if out[i] == "-e":
             out[i + 1] = out[i + 1].split("=", 1)[0]
     return out
+
+
+def _table_open(text: str) -> bool:
+    """True when the last line of `text` is a row of a table with a `Running total` column (`launch.gpu_used_h`'s
+    reading), so a row appended after it counts."""
+    col = False
+    for line in text.splitlines():
+        cells = line.strip()
+        if not cells.startswith("|"):
+            col = False
+        elif not col:
+            col = "Running total" in [c.strip() for c in cells.strip("|").split("|")]
+    return col
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +584,142 @@ class LocalBackend:
     def _attempt_dir(rec: Mapping[str, Any], attempt: int) -> str:
         return os.path.join(rec["job"]["output_dir"], f"a{attempt}")
 
+    # -- GPU accounting, budget, GPU wait (AN-23) --------------------------------------------------------------------
+
+    def _ledger(self, exclude: str | None = None) -> tuple[int, float]:
+        """The GPU seconds every job's `end` rows hold, and the estimates (hours) of the queued or running GPU jobs
+        other than `exclude`."""
+        gpu_s, est = 0, 0.0
+        for job_id in self._job_ids():
+            if not (self.project.root / JOBS_DIR / job_id / JOB_FILE).exists():
+                continue                                        # a submit cut short before its record
+            rec = self._record(job_id)
+            st = self._view(job_id, rec).status
+            gpu_s += st.gpu_seconds
+            if (job_id != exclude and rec["job"].get("gpu") is True and st.state in ("queued", "running")
+                    and _num(rec["job"].get("gpu_hours_est"))):
+                est += float(rec["job"]["gpu_hours_est"])
+        return gpu_s, est
+
+    def gpu_seconds(self) -> int:
+        """AN-23: the project's GPU seconds, summed from its jobs' `end` rows."""
+        return self._ledger()[0]
+
+    def committed_gpu_hours(self) -> float:
+        """AN-23: `gpu_seconds() / 3600` plus the estimates of every queued or running GPU job."""
+        gpu_s, est = self._ledger()
+        return gpu_s / 3600 + est
+
+    def _budget_hours(self) -> float:
+        b = self.project.budget.get("gpu_hours") if isinstance(self.project.budget, Mapping) else None
+        if not (_num(b) and math.isfinite(b) and b >= 0):
+            raise Refused([Problem(RULE_GPU, "budget.gpu_hours", f"the project's GPU budget {b!r} is not a number of "
+                                   "hours", "set budget.gpu_hours in the project's project.yaml")])
+        return float(b)
+
+    def _budget_left_s(self, job: Job, *, exclude: str | None) -> tuple[Problem | None, int]:
+        """The budget check of one GPU attempt start (pre-flight finding 8): committed = the recorded GPU seconds plus
+        the estimates of the other queued or running GPU jobs; the start is refused when committed plus the job's own
+        estimate exceeds the budget. Else no problem and the budget left in seconds (the attempt's GPU limit)."""
+        budget = self._budget_hours()
+        gpu_s, est = self._ledger(exclude)
+        left_s = budget * 3600 - (gpu_s + est * 3600)
+        if job.gpu_hours_est * 3600 > left_s + 1e-6:
+            return Problem(RULE_GPU, "job.gpu_hours_est", f"the job's estimate of {job.gpu_hours_est:g} GPU-hours "
+                           f"exceeds the GPU budget left: the budget is {budget:g} GPU-hours and "
+                           f"{(gpu_s + est * 3600) / 3600:.2f} are committed (recorded GPU time and the estimates of "
+                           "the project's other queued or running GPU jobs)",
+                           "raise budget.gpu_hours in project.yaml, or lower the job's cost"), max(0, int(left_s))
+        return None, int(math.floor(left_s + 1e-6))
+
+    def _wait_gpu(self) -> None:
+        """AN-23: wait for a free GPU (no probe: no wait); a GPU still busy at GPU_WAIT_S, or no GPU tool, refuses the
+        start; the job stays queued."""
+        if self.probe is None:
+            return
+        if not wait_for_gpu(self.probe, sleep=self.sleep, clock=lambda: self.clock().timestamp()):
+            raise Refused([Problem(RULE_GPU, "gpu", f"the GPU is busy: compute processes held more than {GPU_BUSY_MIB} "
+                                   f"MiB through {GPU_WAIT_S} s of waiting, or this host has no nvidia-smi to read it",
+                                   "let the other GPU work end, then poll or submit the job again (it stays queued)")])
+
+    # -- the host's GPU log (AN-23) ----------------------------------------------------------------------------------
+
+    def _gpu_log_path(self) -> str:
+        return os.path.join(self.host().host_work, launch.GPU_LOG_MD)
+
+    @staticmethod
+    def _gpu_log_refused(path: str, why: str) -> Refused:
+        return Refused([Problem(RULE_GPU, "gpu_log", f"the GPU log {path} {why}",
+                                "fix the log by hand: its last table row needs a numeric `Running total` "
+                                "(docs/gpu-step.md); the backend never resets it")])
+
+    def _gpu_log_total(self, fd: int, path: str) -> float | None:
+        """The log's running total (`launch.gpu_used_h`), None for an empty file (one created and cut short before
+        its first write, which writes the header and the first row at once)."""
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise self._gpu_log_refused(path, "is not a regular file")
+        if st.st_size == 0:
+            return None
+        try:
+            total = launch.gpu_used_h(Path(f"/dev/fd/{fd}"))
+            text = os.pread(fd, st.st_size, 0).decode("utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise self._gpu_log_refused(path, f"does not parse ({exc.__class__.__name__}: no table row with a numeric "
+                                        "`Running total`)") from None
+        if not _table_open(text):
+            raise self._gpu_log_refused(path, "does not end in its `Running total` table; a row appended there would "
+                                        "not count")
+        return total
+
+    def _gpu_log_check(self) -> None:
+        """Before a new job: an existing log must parse, so a job's end never fails on it after GPU time was spent."""
+        path = self._gpu_log_path()
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise self._gpu_log_refused(path, f"cannot be opened ({exc.__class__.__name__}; a symbolic link is "
+                                        "refused)") from None
+        try:
+            self._gpu_log_total(fd, path)
+        finally:
+            os.close(fd)
+
+    def _gpu_log(self, job_id: str, rec: Mapping[str, Any], status: JobStatus) -> None:
+        """One row for a job that reached a terminal state, appended without following a link and under a lock on the
+        log (it is the host's, shared by projects): the header and the first row in one write when the log is absent;
+        an existing log that does not parse is refused, never reset."""
+        rows = self._rows(job_id)
+        starts = [r for r in rows if r.get("event") == "start"]
+        ends = [r for r in rows if r.get("event") == "end"]
+        first = next((e["started_utc"] for e in ends if e.get("started_utc")), None) or (
+            starts[0]["utc"] if starts else "-")
+        last = (ends[-1].get("finished_utc") or ends[-1].get("utc")) if ends else "-"
+        hours = status.gpu_seconds / 3600
+        rc = "-" if status.rc is None else status.rc
+        path = self._gpu_log_path()
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+        except OSError as exc:
+            raise self._gpu_log_refused(path, f"cannot be opened ({exc.__class__.__name__}; a symbolic link is "
+                                        "refused)") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            before = self._gpu_log_total(fd, path)
+            row = (f"| {job_id} ({rec['job']['label']}), {len(starts)} attempt(s) | {first} | {last} | {hours:.2f} "
+                   f"| {(before or 0.0) + hours:.2f} | {status.state.upper()} rc={rc} |\n")
+            if before is None:
+                data = GPU_LOG_HEADER + row
+            else:
+                size = os.fstat(fd).st_size
+                data = ("" if os.pread(fd, 1, size - 1) == b"\n" else "\n") + row
+            os.write(fd, data.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     # -- checks before a start ---------------------------------------------------------------------------------------
 
     def _daemon_and_image(self, job: Job, cfg: HostConfig) -> None:
@@ -584,7 +797,8 @@ class LocalBackend:
         """AN-22: the job's id. A job of this project with the same key that is queued, running or succeeded is
         returned after its record is checked against the launch rules (without the fresh-output rule) and nothing
         starts; else the job is checked (`job_problems`), the daemon and image are checked, the record is written and
-        attempt 1 starts."""
+        attempt 1 starts. A GPU job over the budget (AN-23) or a GPU log that does not parse is refused before its
+        record."""
         problems = _shape_problems(job)
         if problems:
             raise Refused(problems)
@@ -610,15 +824,18 @@ class LocalBackend:
                 self._jobs[found] = job
                 return found
             problems = job_problems(job, cfg)
+            if job.gpu:
+                problems += [p for p in (self._budget_left_s(job, exclude=None)[0],) if p is not None]
             if problems:
                 raise Refused(problems)
+            self._gpu_log_check()
             self._daemon_and_image(job, cfg)
             job_id = self._new_job(job, cfg, key, stage)
         self._jobs[job_id] = job
         with self._lock(self._rel(job_id, LOCK)):
             # Re-read under the job's lock: another driver may have reattached and started attempt 1, or a cancel may
             # have come, between the record and this lock (review finding, round 1).
-            self._advance(job_id, self._record(job_id))
+            self._advance(job_id, self._record(job_id), key=key, raise_budget=True)
         return job_id
 
     def _new_job(self, job: Job, cfg: HostConfig, key: str, stage: str) -> str:
@@ -651,13 +868,21 @@ class LocalBackend:
     # -- one attempt -------------------------------------------------------------------------------------------------
 
     def _start(self, job_id: str, rec: Mapping[str, Any], job: Job | None, attempt: int, *,
-               checked: bool = False) -> None:
+               key: str | None = None, checked: bool = False) -> None:
         """Start attempt `attempt` under the job's lock. A container of that attempt the daemon already holds (a
         start whose `start` row a crash cut off) is adopted when it is running or exited, and removed when it was only
-        created; after a failed start, a container left only created is removed, one that ran is adopted."""
-        if job is None or job.key() != rec["key"]:
+        created; after a failed start, a container left only created is removed, one that ran is adopted. A GPU
+        attempt passes the budget (else a `refused` row ends the job: `_BudgetRefused`) and waits for a free GPU; the
+        budget is checked again, and the container started, under the project's job lock, so two jobs never both take
+        the last of it. `key` is the job's key when the caller just computed it."""
+        if job is None:
             raise Refused([_problem("job_id", f"job {job_id} has an attempt due, and its environment values are "
                                     "never recorded", "submit the job again (the same job reattaches) and poll it")])
+        if (key or job.key()) != rec["key"]:
+            why = "the inputs changed since the job was recorded"
+            self._append(job_id, "refused", attempt=attempt, rule=RULE, reason=why)
+            raise Refused([_problem("job", f"job {job_id}: {why}; it ends here, its attempt {attempt} is not started",
+                                    "submit the job again: with the new inputs it is a new job")])
         cfg = launch.adapter_config(self.host(), job.adapter)
         if not checked:
             self._daemon_and_image(job, cfg)
@@ -665,24 +890,47 @@ class LocalBackend:
         out_dir = self._attempt_dir(rec, attempt)
         st = self.runtime.inspect(name)
         if st.status in ("running", "exited"):
-            self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir)
+            self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir,
+                         **self._limit(job, job_id))
             return
         if st.status == "created":
             self.runtime.remove(name)
-        self._fresh_attempt_dir(out_dir, cfg)
-        spec = self._spec(job, cfg, job_id, attempt, out_dir)
-        try:
-            cid = self.runtime.run(spec)
-        except RuntimeFailure:
-            with contextlib.suppress(RuntimeFailure):
-                left = self.runtime.inspect(name)
-                if left.status in ("running", "exited"):            # it ran after all (a CLI timeout): adopt
-                    self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir)
-                    return
-                if left.status == "created":
-                    self.runtime.remove(name)
-            raise
-        self._append(job_id, "start", attempt=attempt, container=cid, name=name, output=out_dir)
+        if job.gpu:
+            self._budget_gate(job_id, job, attempt)
+            self._wait_gpu()
+        with self._lock(self._rel(LOCK)):
+            limit = self._budget_gate(job_id, job, attempt) if job.gpu else self._limit(job, job_id)
+            self._fresh_attempt_dir(out_dir, cfg)
+            spec = self._spec(job, cfg, job_id, attempt, out_dir)
+            try:
+                cid = self.runtime.run(spec)
+            except RuntimeFailure:
+                with contextlib.suppress(RuntimeFailure):
+                    left = self.runtime.inspect(name)
+                    if left.status in ("running", "exited"):        # it ran after all (a CLI timeout): adopt
+                        self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir,
+                                     **limit)
+                        return
+                    if left.status == "created":
+                        self.runtime.remove(name)
+                raise
+            self._append(job_id, "start", attempt=attempt, container=cid, name=name, output=out_dir, **limit)
+
+    def _limit(self, job: Job, job_id: str, left_s: int | None = None) -> dict[str, Any]:
+        """The attempt's run-time limit for its `start` row: the time limit, or for a GPU attempt the budget left when
+        it starts when that comes first (pre-flight finding 8)."""
+        if job.gpu and left_s is None:
+            left_s = self._budget_left_s(job, exclude=job_id)[1]
+        if job.gpu and left_s is not None and left_s < job.time_limit_s:
+            return {"limit_s": left_s, "limit_reason": "budget_exhausted"}
+        return {"limit_s": job.time_limit_s, "limit_reason": "timed_out"}
+
+    def _budget_gate(self, job_id: str, job: Job, attempt: int) -> dict[str, Any]:
+        problem, left_s = self._budget_left_s(job, exclude=job_id)
+        if problem is not None:
+            self._append(job_id, "refused", attempt=attempt, rule=RULE_GPU, reason=problem.message)
+            raise _BudgetRefused([problem])
+        return self._limit(job, job_id, left_s)
 
     def _end(self, job_id: str, rec: Mapping[str, Any], view: _View, st: ContainerState, rows: list[dict]) -> None:
         """Record the end of the current attempt once (under the job's lock): its outcome, times and the tail of its
@@ -704,22 +952,61 @@ class LocalBackend:
             with contextlib.suppress(RuntimeFailure):                # the end is recorded; a leftover is harmless
                 self.runtime.remove(name)
 
-    def _advance(self, job_id: str, rec: Mapping[str, Any]) -> JobStatus:
-        """Under the job's lock: start a due attempt, or inspect the running one and record its end (then start a
-        retry when one is due). A RuntimeFailure leaves the records as they were."""
+    def _advance(self, job_id: str, rec: Mapping[str, Any], *, was: str | None = None, key: str | None = None,
+                 raise_budget: bool = False) -> JobStatus:
+        """Under the job's lock: start a due attempt, or inspect the running one, stop it past its limit and record its
+        end (then start a retry when one is due). A RuntimeFailure leaves the records as they were. A job that reaches
+        a terminal state here (from `was`, default its state on entry) gets its GPU log row."""
         view = self._view(job_id, rec)
+        if (was or view.status.state) in TERMINAL:
+            return view.status
+        try:
+            status = self._step(job_id, rec, view, key=key, raise_budget=raise_budget)
+        except Refused:
+            after = self._view(job_id, rec).status
+            if after.state in TERMINAL:
+                self._gpu_log(job_id, rec, after)
+            raise
+        if status.state in TERMINAL:
+            self._gpu_log(job_id, rec, status)
+        return status
+
+    def _step(self, job_id: str, rec: Mapping[str, Any], view: _View, *, key: str | None,
+              raise_budget: bool) -> JobStatus:
         if view.status.state in TERMINAL:
             return view.status
         if view.status.state == "running":
-            st = self.runtime.inspect(self._container(job_id, view.status.attempt))
+            name = self._container(job_id, view.status.attempt)
+            st = self.runtime.inspect(name)
+            if st.status == "running" and self._past_limit(rec, view, st):
+                if view.stop_reason is None:
+                    reason = view.limit[1] if view.limit else "timed_out"
+                    self._append(job_id, "stop", attempt=view.status.attempt, reason=reason)
+                self.runtime.stop(name)
+                view = self._view(job_id, rec)
+                st = self.runtime.inspect(name)
             if st.status in ("running", "created"):
                 return view.status
             self._end(job_id, rec, view, st, self._rows(job_id))
             view = self._view(job_id, rec)
         if view.pending:
-            self._start(job_id, rec, self._jobs.get(job_id), view.status.attempt + 1)
+            try:
+                self._start(job_id, rec, self._jobs.get(job_id), view.status.attempt + 1, key=key)
+            except _BudgetRefused:
+                if raise_budget:
+                    raise
             view = self._view(job_id, rec)
         return view.status
+
+    def _past_limit(self, rec: Mapping[str, Any], view: _View, st: ContainerState) -> bool:
+        """The running attempt reached its limit (or a stop was already recorded and is due again)."""
+        if view.stop_reason is not None:
+            return True
+        if not st.started_utc:
+            return False
+        limit_s = view.limit[0] if view.limit else int(rec["job"]["time_limit_s"])
+        started = datetime.strptime(st.started_utc, TIME_FORMAT).replace(tzinfo=timezone.utc)
+        return (self.clock() - started).total_seconds() >= limit_s
 
     # -- public operations -------------------------------------------------------------------------------------------
 
@@ -768,7 +1055,7 @@ class LocalBackend:
             self._append(job_id, "cancel_requested")
             if view.status.state == "running":
                 self.runtime.stop(self._container(job_id, view.status.attempt))
-            return self._advance(job_id, rec)
+            return self._advance(job_id, rec, was=view.status.state)
 
     def jobs(self) -> list[JobStatus]:
         """Every job's state from its records alone (no runtime)."""
@@ -788,8 +1075,9 @@ class LocalBackend:
         Without `key` (a job's inputs directory, which the stage rewrites): created, or returned again when it is a
         plain owner directory this project created. With `key` (`Job.key()` of the job the directory is the output
         of; review round 1): the directory recorded for this name and key is returned again, so a stage re-run of the
-        same job reattaches; a job with another key gets a fresh directory, `<name>` when free, else `<name>.<n>`.
-        Anything else is refused (pre-flight finding 1)."""
+        same job reattaches, unless every job of that key that used it ended without success (failed, cancelled,
+        timed_out, budget_exhausted): a re-run then gets a fresh directory like a job with another key, `<name>` when
+        free, else `<name>.<n>`. Anything else is refused (pre-flight finding 1)."""
         if not (isinstance(name, str) and NAME_RE.fullmatch(name)):
             raise Refused([_problem("name", f"{name!r} is not a plain name (letters, digits, _ . -; first a letter or "
                                     "digit; at most 100 characters)", "pass a plain directory name")])
@@ -825,12 +1113,14 @@ class LocalBackend:
                                         "remove it; the backend creates it")])
             rows = read_jsonl(self.project.root, rel)
             if key is not None:
-                for r in rows:
+                for r in reversed(rows):
                     if r.get("name") == name and r.get("key") == key:
                         path = r.get("path")
                         if not (isinstance(path, str) and os.path.lexists(path) and plain(path)):
                             raise Refused([_problem("name", f"the output directory {path} of this job is gone or "
                                                     "not a plain directory of the owner", "restore or remove it")])
+                        if self._spent(path, key):
+                            break                       # a re-run after a failure: a fresh directory (Task 4 carry)
                         return Path(path)
                 n = 1
                 while True:
@@ -846,6 +1136,17 @@ class LocalBackend:
                 raise Refused([_problem("name", f"{target} exists and is not a plain directory of the owner that "
                                         "this project created for no job", "pick another name")])
             return Path(target)
+
+    def _spent(self, path: str, key: str) -> bool:
+        """Jobs of `key` used the output directory `path`, and all of them ended without success."""
+        states = []
+        for job_id in self._job_ids():
+            if not (self.project.root / JOBS_DIR / job_id / JOB_FILE).exists():
+                continue
+            rec = self._record(job_id)
+            if rec.get("key") == key and rec["job"].get("output_dir") == path:
+                states.append(self._view(job_id, rec).status.state)
+        return bool(states) and all(st in TERMINAL and st != "succeeded" for st in states)
 
     def _succeeded_dir(self, job_id: str, op: str) -> str:
         rec = self._record(job_id)
