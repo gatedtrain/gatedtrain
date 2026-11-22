@@ -9,7 +9,8 @@ scoring and the gate statistics cannot drift apart between the two paths.
 - `power_record`: the body of the `power` record (without `schema`).
 - `score_arm` / `item_scorer`: score one arm with the registered sampler, eval_seeds and scorer; any exception from
   pack code becomes `Refused` AN-8 with the exception's class name only, never its message (it may quote a sealed
-  input or label).
+  input or label). With a batch generator (AN-25), `score_arm` makes one `batch.generate_batch` call per arm for all
+  seeds through the caller's runner (the keeper's inference container) and scores its predictions the same way.
 - `decide`: the gate statistics on two arms of `score_arm` rows (`gates.evaluate_items`, then `gates.apply_post_hoc`
   for a post hoc registration).
 - The shared report pieces: `known_limits`, `round_display`, `effective_status`, `headline`, `display_block`.
@@ -26,6 +27,7 @@ from .. import gates
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
 from ..registration import max_unpaired, min_paired
+from .batch import CRASH, CRASH_FIX, BatchGenerator, BatchRunner, generate_batch
 
 DEFAULT_MDE = 0.10
 DEFAULT_ALPHA = 0.05
@@ -198,7 +200,6 @@ def item_scorer(generate: Callable[..., Any], model: dict, full: dict, score: Ca
     `score` (a `Refused` too: pack code may build one with the label in it) is refused (AN-8) with its class name
     only, and so is a score that is not a finite number in `score_range`."""
     sampler = full["sampler"]
-    lo, hi = score_range
     counter = [0]
 
     def run(item: dict) -> dict:
@@ -209,30 +210,68 @@ def item_scorer(generate: Callable[..., Any], model: dict, full: dict, score: Ca
         except Exception as exc:       # never carry the item (or the pack's message about it) out
             raise _refuse("AN-8", "generate", f"the generation function failed ({type(exc).__name__})",
                           "fix the scenario pack's generate") from None
-        try:
-            value = score(prediction, item["label"])
-        except Exception as exc:       # a pack scorer's message may quote the label: class name only
-            raise _refuse("AN-8", "score", f"the scorer failed ({type(exc).__name__})",
-                          "fix the scorer of the scenario pack") from None
-        if not (_num(value) and math.isfinite(value) and lo <= value <= hi):
-            raise _refuse("AN-8", "score", f"the scorer {scorer_name} returned a value that is not a number in its "
-                          f"range [{lo:g}, {hi:g}]", "fix the scorer of the scenario pack")
-        return {"item_id": index, "seed": seed, "score": float(value)}
+        return {"item_id": index, "seed": seed, "score": _score_one(score, prediction, item["label"], score_range,
+                                                                    scorer_name)}
 
     return run
 
 
-def score_arm(items: list[dict], generate: Callable[..., Any], model: dict, full: dict,
-              score: Callable[[Any, Any], float], *, score_range: tuple[float, float], scorer_name: str) -> list[dict]:
+def _score_one(score: Callable[[Any, Any], float], prediction: Any, label: Any, score_range: tuple[float, float],
+               scorer_name: str) -> float:
+    """The registered scorer's value for one prediction, checked to be a finite number in `score_range`; refusals
+    (AN-8) name the exception's class only."""
+    lo, hi = score_range
+    try:
+        value = score(prediction, label)
+    except Exception as exc:       # a pack scorer's message may quote the label: class name only
+        raise _refuse("AN-8", "score", f"the scorer failed ({type(exc).__name__})",
+                      "fix the scorer of the scenario pack") from None
+    if not (_num(value) and math.isfinite(value) and lo <= value <= hi):
+        raise _refuse("AN-8", "score", f"the scorer {scorer_name} returned a value that is not a number in its "
+                      f"range [{lo:g}, {hi:g}]", "fix the scorer of the scenario pack")
+    return float(value)
+
+
+def score_arm(items: list[dict], generate: Callable[..., Any] | None, model: dict, full: dict,
+              score: Callable[[Any, Any], float], *, score_range: tuple[float, float], scorer_name: str,
+              batch: BatchGenerator | None = None, runner: BatchRunner | None = None) -> list[dict]:
     """One `{item_id, seed, score}` record per registered seed and item (seeds outer, items in the given order) of
     one arm: `items` are the sealed `{input, label}` items, `generate` the registered generator, `model` the arm's
     model reference, `full` the registration (its `sampler` and `clause.eval_seeds`), `score` the bound registered
-    scorer with its `score_range` and name. Refusals as in `item_scorer`."""
+    scorer with its `score_range` and name. Refusals as in `item_scorer`.
+
+    With `batch` (AN-25), `generate` is not used: one `generate_batch` call through `runner` gives the predictions
+    for all seeds and items, each scored as in `item_scorer`; the records are the same in shape and order. Without a
+    `runner` it is refused (AN-8): a batch generator runs only in the keeper's inference container. Predictions not
+    in (seed, item) order, one per pair, are a crash (AN-9)."""
+    if batch is not None:
+        return _score_arm_batch(items, model, full, score, batch, runner, score_range=score_range,
+                                scorer_name=scorer_name)
     records: list[dict] = []
     for seed in eval_seeds(full):
         run = item_scorer(generate, model, full, score, seed, score_range=score_range, scorer_name=scorer_name)
         records.extend(run(dict(item)) for item in items)
     return records
+
+
+def _score_arm_batch(items: list[dict], model: dict, full: dict, score: Callable[[Any, Any], float],
+                     gen: BatchGenerator, runner: BatchRunner | None, *, score_range: tuple[float, float],
+                     scorer_name: str) -> list[dict]:
+    if runner is None:
+        raise _refuse("AN-8", "generate", "a batch generator runs in the keeper's inference container",
+                      "bind the project to a keeper")
+    seeds = eval_seeds(full)
+    predictions = generate_batch(gen, dict(model), [{"input": item["input"]} for item in items],
+                                 dict(full["sampler"]), list(seeds), runner=runner)
+    want = [(s, i) for s in seeds for i in range(len(items))]
+    if not (isinstance(predictions, list) and len(predictions) == len(want) and all(
+            isinstance(p, dict) and p.get("seed") == s and p.get("item_id") == i and "prediction" in p
+            for p, (s, i) in zip(predictions, want))):
+        raise _refuse("AN-9", "predictions", f"{CRASH}: the runner did not return {len(want)} predictions in seed "
+                      "and item order", CRASH_FIX)
+    return [{"item_id": i, "seed": s, "score": _score_one(score, p["prediction"], items[i]["label"], score_range,
+                                                          scorer_name)}
+            for p, (s, i) in zip(predictions, want)]
 
 
 # ---------------------------------------------------------------------------
