@@ -61,7 +61,7 @@ from .sealed_eval import effective_status as _effective_status, eval_seeds as _e
 
 SCHEMA_VERSION = 1
 KEEPER_SCHEMA_VERSION = 2          # the keeper-mode records of the same schema ids
-# The registration field that names the alpha rule in keeper mode (preflight finding 13): `signed_by` names the signer,
+# The registration field that names the alpha rule in keeper mode: `signed_by` names the signer,
 # which under the keeper is the keeper, and the rule it sets each attempt's test level by.
 KEEPER_SIGNED_BY = f"gatedtrain-keeper (alpha rule: {alpha_investing.RULE})"
 RECEIPT_KEYS = frozenset({"schema", "schema_version", "arm", "held_by", "attempt_id", "registration_hash",
@@ -292,7 +292,7 @@ def _values(ctx: StageContext, decision: dict) -> dict:
     """The scorer, direction, margin and alpha the registration will carry."""
     v = _metric(decision)
     # Under the keeper the registration carries the fixed planning alpha: the test level of each attempt is set by
-    # alpha-investing at the gate, so a rerun after an attempt registers the same content (preflight finding 13).
+    # alpha-investing at the gate, so a rerun after an attempt registers the same content.
     alpha = ctx.ledger.planning_alpha if _keeper(ctx) else ctx.ledger.available()
     if not _num(alpha) or not 0 < alpha < 0.5:
         raise _refuse7("alpha", f"no alpha is available to register (available: {alpha!r})",

@@ -58,7 +58,7 @@ def sealed_guarantee(keeper_uid: int, owner_uid: int, *, root_docker: bool = Fal
     return KEEPER_ROOT_DOCKER_GUARANTEE if root_docker else KEEPER_GUARANTEE
 
 
-# ---- report v2 known limits (spec §5.4; preflight finding 16) -----------------------------------------------------
+# ---- report v2 known limits (spec §5.4) ---------------------------------------------------------------------------
 
 LIMIT_KEEPER_MODEL_REFERENCE = ("a model reference must content-address its weights: the keeper copies the files a "
                                 "reference lists (`files`) into its own state, hashes the copy and runs only the copy, "

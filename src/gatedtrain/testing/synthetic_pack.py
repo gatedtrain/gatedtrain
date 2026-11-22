@@ -275,8 +275,8 @@ class Train(_Base):
     """Declares the `gpu` need (to exercise the order rule) and `trains`, but fits a table on the CPU.
 
     Test only: the decision key `noise_override` (a number from 0 to 1) fits with that noise instead of the recipe's,
-    so a test can make a second candidate in one project without editing the pipeline, whose hash the project pins
-    (preflight finding 1). A real pack has no such key."""
+    so a test can make a second candidate in one project without editing the pipeline, whose hash the project pins.
+    A real pack has no such key."""
 
     name = "train"
     inputs = {"train_set": SCHEMA_TRAIN_PART, "recipe": SCHEMA_RECIPE, "smoke": SCHEMA_SMOKE}

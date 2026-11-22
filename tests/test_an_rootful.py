@@ -122,7 +122,7 @@ class DetectionTest(Tree):
         self.bind("run/containerd/containerd.sock")
         self.assertIn("/run/containerd/containerd.sock", self.reasons()[0])
 
-    def test_old_session_gid(self):                     # Review Focus 4: left the group, an old session keeps it
+    def test_old_session_gid(self):                     # left the group, an old session keeps it
         self.tree(statuses={1234: status(UID, [100, GID]), 1300: status(UID + 1, [GID], name="other"),
                             1400: status(UID, [100], name="fresh")})
         self.bind()
@@ -151,7 +151,7 @@ class DetectionTest(Tree):
         (self.root / "proc" / "net" / "tcp6").unlink()                    # no IPv6: fine
         self.assertEqual(self.reasons(), [])
 
-    def test_hidepid_fails_closed(self):                # Review Focus 4
+    def test_hidepid_fails_closed(self):
         for opt in ("hidepid=2", "hidepid=invisible", "hidepid=1"):
             with self.subTest(opt=opt):
                 self.tree(mountinfo=f"22 1 0:21 / /proc rw,nosuid,relatime shared:12 - proc proc rw,{opt}\n")
@@ -193,7 +193,7 @@ class DetectionTest(Tree):
         reasons = self.reasons()
         self.assertTrue(any(r.startswith("cannot read /proc ") for r in reasons), reasons)
 
-    def test_unreadable_status_fails_closed(self):     # preflight finding 12: only a vanished process is skipped
+    def test_unreadable_status_fails_closed(self):     # only a vanished process is skipped
         self.tree()
         (self.root / "proc" / "55").mkdir()                               # no status: the process ended
         self.assertEqual(self.reasons(), [])
@@ -208,7 +208,7 @@ class DetectionTest(Tree):
         self.assertEqual(len(reasons), rootful.MAX_REASONS + 1)
         self.assertEqual(reasons[-1], "and 5 more reasons")
 
-    def test_name_service_groups(self):                # preflight finding 12: sssd or LDAP groups count
+    def test_name_service_groups(self):                # sssd or LDAP groups count
         self.tree(group="root:x:0:\n")
         with mock.patch.object(rootful.grp, "getgrnam", side_effect=lambda n: mock.Mock(gr_gid=990)
                                if n == "docker" else (_ for _ in ()).throw(KeyError(n))), \
@@ -218,7 +218,7 @@ class DetectionTest(Tree):
             gl.assert_called_with("owner", OTHER_GID)
             self.assertEqual(self.reasons(), [])                          # a fake tree never asks the name service
 
-    def test_effective_and_saved_gid(self):          # fix round 1, finding 4: `Gid:` too, not only `Groups:`
+    def test_effective_and_saved_gid(self):          # `Gid:` too, not only `Groups:`
         group = "root:x:0:\ndocker:x:998:\n"
         for gids in ((OTHER_GID, 998, OTHER_GID, OTHER_GID), (OTHER_GID, OTHER_GID, 998, OTHER_GID)):
             with self.subTest(gids=gids):
@@ -227,7 +227,7 @@ class DetectionTest(Tree):
         self.tree(group=group, statuses={31: status(UID, [998], name="sg", gids=(OTHER_GID, 998, 998, 998))})
         self.assertEqual(len(self.reasons()), 1)                         # one reason per gid
 
-    def test_socket_acl_counts(self):                   # fix round 1, finding 2
+    def test_socket_acl_counts(self):
         self.tree()
         self.bind()
         real = os.listxattr
@@ -251,7 +251,7 @@ class DetectionTest(Tree):
         with mock.patch.object(rootful.os, "listxattr", return_value=["user.x"]):
             self.assertEqual(self.reasons(), [])
 
-    def test_lookup_errors_fail_closed(self):          # fix round 1, finding 3
+    def test_lookup_errors_fail_closed(self):
         self.tree(group="root:x:0:\n")
         with mock.patch.object(rootful.grp, "getgrnam", side_effect=OSError(errno.EIO, "x")), \
                 mock.patch.object(rootful.os, "getgrouplist", return_value=[OTHER_GID]):
@@ -313,14 +313,14 @@ class HelloTest(Tree):
         self.assertIs(hello["owner_has_root_docker"], True)
         self.assertEqual(hello["root_docker_reasons"], [f"uid {UID} is in gid 998 (group docker) by /etc/group"])
         self.assertEqual(hello["sealed_guarantee"], texts.KEEPER_SAME_USER_GUARANTEE)   # same user wins
-        self.assertEqual(code, 0, doc)                                                # preflight finding 6
+        self.assertEqual(code, 0, doc)
         self.assertIs(doc["data"]["owner_has_root_docker"], True)
         self.assertEqual(doc["data"]["root_docker_reasons"], hello["root_docker_reasons"])
         with KeeperProcess() as kp:                    # the default: a clean fake tree, whatever the host's groups
             hello = kp.client.call("hello", None, {})
         self.assertEqual((hello["owner_has_root_docker"], hello["root_docker_reasons"]), (False, []))
 
-    def test_hello_separate_user(self):                # preflight finding 6: a keeper under its own uid
+    def test_hello_separate_user(self):                # a keeper under its own uid
         keeper = server.Keeper(self.root, UID, host_view=self.view())
         keeper.keeper_uid = UID + 1
         self.docker_tree()
@@ -334,7 +334,7 @@ class HelloTest(Tree):
 
 @skip_unless_linux
 class StickyTest(unittest.TestCase):
-    """`KeeperState` in this process for an owner uid other than the test user's (preflight finding 2)."""
+    """`KeeperState` in this process for an owner uid other than the test user's."""
 
     OWNER = UID + 1
 
@@ -370,7 +370,7 @@ class StickyTest(unittest.TestCase):
         self.assertIs(resp["ok"], True, resp)
         return resp["result"]
 
-    def test_report_sticky(self):                      # Review Focus 4
+    def test_report_sticky(self):
         hv = Path(tempfile.mkdtemp(prefix="gr-"))
         self.addCleanup(shutil.rmtree, hv, True)
         keeper = server.Keeper(self.dir, self.OWNER, key=self.state.key, state=self.state,
@@ -422,7 +422,7 @@ class StickyTest(unittest.TestCase):
         self.state.open_project(pid_x)
         return pid_y, r_y, reg_y, pid_x
 
-    def test_positive_check_marks_every_open_set(self):     # fix round 1, finding 1
+    def test_positive_check_marks_every_open_set(self):
         self.positive = False
         pid_y, r_y, reg_y, pid_x = self.two_sets()
         self.assertIsNone(self.state.root_docker_seen(r_y["sealed_id"]))
@@ -436,7 +436,7 @@ class StickyTest(unittest.TestCase):
         report = signing.verify(self.state.report(pid_y)["report"], self.state.key.public_key(), kind="report")
         self.assertEqual(report["sealed_guarantee"], texts.KEEPER_ROOT_DOCKER_GUARANTEE)
 
-    def test_hello_without_project_marks_open_sets_not_closed_ones(self):     # fix round 1, finding 1
+    def test_hello_without_project_marks_open_sets_not_closed_ones(self):
         self.positive = False
         pid_y, r_y, reg_y, pid_x = self.two_sets()
         a = self.state.evaluate(pid_y, reg_y, arm(BASE), self.candidate(r_y, 0))

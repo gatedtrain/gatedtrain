@@ -189,7 +189,7 @@ class IntakeTest(Base):
         sealed_inputs = [r["input"] for r in sealed]
         self.assertEqual(len(train_inputs) + len(sealed_inputs), N_DATA)  # every duplicate counted once
         self.assertEqual(len(set(train_inputs) | set(sealed_inputs)), N_DATA)
-        self.assertFalse(set(train_inputs) & set(sealed_inputs))          # Review Focus 1
+        self.assertFalse(set(train_inputs) & set(sealed_inputs))
         self.assertEqual(train["n_duplicates_removed"], 60)
 
     def test_duplicate_input_with_a_different_label_is_refused(self) -> None:

@@ -167,7 +167,7 @@ def _records(project: Project) -> list[tuple[str, dict]]:
 
 def _cross_bind(by_sha: dict[str, dict], rel: str, report: dict) -> None:
     """The report's registration and attempts must be this project's: its signed registration and claim receipts
-    (the report record names no project; review finding 1)."""
+    (the report record names no project)."""
     hashes = {e["record"].get("hash") for e in by_sha.values() if e["kind"] == "registration"}
     attempts = {e["record"].get("attempt_id") for e in by_sha.values() if e["kind"] == "claim"}
     if _dict(report.get("registration")).get("hash") not in hashes:

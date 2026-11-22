@@ -206,7 +206,7 @@ class InferenceUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             InferenceConfig(image_id=IMAGE, docker_host="unix:///x", eval_trees=(Path("relative"),))
 
-    def test_client_waits_long_enough(self):               # pre-flight finding 11: 900 + 2 x 1200 + 600
+    def test_client_waits_long_enough(self):               # 900 + 2 x 1200 + 600
         self.assertGreaterEqual(protocol.LONG_OP_TIMEOUT_S, 3900)
         self.assertEqual(KeeperClientTimeout.evaluate(), protocol.LONG_OP_TIMEOUT_S)
 
@@ -360,7 +360,7 @@ class InferenceUnitTest(unittest.TestCase):
         rt = FakeRuntime(image_ids={cfg.image_ref: IMAGE}, socket=str(self.sock))
         self.assertEqual(self.ki(cfg, rt=rt).start_problems(), [])
 
-    def test_start_daemon_not_rootless(self):                   # pre-flight finding 3
+    def test_start_daemon_not_rootless(self):
         rt = FakeRuntime(image_ids={IMAGE: IMAGE}, socket=str(self.sock), rootless=False)
         problems = self.ki(rt=rt).start_problems()
         self.assertEqual(self.rules(problems), ["AN-13"])
@@ -382,7 +382,7 @@ class InferenceUnitTest(unittest.TestCase):
         rt = FakeRuntime(image_ids={IMAGE: IMAGE}, socket=None)
         self.assertEqual(self.rules(self.ki(rt=rt).start_problems()), ["AN-13"])
 
-    def test_start_waits_for_the_socket(self):                  # pre-flight finding 20
+    def test_start_waits_for_the_socket(self):
         self.sock.unlink()
         problems = self.ki().start_problems()
         self.assertIn("AN-13", self.rules(problems))
@@ -575,7 +575,7 @@ class InferenceUnitTest(unittest.TestCase):
         script.write_text("print(1)\n")
         self.refused_ready(self.ki(), dataclasses.replace(pack.BATCH, script=script), "AN-13")
 
-    def test_ready_time_bound(self):                           # pre-flight finding 11
+    def test_ready_time_bound(self):
         ki = self.ki()
         ki.ready(dataclasses.replace(pack.BATCH, time_limit_s=1200))     # 900 + 2400 + 600 = 3900
         exc = self.refused_ready(ki, dataclasses.replace(pack.BATCH, time_limit_s=1201), "AN-25")
@@ -583,14 +583,14 @@ class InferenceUnitTest(unittest.TestCase):
         with mock.patch.object(protocol, "LONG_OP_TIMEOUT_S", 7200.0):
             ki.ready(dataclasses.replace(pack.BATCH, time_limit_s=2800))
 
-    def test_ready_gpu_busy(self):                             # Review Focus 5
+    def test_ready_gpu_busy(self):
         probe = Probe(5000)
         exc = self.refused_ready(self.ki(probe=probe), dataclasses.replace(pack.BATCH, gpu=True), "AN-25")
         self.assertIn("the GPU is busy", exc.problems[0].message)
         self.assertGreaterEqual(self.clock.t, runtime_mod.GPU_WAIT_S - runtime_mod.GPU_POLL_S)
         self.assertGreater(probe.calls, 1)
 
-    def test_ready_gpu_tool_missing(self):                      # pre-flight finding 25
+    def test_ready_gpu_tool_missing(self):
         self.refused_ready(self.ki(probe=Probe(None)), dataclasses.replace(pack.BATCH, gpu=True), "AN-25")
 
     def test_ready_cpu_generator_does_not_probe(self):
@@ -753,7 +753,7 @@ class StateInferenceTest(unittest.TestCase):
         self.assertEqual([r["arm"] for r in self.attempt_file(2)["gate_record"]["record"]["inference"]],
                          ["candidate"])
 
-    def assert_crash_after_grant(self, cand: dict, text: str) -> None:   # Review Focus 3
+    def assert_crash_after_grant(self, cand: dict, text: str) -> None:
         before = self.state.alpha(self.pid)
         with self.assertRaises(RefusedAfterSpend) as cm:
             self.evaluate(cand)
@@ -852,7 +852,7 @@ class StateGpuTest(StateInferenceTest):
 
     gen = dataclasses.replace(pack.BATCH, gpu=True)
 
-    def test_gpu_busy_before_grant(self):                       # Review Focus 5
+    def test_gpu_busy_before_grant(self):
         self.probe.mib = 50_000
         self.assert_refused_before_grant("AN-25", "the GPU is busy")
         self.assertEqual(self.rt.runs, [])

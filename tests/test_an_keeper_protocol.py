@@ -232,7 +232,7 @@ class TestHandle(unittest.TestCase):
 
 @skip_unless_linux
 class TestInProcessServer(unittest.TestCase):
-    def test_bad_requests_keep_the_keeper_serving(self):        # Review Focus 5
+    def test_bad_requests_keep_the_keeper_serving(self):
         cap = 1024
         with serving(MAX_REQUEST_BYTES=cap, SOCKET_TIMEOUT_S=5.0) as sock:
             over = raw_roundtrip(sock, b"x" * (cap + 1) + b"\n")

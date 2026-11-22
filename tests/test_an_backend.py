@@ -200,7 +200,7 @@ class TestSubmit(_Base):
         self.assertEqual(rt.runs, [])
 
     def test_argv_rules_and_run_options(self) -> None:
-        """Pre-flight finding 14: the adapter's argv rules refuse; its run options reach the container."""
+        """The adapter's argv rules refuse; its run options reach the container."""
         row = {"run_options": {SCRIPT: ("--ulimit", "memlock=-1", "--shm-size=16g")},
                "tmpfs_options": {SCRIPT: "rw,size=1g"}}
         calls = []
@@ -237,7 +237,7 @@ class TestRootful(_Base):
 
 class TestLifecycle(_Base):
     def test_resubmit_reattaches(self) -> None:
-        """Review Focus 1, pre-flight finding 1: the driver dies while the job runs and its output is not empty; the
+        """The driver dies while the job runs and its output is not empty; the
         stage re-run in a new process gets the same job and starts nothing."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=["hang"])
         job = self.job()
@@ -325,7 +325,7 @@ class TestLifecycle(_Base):
         self.assertEqual(len(rt.runs), 1)
 
     def test_retry_uses_fresh_attempt_dir(self) -> None:
-        """Pre-flight finding 9: each attempt writes into its own directory; artifacts read the succeeded one."""
+        """Each attempt writes into its own directory; artifacts read the succeeded one."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=["preempt", "ok"])
         b = self.make_backend(rt)
         job = self.job()
@@ -400,7 +400,7 @@ class TestLifecycle(_Base):
         return Gap(outer.project, outer.rt_gap, host=outer.host, sleep=lambda s: None, clock=lambda: CLOCK)
 
     def test_start_race_second_driver(self) -> None:
-        """Review round 1: another driver reattaches and starts attempt 1 in the gap; no second container."""
+        """Another driver reattaches and starts attempt 1 in the gap; no second container."""
         self.rt_gap = FakeRuntime({IMAGE: _train}, outcomes=["hang", "hang"])
         job = self.job()
         other = self.make_backend(self.rt_gap)
@@ -413,7 +413,7 @@ class TestLifecycle(_Base):
         self.assertEqual(self.events(jid), ["start"])
 
     def test_start_race_cancel(self) -> None:
-        """Review round 1: a cancel in the gap; the job never starts."""
+        """A cancel in the gap; the job never starts."""
         self.rt_gap = FakeRuntime({IMAGE: _train})
         other = self.make_backend(self.rt_gap)
         jid = self._gap(lambda: other.cancel("0001-train")).submit(self.job())
@@ -422,7 +422,7 @@ class TestLifecycle(_Base):
         self.assertEqual(other.status(jid).state, "cancelled")
 
     def test_changed_inputs_new_key_and_output(self) -> None:
-        """Review round 1: a changed script, small input or large input is another job with a fresh output
+        """A changed script, small input or large input is another job with a fresh output
         directory; unchanged inputs (a small file rewritten with the same bytes included) reattach."""
         (self.inputs / "table.json").write_text('{"a": 1}')
         big = self.inputs / "big.bin"
@@ -550,7 +550,7 @@ class TestOutputs(_Base):
             self.assertEqual(cm.exception.problems[0].rule, "AN-22")
 
     def test_hand_off_refusals(self) -> None:
-        """Review Focus 2: the keeper user must be able to read each handed-off file."""
+        """The keeper user must be able to read each handed-off file."""
         jid, a1 = self.succeeded()
         model = a1 / "model"
         got = self.backend.hand_off(jid, [str(model / "model.safetensors"), "model/config.json"])

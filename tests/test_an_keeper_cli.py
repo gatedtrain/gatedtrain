@@ -123,7 +123,7 @@ class SetupKeeperTest(unittest.TestCase):                          # AN-19
         for c in commands:
             self.assertIn(c, text)
 
-    def test_defaults_use_a_runtime_directory(self):                  # preflight finding 27
+    def test_defaults_use_a_runtime_directory(self):
         with no_processes():
             code, doc = run(["setup", "keeper"])
         self.assertEqual(code, 0, doc)
@@ -268,7 +268,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertIn(doc["data"]["sentence"], err)                    # the prompt goes to stderr, stdout is the result
         self.assertIn("confirmed", text)
 
-    def test_verify(self):                                             # AN-14, preflight finding 10
+    def test_verify(self):                                             # AN-14
         proj = self.create()
         self.to_report(proj)
         fp = signing.fingerprint(self.public())
@@ -363,7 +363,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), doc)
 
-    def test_verify_refuses_another_projects_report(self):           # review finding 1
+    def test_verify_refuses_another_projects_report(self):
         a = self.create("a")
         self.to_report(a)
         b = self.create("b")                                            # same keeper, no attempts
@@ -379,7 +379,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
             code, doc = run(["verify", str(b.root), *argv])
             self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), (argv, doc))
 
-    def test_verify_with_the_keeper_finds_a_deleted_record(self):    # review finding 3
+    def test_verify_with_the_keeper_finds_a_deleted_record(self):
         proj = self.create()
         self.to_report(proj, until="gate")
         fp = signing.fingerprint(self.public())
@@ -395,7 +395,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
         self.assertEqual((code, doc["warnings"]), (0, [OFFLINE_LIMIT]), doc)     # offline: stated, not detected
 
-    def test_project_report_fetches_missing_receipts(self):          # final review finding 1
+    def test_project_report_fetches_missing_receipts(self):
         proj = self.create()
         self.to_report(proj)
         lines = (proj.root / RECEIPTS).read_bytes().splitlines(keepends=True)
@@ -415,7 +415,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertEqual(len(doc["warnings"]), 1, doc)
         self.assertIn("AN-12", doc["warnings"][0])
 
-    def test_status_reads_the_keeper_ledger(self):                   # Task 10 carry: project_id and j
+    def test_status_reads_the_keeper_ledger(self):                   # project_id and j
         proj, other = self.create(), self.create("other")             # same data: one sealed set, one ledger
         self.to_report(other, until="gate")
         self.to_report(proj)
@@ -440,7 +440,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
 
 @skip_unless_linux
 class AbandonedEvaluateTest(CliProject, unittest.TestCase):
-    """Final review finding 1: a driver that gave up during an evaluation never received that attempt's claim and
+    """A driver that gave up during an evaluation never received that attempt's claim and
     grant; after a retrain the identical request is never sent, and the keeper settles the attempt at the next
     evaluate. The driver fetches the project's records from the keeper and keeps every envelope it lacks, so the
     project still verifies. Every candidate call sleeps 5 ms in the keeper, so one evaluation takes a few seconds; the
@@ -478,7 +478,7 @@ class AbandonedEvaluateTest(CliProject, unittest.TestCase):
 
 @skip_unless_linux
 class ScoringErrorAfterSpendTest(CliProject, unittest.TestCase):
-    """Final review finding 1: an exception that is not a refusal after the grant (here the keeper cannot write the
+    """An exception that is not a refusal after the grant (here the keeper cannot write the
     candidate's per-item records, `run_cli.py` mode `write_error`) still settles the attempt as not passed and returns
     the spend's envelopes, naming the exception class only."""
 
