@@ -11,9 +11,16 @@ This is a prototype. Outputs carry the tags `prototype` and `unpromotable`.
 The analysis code version stays `gatedtrain 0.3.0`. A registration records `analysis_code_version` and is refused
 when it differs from the running code; from this release that version names the gate statistics and registration
 semantics, not the package release (`gatedtrain.ANALYSIS_VERSION`; design 05 section 3.7). It changes only when that
-code's behaviour changes, so registrations made with 0.3.0 stay valid under 0.4.0. The stand-in evaluator's identity
-hash names the analysis version too, so the demo registrations are unchanged. Lockfile backends, the ledger
-`writer_id`, the keeper's `keeper_version` and `--version` still name the package release that wrote them.
+code's behaviour changes, so a registration made with 0.3.0 passes the analysis code version check under 0.4.0,
+and one whose evaluators are Tier B, external-run or recipe evaluators stays valid. A Tier A stand-in (demo)
+registration made with 0.3.0 does not: the stand-in evaluator's identity hash covers the stand-in model code, which
+changed after 0.3.0 (oneDNN turned off in the CPU demo), so it pins an old hash and gates MISSING
+(`evaluator_hash_mismatch`); register it again. The stand-in hash names the analysis version, not the package
+release, so later releases do not change it by themselves. Lockfile backends, the ledger `writer_id`, the keeper's
+`keeper_version`, the `setup keeper` install pin `gatedtrain==<version>` and `--version` still name the package
+release that wrote them.
+
+New required dependency: `cryptography>=50.0.2` (Ed25519 signatures of the AI-native keeper).
 
 New in this release:
 
@@ -22,7 +29,9 @@ New in this release:
   ledger schema 1.1; a 1.0 ledger reads as kept rows), and `impact --json` adds an `orphaned` section for resumed runs.
 - AI-native projects, a preview: step 1, `gatedtrain project` (in process, CPU only), and step 2, the keeper daemon
   that holds the sealed items, registrations and alpha ledger and signs its records (`keeper`, `setup keeper`,
-  `verify`, Linux only). See "AI-native projects (preview)" below.
+  `verify`, Linux only). See "AI-native projects (preview)" below. AI-native code is new in 0.4.0; a registration
+  made with the library scorers of `gatedtrain.ainative.scorers` on unreleased main before 0.4.0 pins an older
+  evaluator hash, which no longer matches the scorer: register it again (a new `preregister`).
 
 Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs/findings.md,
 "Review of the 3.12 path fix" and "Review of PR 2"):
@@ -40,9 +49,6 @@ Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs
   `merge.json` are those of the bytes checked.
 - Tests run as any non-root user (the launch fixtures run the container as the running user and its primary group).
   With `GATEDTRAIN_REQUIRE_CONTAINER_USER=1`, as in CI, the tests that need such a user fail instead of skipping.
-- AI-native projects: the library scorers of `gatedtrain.ainative.scorers` have a new evaluator hash. A registration
-  made with them before this change pins the old hash, which no longer matches the scorer; register it again (a new
-  `preregister`).
 
 ## Install and run the demo
 
