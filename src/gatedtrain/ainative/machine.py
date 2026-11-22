@@ -30,19 +30,28 @@ The trust backend and the ledger come from `backends(project)` unless the caller
 before the `start` line, so a refused binding (a keeper that is unreachable or serves another key, or keeper records
 without a binding) leaves no attempt behind. A keeper's spend shows as new lines in the project's keeper receipts,
 which count as a side effect like the step 1 ledger.
+
+AN-24: a pack stage gets `ctx.backend`, a `StageBackend` over the caller's `LocalBackend` or, without one,
+`compute_backend(project)`, which reads nothing and starts nothing until a stage uses it, so a pipeline that submits no
+job needs no host layout and no Docker; trust stages get None. A job directory or attempt line, or an output directory
+record, written by the stage counts as a side effect: a stage that submitted a job and then refused is `failed`.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
+from ..ext import launch
+from .backend import ATTEMPTS, JOBS_DIR, OUTPUT_DIRS, LocalBackend, StageBackend
+from .runtime import DockerCLIRuntime, NvidiaSmiProbe, Runtime
 from .pipeline import PipelineSpec, StageRef, _is_training, load_pipeline, pipeline_problems
 from .project import ArtifactRef, Project, _utc_now
-from .stage import Proposal, StageContext, stage_registry
+from .stage import TRUST_STAGES, Proposal, StageContext, stage_registry
 from .keeper_trust import KEEPER_BINDING, RECEIPTS, KeeperAlphaLedger, KeeperTrust, keeper_records
 from .trust import AlphaLedger, FixedAlphaLedger, InProcessTrust, TrustBackend
 
@@ -244,21 +253,40 @@ def _resolve(project: Project, trust: TrustBackend | None,
             ledger if ledger is not None else FixedAlphaLedger(project))
 
 
+def compute_backend(project: Project, *, runtime: Runtime | None = None) -> LocalBackend:
+    """AN-24: the project's job backend: the Docker CLI runtime on the context `launch.DOCKER_CONTEXT` (or `runtime`)
+    and the `nvidia-smi` GPU probe. Nothing is read or run until a stage uses it."""
+    return LocalBackend(project, runtime if runtime is not None else DockerCLIRuntime(context=launch.DOCKER_CONTEXT),
+                        probe=NvidiaSmiProbe())
+
+
+def _stage_backend(project: Project, sref: StageRef, cls: Any, backend: LocalBackend | None, *,
+                   planning: bool) -> StageBackend | None:
+    """`ctx.backend` (AN-24): None for a trust stage; else the backend, `gpu` allowed when the class declares it."""
+    if sref.stage in TRUST_STAGES:
+        return None
+    return StageBackend(backend if backend is not None else compute_backend(project), stage=sref.name,
+                        allow_gpu="gpu" in frozenset(getattr(cls, "needs", frozenset())), planning=planning)
+
+
 def _context(project: Project, sref: StageRef, inputs: dict[str, ArtifactRef], trust: TrustBackend,
-             ledger: AlphaLedger) -> StageContext:
-    return StageContext(project, inputs, dict(sref.params), trust, ledger, sref.name)
+             ledger: AlphaLedger, backend: StageBackend | None = None) -> StageContext:
+    return StageContext(project, inputs, dict(sref.params), trust, ledger, sref.name, backend)
 
 
 def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, registry: dict | None = None,
-               trust: TrustBackend | None = None, ledger: AlphaLedger | None = None) -> Proposal:
+               trust: TrustBackend | None = None, ledger: AlphaLedger | None = None,
+               backend: LocalBackend | None = None) -> Proposal:
     spec, registry = _validated(project, spec, registry)
     i = _locate(spec, ref)
     states = _states(project, spec, registry)
     _check_ready(spec, states, i)
     sref = spec.stages[i]
     trust, ledger = _resolve(project, trust, ledger)
-    ctx = _context(project, sref, _inputs(project, spec, states, sref), trust, ledger)
-    return registry[sref.stage]().plan(ctx)
+    cls = registry[sref.stage]
+    ctx = _context(project, sref, _inputs(project, spec, states, sref), trust, ledger,
+                   _stage_backend(project, sref, cls, backend, planning=True))
+    return cls().plan(ctx)
 
 
 # Trust files whose change is a side effect of a stage: the alpha claim, the latest registration and the claim of
@@ -266,10 +294,33 @@ def plan_stage(project: Project, ref: str, *, spec: PipelineSpec | None = None, 
 _TRUST_MARKERS = ("trust/spent", "trust/registrations/latest", "trust/sealed_evaluation")
 
 
-def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, int, dict[str, str | None]]:
+def _job_records(project: Project) -> dict[str, int]:
+    """Per job directory under `jobs/`, the number of its attempt lines (-1 without the file), and the number of
+    output directory records (AN-24): a submit, a start, an end or a new output directory changes it."""
+    out: dict[str, int] = {}
+    d = project.root / JOBS_DIR
+    if d.is_symlink() or not d.is_dir():
+        return out
+    with os.scandir(d) as it:
+        entries = sorted(it, key=lambda e: e.name)
+    for e in entries:
+        if e.is_dir(follow_symlinks=False):
+            try:
+                out[e.name] = (Path(e.path) / ATTEMPTS).read_bytes().count(b"\n")
+            except OSError:
+                out[e.name] = -1
+    try:
+        out["/" + OUTPUT_DIRS] = (d / OUTPUT_DIRS).read_bytes().count(b"\n")
+    except OSError:
+        pass
+    return out
+
+
+def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, int, dict[str, str | None],
+                                                         dict[str, int]]:
     """What a stage's `run` may have changed: the hash of every file under `stages/<stage>/`, the number of lines
-    in the alpha ledger and in the keeper receipts (a spend is a side effect) and the hash of each trust marker file
-    (`_TRUST_MARKERS`)."""
+    in the alpha ledger and in the keeper receipts (a spend is a side effect), the hash of each trust marker file
+    (`_TRUST_MARKERS`) and the project's job records (`_job_records`, AN-24)."""
     files: dict[str, str] = {}
     base = project.root / "stages" / stage
     if base.is_dir():
@@ -290,7 +341,7 @@ def _side_effects(project: Project, stage: str) -> tuple[dict[str, str], int, in
             markers[rel] = sha256_bytes((project.root / rel).read_bytes())
         except OSError:
             markers[rel] = None
-    return files, lines, receipts, markers
+    return files, lines, receipts, markers, _job_records(project)
 
 
 def done_output(project: Project, stage: str, name: str, *, spec: PipelineSpec | None = None,
@@ -322,7 +373,7 @@ def _event(project: Project, stage: str, attempt: int, key: str | None, event: s
 
 def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec | None = None,
               registry: dict | None = None, trust: TrustBackend | None = None,
-              ledger: AlphaLedger | None = None) -> StageResult:
+              ledger: AlphaLedger | None = None, backend: LocalBackend | None = None) -> StageResult:
     spec, registry = _validated(project, spec, registry)
     i = _locate(spec, ref)
     states = _states(project, spec, registry)
@@ -355,7 +406,7 @@ def run_stage(project: Project, ref: str, decision: dict, *, spec: PipelineSpec 
     # Resolved now, from the registry class and the spec, and recorded: later readers (preregister's post hoc test)
     # trust the log, not the pipeline file, which can be edited afterwards.
     _event(project, sref.name, attempt, key, "start", trains=_is_training(spec, sref, cls))
-    ctx = _context(project, sref, inputs, trust, ledger)
+    ctx = _context(project, sref, inputs, trust, ledger, _stage_backend(project, sref, cls, backend, planning=False))
     before = _side_effects(project, sref.name)
     try:
         outputs = stage.run(ctx, decision)

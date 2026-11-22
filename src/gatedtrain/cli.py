@@ -292,6 +292,8 @@ _GATE_STAGE = "gate"
 
 
 def _project_command(args) -> str:
+    if args.project_cmd == "job":
+        return f"project job {args.job_cmd}"
     return f"project {args.project_cmd}"
 
 
@@ -478,6 +480,53 @@ def cmd_project_report(args) -> int:
                     exit_code=EXIT_OK if ok else EXIT_NOT_PASS, warnings=warnings)
 
 
+def _job_call(args, op):
+    """AN-24: run `op(backend)` on the project's backend (`machine.compute_backend`); a refusal, or a daemon error
+    (the operation and exit code only), is the refusal envelope."""
+    from .ainative.machine import compute_backend
+    from .ainative.project import Project
+    from .ainative.runtime import RuntimeFailure
+
+    try:
+        return op(compute_backend(Project.load(Path(args.root)))), None
+    except Refused as exc:
+        return None, _prefuse(args, exc.problems)
+    except RuntimeFailure as exc:
+        return None, _prefuse(args, [Problem("AN-22", "daemon", str(exc),
+                                             "check that the daemon runs: `docker --context gatedtrain info`")])
+
+
+def _job_line(j) -> str:
+    return (f"{j.job_id} {j.state} attempt {j.attempt} rc {j.rc} gpu_seconds {j.gpu_seconds}"
+            + (f" ({j.reason})" if j.reason else "") + "\n")
+
+
+def cmd_project_job_list(args) -> int:
+    import dataclasses
+
+    jobs, refused = _job_call(args, lambda b: b.jobs())          # the records only; no runtime
+    if refused is not None:
+        return refused
+    return _pfinish(args, {"jobs": [dataclasses.asdict(j) for j in jobs]},
+                    "".join(_job_line(j) for j in jobs) or "no jobs\n")
+
+
+def cmd_project_job_logs(args) -> int:
+    log, refused = _job_call(args, lambda b: b.logs(args.job_id, tail=args.tail))
+    if refused is not None:
+        return refused
+    return _pfinish(args, {"job_id": args.job_id, "log": log}, log)
+
+
+def cmd_project_job_cancel(args) -> int:
+    import dataclasses
+
+    job, refused = _job_call(args, lambda b: b.cancel(args.job_id))
+    if refused is not None:
+        return refused
+    return _pfinish(args, {"job": dataclasses.asdict(job)}, _job_line(job))
+
+
 def _sync_receipts(project) -> list[str]:
     """A keeper project's receipts get every envelope the keeper signed for it that they lack (`KeeperTrust.sync`);
     the report is printed either way, with a warning when the keeper cannot be asked."""
@@ -503,7 +552,7 @@ def _gpu_hours(text: str) -> float:
 
 
 def _add_project(sub) -> None:
-    p = sub.add_parser("project", help="AI-native project (step 1 preview): create, plan, run, status, report")
+    p = sub.add_parser("project", help="AI-native project (step 1 preview): create, plan, run, status, report, job")
     ps = p.add_subparsers(dest="project_cmd", required=True)
 
     c = ps.add_parser("create", help="create a project directory for one goal")
@@ -540,11 +589,28 @@ def _add_project(sub) -> None:
     c.add_argument("root")
     c.set_defaults(func=cmd_project_report)
 
+    c = ps.add_parser("job", help="the project's backend jobs (AN-24): list, logs, cancel")
+    js = c.add_subparsers(dest="job_cmd", required=True)
+    j = js.add_parser("list", help="every job's state, from the job records only")
+    j.add_argument("root")
+    j.set_defaults(func=cmd_project_job_list)
+    j = js.add_parser("logs", help="a job's current attempt log")
+    j.add_argument("root")
+    j.add_argument("job_id", help="a job id from `project job list`")
+    j.add_argument("--tail", type=int, default=200, metavar="N", help="the last N lines (default 200)")
+    j.set_defaults(func=cmd_project_job_logs)
+    j = js.add_parser("cancel", help="cancel a job: stop its running container; the end is recorded `cancelled`")
+    j.add_argument("root")
+    j.add_argument("job_id", help="a job id from `project job list`")
+    j.set_defaults(func=cmd_project_job_cancel)
+
 
 # AN-12, AN-14, AN-18, AN-19: `gatedtrain keeper ...`, `gatedtrain setup keeper`, `gatedtrain verify`.
 
 def _command_name(args) -> str:
-    sub = {"project": "project_cmd", "keeper": "keeper_cmd", "setup": "setup_cmd"}.get(args.command)
+    if args.command == "project":
+        return _project_command(args)
+    sub = {"keeper": "keeper_cmd", "setup": "setup_cmd"}.get(args.command)
     return f"{args.command} {getattr(args, sub)}" if sub else args.command
 
 

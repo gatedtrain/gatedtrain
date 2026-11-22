@@ -45,6 +45,13 @@ MINIMAL_ARGS = {
     "verify": ["root"],
 }
 
+# `project job` sub-subcommands (AN-24): each parses with and without `--json`.
+PROJECT_JOB_ARGS = {
+    "list": ["project", "job", "list", "root"],
+    "logs": ["project", "job", "logs", "root", "0001-train", "--tail", "5"],
+    "cancel": ["project", "job", "cancel", "root", "0001-train"],
+}
+
 
 def subcommand_names(parser) -> list[str]:
     for action in parser._actions:
@@ -65,6 +72,10 @@ class TestJson(unittest.TestCase):
             args = build_parser().parse_args(["--json", name, *MINIMAL_ARGS[name]])
             self.assertIs(args.json, True, name)
             self.assertIs(build_parser().parse_args([name, *MINIMAL_ARGS[name]]).json, False, name)
+        for name, argv in PROJECT_JOB_ARGS.items():
+            args = build_parser().parse_args(["--json", *argv])
+            self.assertEqual((args.json, args.project_cmd, args.job_cmd), (True, "job", name))
+            self.assertIs(build_parser().parse_args(argv).json, False, name)
 
     def test_refusal_is_one_json_line(self):
         proc = run_cli(["--json", "validate", "missing.yaml"], cwd=self.tmp)

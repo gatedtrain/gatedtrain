@@ -32,6 +32,9 @@ that records the end. Each job that reaches a terminal state appends one row to 
 The budget and the records are cooperative: they hold for drivers that use this backend, and they are not a guarantee
 against an agent that runs containers itself or edits the project's records (spec §5.8.3). The keeper's own container
 time is the checked figure.
+
+AN-24: a pack stage reaches the backend through `StageBackend` (`ctx.backend`), which records its jobs under the stage
+and refuses a GPU job from a stage that does not declare `needs: gpu`, and every side effect during `plan`.
 """
 
 from __future__ import annotations
@@ -67,6 +70,7 @@ SCHEMA_VERSION = 1
 JOBS_DIR = "jobs"
 RULE = "AN-22"
 RULE_GPU = "AN-23"
+RULE_STAGE = "AN-24"
 GPU_LOG_HEADER = ("| Step | Started (UTC) | Ended (UTC) | GPU-hours | Running total | Outcome |\n"
                   "|---|---|---|---|---|---|\n")                # docs/gpu-step.md
 
@@ -1317,3 +1321,58 @@ class LocalBackend:
             raise Refused(problems)
         return out
 
+
+
+class StageBackend:
+    """AN-24: what a pack stage sees as `ctx.backend`: the `LocalBackend` operations, its jobs recorded under the
+    stage's ref name. Only a stage that declares `needs: gpu` (`allow_gpu`) submits a GPU job. During `plan`
+    (`planning`) every operation that may change a record or a container is refused (`submit`, `new_output_dir`,
+    `cancel`, and `status` and `wait`, which record an end and start a due retry); `jobs`, `logs`, `artifacts` and
+    `hand_off` only read. The rule is cooperative: it holds for stages that use this object."""
+
+    def __init__(self, backend: LocalBackend, *, stage: str, allow_gpu: bool, planning: bool = False) -> None:
+        self._backend = backend
+        self.stage = stage
+        self.allow_gpu = bool(allow_gpu)
+        self.planning = bool(planning)
+
+    def _no_side_effect(self, op: str) -> None:
+        if self.planning:
+            raise Refused([Problem(RULE_STAGE, op, f"stage {self.stage!r}: `plan` has no side effects, so it cannot "
+                                   f"call `{op}`", f"call `{op}` from the stage's `run`")])
+
+    def submit(self, job: Job) -> str:
+        self._no_side_effect("submit")
+        if getattr(job, "gpu", False) is not False and not self.allow_gpu:
+            raise Refused([Problem(RULE_STAGE, "job.gpu", f"stage {self.stage!r} does not declare `needs: gpu`; only "
+                                   "a stage that declares `needs: gpu` submits GPU jobs",
+                                   "declare `gpu` in the stage's `needs`, or submit a CPU job")])
+        return self._backend.submit(job, stage=self.stage)
+
+    def status(self, job_id: str) -> JobStatus:
+        self._no_side_effect("status")
+        return self._backend.status(job_id)
+
+    def wait(self, job_id: str, *, poll_s: float = 10.0) -> JobStatus:
+        self._no_side_effect("wait")
+        return self._backend.wait(job_id, poll_s=poll_s)
+
+    def cancel(self, job_id: str) -> JobStatus:
+        self._no_side_effect("cancel")
+        return self._backend.cancel(job_id)
+
+    def new_output_dir(self, name: str, *, key: str | None = None) -> Path:
+        self._no_side_effect("new_output_dir")
+        return self._backend.new_output_dir(name, key=key)
+
+    def jobs(self) -> list[JobStatus]:
+        return self._backend.jobs()
+
+    def logs(self, job_id: str, *, tail: int | None = 200) -> str:
+        return self._backend.logs(job_id, tail=tail)
+
+    def artifacts(self, job_id: str) -> dict[str, Any]:
+        return self._backend.artifacts(job_id)
+
+    def hand_off(self, job_id: str, paths: list[str]) -> list[dict[str, str]]:
+        return self._backend.hand_off(job_id, paths)
