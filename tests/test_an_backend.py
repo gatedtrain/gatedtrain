@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import datetime
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -650,6 +651,42 @@ class TestQuiet(unittest.TestCase):
             with self.assertRaises(Refused):
                 op()
         self.assertEqual(list((tmp / "elsewhere").iterdir()), [])
+
+
+class TestReportCompute(_Base):
+    """The driver sends `compute` with the keeper's report only when the backend recorded a job, so a keeper that
+    does not know `compute` still reports a project without jobs; unreadable job records never block the report."""
+
+    def sent(self) -> tuple[dict, str]:
+        from gatedtrain.ainative.keeper_trust import KeeperTrust
+        calls = []
+        fake = mock.Mock(project=self.project)
+        fake._call = lambda op, args=None: calls.append((op, args)) or {"report": {}}
+        fake._keep = lambda env, kind: {"kind": kind}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(KeeperTrust.report(fake), {"kind": "report"})
+        self.assertEqual([op for op, _ in calls], ["report"])
+        return calls[0][1] or {}, err.getvalue()
+
+    def test_no_jobs_no_compute(self) -> None:
+        self.assertEqual(self.sent(), ({}, ""))
+
+    def test_jobs_send_compute(self) -> None:
+        jid = self.backend.submit(self.job())
+        self.backend.wait(jid)
+        args, err = self.sent()
+        self.assertEqual(args["compute"]["jobs"], 1)
+        self.assertEqual(err, "")
+
+    def test_damaged_job_record_warns(self) -> None:
+        jid = self.backend.submit(self.job())
+        self.backend.wait(jid)
+        (self.project.root / "jobs" / jid / "job.json").write_text("{not json")
+        args, err = self.sent()
+        self.assertNotIn("compute", args)
+        self.assertTrue(err.startswith("warning: "), err)
+        self.assertIn("job totals", err)
 
 
 class TestJobProblems(_Base):

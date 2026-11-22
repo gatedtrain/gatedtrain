@@ -37,7 +37,7 @@ from gatedtrain.ainative.keeper_trust import KEEPER_BINDING, KEEPER_PUB, RECEIPT
 from gatedtrain.ainative.project import Project
 from gatedtrain.ainative.keeper import protocol
 from gatedtrain.ainative.keeper.protocol import KeeperClient
-from gatedtrain.ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_KEEPER
+from gatedtrain.ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_KEEPER, SAME_USER_REPORT
 from gatedtrain.errors import Refused
 from gatedtrain.testing import synthetic_pack as pack
 
@@ -275,10 +275,11 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         root = str(proj.root)
 
         code, doc = run(["verify", root, "--keeper", str(self.kp.socket)])
-        # the test keeper runs as the owner's uid, which can read its key: checked, but not an anchor (exit 1)
+        # the test keeper runs as the owner's uid, which can read its key: checked, but not an anchor (exit 1); its
+        # report states the same-user guarantee, which exits 1 under any anchor
         self.assertEqual((code, doc["ok"], doc["command"], doc["data"]["anchor"], doc["data"]["fingerprint"]),
                          (1, False, "verify", "keeper", fp), doc)
-        self.assertEqual((doc["problems"], doc["warnings"]), ([], [SAME_USER_KEEPER]), doc)
+        self.assertEqual((doc["problems"], doc["warnings"]), ([], [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
         n = len((proj.root / RECEIPTS).read_bytes().splitlines())
         self.assertEqual(doc["data"]["checked"], n + 3)                # every receipt, registration, gate, report
         code, text, err = run_text(["verify", root, "--keeper", str(self.kp.socket)])
@@ -287,16 +288,18 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertNotIn("verified against the keeper", text)
         with self.separate_user_keeper():                              # a keeper under its own user anchors
             code, doc = run(["verify", root, "--keeper", str(self.kp.socket)])
-        self.assertEqual((code, doc["ok"], doc["data"]["anchor"], doc["warnings"]), (0, True, "keeper", []), doc)
+        self.assertEqual((code, doc["ok"], doc["data"]["anchor"], doc["warnings"]),
+                         (1, False, "keeper", [SAME_USER_REPORT]), doc)
         code, doc = run(["verify", root, "--fingerprint", fp])
-        self.assertEqual((code, doc["data"]["anchor"]), (0, "fingerprint"), doc)
+        self.assertEqual((code, doc["data"]["anchor"]), (1, "fingerprint"), doc)
         code, doc = run(["verify", root, "--keeper", str(self.kp.socket), "--fingerprint", fp])
-        self.assertEqual((code, doc["data"]["anchor"], doc["warnings"]), (1, "keeper", [SAME_USER_KEEPER]), doc)
+        self.assertEqual((code, doc["data"]["anchor"], doc["warnings"]),
+                         (1, "keeper", [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
         code, doc = run(["verify", root])
         self.assertEqual((code, doc["ok"], doc["data"]["anchor"]), (1, False, "none"), doc)
-        self.assertEqual(doc["warnings"], [CONSISTENCY_ONLY, OFFLINE_LIMIT])
+        self.assertEqual(doc["warnings"], [CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_REPORT])
         code, doc = run(["verify", root, "--fingerprint", fp])
-        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT])
+        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, SAME_USER_REPORT])
         code, text, err = run_text(["verify", root, "--fingerprint", fp])
         self.assertIn(OFFLINE_LIMIT, err)
 
@@ -355,7 +358,8 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         with open(proj.root / RECEIPTS, "ab") as f:
             f.write(json.dumps(forged).encode() + b"\n")
         code, doc = run(["verify", str(proj.root), "--fingerprint", signing.fingerprint(self.public())])
-        self.assertEqual(code, 0, doc)                                # signed by the key: offline it checks
+        self.assertEqual((code, doc["problems"]), (1, []), doc)      # signed by the key: offline it checks
+        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, SAME_USER_REPORT])    # (exit 1: a same-user report)
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), doc)
 
@@ -463,13 +467,13 @@ class AbandonedEvaluateTest(CliProject, unittest.TestCase):
         claims = [e["record"]["j"] for e in KeeperTrust(proj).receipts() if e["kind"] == "claim"]
         self.assertEqual(sorted(claims), [1, 2])
         fp = signing.fingerprint(self.public())
-        code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
-        self.assertEqual((code, doc["problems"]), (0, []), doc)
+        code, doc = run(["verify", str(proj.root), "--fingerprint", fp])          # exit 1: a same-user report
+        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [OFFLINE_LIMIT, SAME_USER_REPORT]), doc)
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
-        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [SAME_USER_KEEPER]), doc)
+        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
         with self.separate_user_keeper():
             code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
-        self.assertEqual((code, doc["problems"]), (0, []), doc)
+        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [SAME_USER_REPORT]), doc)
 
 
 @skip_unless_linux

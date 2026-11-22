@@ -296,8 +296,9 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
     rootful-access detection reads (AN-21; the real host by default, a fake tree in tests).
 
     With `inference` (AN-25) the keeper runs batch generators in its inference container on `runtime` (default: the
-    Docker CLI at `inference.docker` on `inference.docker_host`): once it holds its state lock it refuses to start on
-    any `KeeperInference.start_problems`, removes leftover run directories and containers, and adds
+    Docker CLI at `inference.docker` on `inference.docker_host`): once it holds its state lock it removes leftover
+    containers and run directories, refuses to start on any `KeeperInference.start_problems` (or a leftover it cannot
+    remove), and adds
     `KeeperInference.environment()` to its environment record as `inference`. Without it a batch generator is
     refused before the grant (AN-8)."""
     if sys.platform != "linux":
@@ -316,10 +317,10 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
     try:
         record = envcheck.environment_record()
         if runner is not None:
-            problems = runner.start_problems()
+            problems = runner.remove_leftovers()            # before the start checks: an earlier keeper's containers
+            problems += runner.start_problems()
             if problems:
                 raise Refused(_capped(problems))
-            runner.remove_leftovers()
             record["inference"] = runner.environment()
         _prepare_socket_path(socket_path)
         stop = stop if stop is not None else threading.Event()

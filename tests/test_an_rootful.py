@@ -32,7 +32,8 @@ from gatedtrain.ainative.keeper.rootful import HostView, owner_root_docker
 from gatedtrain.ainative.keeper.state import KeeperState
 from gatedtrain.ainative.keeper_trust import RECEIPTS
 from gatedtrain.ainative.trust_stages import render_markdown
-from gatedtrain.ainative.verify import ROOT_DOCKER_KEEPER, ROOT_DOCKER_REPORT, UNCHECKED_GUARANTEE_REPORT
+from gatedtrain.ainative.verify import (OFFLINE_LIMIT, ROOT_DOCKER_KEEPER, ROOT_DOCKER_REPORT, SAME_USER_REPORT,
+                                        UNCHECKED_GUARANTEE_REPORT, UNKNOWN_GUARANTEE_REPORT, report_warnings)
 from gatedtrain.canonical import sha256_bytes
 
 UID = os.getuid()
@@ -477,18 +478,18 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
 
     def test_verify_exit_1_on_root_docker(self):
         proj = self.create()
-        self.to_report(proj)
+        self.to_report(proj)        # the test keeper runs as the owner: its report states the same-user text
         root, sock = str(proj.root), str(self.kp.socket)
         with self.patched_hello(owner_has_root_docker=True, root_docker_reasons=["uid 1 is in gid 998"]):
             code, doc = run(["verify", root, "--keeper", sock])
         self.assertEqual((code, doc["ok"], doc["data"]["root_docker"], doc["warnings"]),
-                         (1, False, True, [ROOT_DOCKER_KEEPER]), doc)
+                         (1, False, True, [ROOT_DOCKER_KEEPER, SAME_USER_REPORT]), doc)
         with self.patched_hello(owner_has_root_docker=None):              # a hello without the field
             code, doc = run(["verify", root, "--keeper", sock])
-        self.assertEqual((code, doc["warnings"]), (1, [ROOT_DOCKER_KEEPER]), doc)
-        with self.patched_hello(owner_has_root_docker=False):
+        self.assertEqual((code, doc["warnings"]), (1, [ROOT_DOCKER_KEEPER, SAME_USER_REPORT]), doc)
+        with self.patched_hello(owner_has_root_docker=False):             # the key anchors; the report's text not
             code, doc = run(["verify", root, "--keeper", sock])
-        self.assertEqual((code, doc["data"]["root_docker"], doc["warnings"]), (0, False, []), doc)
+        self.assertEqual((code, doc["data"]["root_docker"], doc["warnings"]), (1, False, [SAME_USER_REPORT]), doc)
 
     def resign_report(self, proj, guarantee: str) -> None:
         key = signing.load_private_key(self.kp.state / "keeper.key")
@@ -506,6 +507,7 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
     def test_verify_exit_1_on_downgraded_report(self):
         proj = self.create()
         self.to_report(proj)
+        self.resign_report(proj, texts.KEEPER_GUARANTEE)    # the test keeper runs as the owner: state the real text
         fp = signing.fingerprint(self.public())
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
         self.assertEqual(code, 0, doc)
@@ -515,10 +517,33 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
         self.assertIn(ROOT_DOCKER_REPORT, doc["warnings"])
         code, doc = run(["verify", str(proj.root)])                       # no anchor: both warnings
         self.assertIn(ROOT_DOCKER_REPORT, doc["warnings"])
-        self.resign_report(proj, texts.KEEPER_GUARANTEE_V1)               # preflight finding 18
+        self.resign_report(proj, texts.KEEPER_GUARANTEE_V1)               # signed by a 0.4.0 keeper
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
         self.assertEqual((code, doc["problems"]), (1, []), doc)
         self.assertIn(UNCHECKED_GUARANTEE_REPORT, doc["warnings"])
+        for text, warning in ((texts.KEEPER_SAME_USER_GUARANTEE, SAME_USER_REPORT),
+                              ("a guarantee no version states", UNKNOWN_GUARANTEE_REPORT)):
+            with self.subTest(text):
+                self.resign_report(proj, text)
+                code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
+                self.assertEqual((code, doc["problems"]), (1, []), doc)
+                self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, warning])
+        self.resign_report(proj, texts.KEEPER_GUARANTEE)
+        code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
+        self.assertEqual(code, 0, doc)
+
+
+class ReportWarningsTest(unittest.TestCase):
+    """`report_warnings` is an allow-list: only the separate-user guarantee passes."""
+
+    def test_allow_list(self):
+        self.assertEqual(report_warnings({"report_guarantees": []}), [])
+        self.assertEqual(report_warnings({"report_guarantees": [texts.KEEPER_GUARANTEE] * 2}), [])
+        self.assertEqual(report_warnings({"report_guarantees": [texts.KEEPER_GUARANTEE, None]}),
+                         [UNKNOWN_GUARANTEE_REPORT])
+        self.assertEqual(report_warnings({"report_guarantees": [texts.KEEPER_SAME_USER_GUARANTEE,
+                                                                texts.KEEPER_ROOT_DOCKER_GUARANTEE]}),
+                         [ROOT_DOCKER_REPORT, SAME_USER_REPORT])
 
 
 if __name__ == "__main__":

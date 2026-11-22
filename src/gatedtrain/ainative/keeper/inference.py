@@ -17,15 +17,16 @@ empty keeper-owned output directory `/out`. Nothing about the items is passed in
   keeper's ownership check;
 - `environment`: what the signed environment record holds under `inference`;
 - `ready` (before the grant, so a refusal spends nothing): the generator's time limit fits the driver's wait for an
-  evaluation, eval trees are configured when it needs them, its script is a file of a distribution the keeper runs,
+  evaluation, eval trees are configured when it needs them and its interpreter is a regular file inside one, its script is a file of a distribution the keeper runs,
   the daemon and the image are unchanged, and for a GPU generator the GPU is free (AN-23's bounded wait; no
   `nvidia-smi` refuses);
 - `run_batch` (`batch.BatchRunner`): runs one container and reads `/out` back with `batch.read_predictions`. The
   daemon is checked again just before the start. Every failure of the container, the runtime or the files around it
-  is a crash (AN-9) whose message names an exit code, a time limit or an exception class, never a path into the
+  is a crash (AN-9), a daemon that changed since `ready` too, whose message names an exit code, a time limit, the
+  daemon check or an exception class, never a path into the
   keeper's state, an item or a prediction. The container and its run directory `state/run/<hex>/` are removed on
-  every path (best effort: a failed removal never changes the outcome; `remove_leftovers` at the next start removes
-  what is left). `last_run` is `{"arm", "image_id", "seconds", "gpu_seconds", "rc"}` of the last container started
+  every path (best effort: a failed removal never changes the outcome; `remove_leftovers` at the next start, before
+  the start checks, removes what is left). `last_run` is `{"arm", "image_id", "seconds", "gpu_seconds", "rc"}` of the last container started
   (`arm` None: the keeper's state sets it), or None when none started.
 """
 
@@ -94,7 +95,7 @@ def _plain_abs(p: Path, what: str) -> Path:
 @dataclass(frozen=True)
 class InferenceConfig:
     """`keeper serve --inference-image ID [--inference-ref REF] [--eval-tree DIR]... [--docker-host URL] [--docker
-    PATH]`: the image ID (`sha256:<64 hex>`) the keeper runs and refuses any other; the reference the daemon knows it by
+    PATH] [--nvidia-smi PATH]`: the image ID (`sha256:<64 hex>`) the keeper runs and refuses any other; the reference the daemon knows it by
     (default: the ID); the eval trees (absolute directories, mounted read-only at their own paths); the daemon; the
     Docker CLI and `nvidia-smi` the keeper calls by absolute path."""
 
@@ -124,6 +125,25 @@ def _seconds(st: ContainerState | None) -> int | None:
         return None
     a, b = (datetime.strptime(t, TIME_FORMAT).replace(tzinfo=timezone.utc) for t in (st.started_utc, st.finished_utc))
     return max(0, int((b - a).total_seconds()))
+
+
+def _open_up(path: Path, st: os.stat_result) -> None:
+    """Give a directory (already `lstat`ed: not a link) its owner's read, write and search permission."""
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o700 != 0o700:
+        os.chmod(path, mode | 0o700)
+
+
+def _remove_tree(path: Path) -> None:
+    """Remove `path` without following links; directories without their owner's permissions are opened up first."""
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(path)
+        return
+    _open_up(path, st)
+    for name in os.listdir(path):
+        _remove_tree(path / name)
+    os.rmdir(path)
 
 
 def _write_new(path: Path, data: bytes) -> None:
@@ -249,25 +269,36 @@ class KeeperInference:
         problems += self._cli_problems()
         return problems
 
-    def remove_leftovers(self) -> None:
-        """At start (the keeper holds its state lock): remove `state/run/*` (strict, as the model copies) and every
-        container labelled for the keeper (best effort)."""
+    def remove_leftovers(self) -> list[Problem]:
+        """At start, before the start checks (the keeper holds its state lock): remove every container labelled for
+        the keeper, best effort and only when the daemon's socket is already there (no wait here, so a daemon that
+        is not up yet leaves the bounded wait to `start_problems`), then `state/run/*`, strictly: a directory without
+        the owner's permissions is opened up first, links are never followed, and an entry that still cannot be
+        removed is an AN-13 start problem naming its path in the keeper's state. [] when everything is removed."""
+        path = self._socket_path()
+        if path is not None and os.path.exists(path):
+            try:
+                names = self.runtime.containers("=".join(KEEPER_LABEL))
+            except RuntimeFailure:
+                names = ()
+            for name in names:
+                self._remove_container(name)
         run = self.state_dir / RUN_DIR
-        if os.path.islink(run) or os.path.isfile(run):
-            os.unlink(run)
-        elif os.path.isdir(run):
-            for name in os.listdir(run):
-                p = run / name
-                if os.path.isdir(p) and not os.path.islink(p):
-                    shutil.rmtree(p)
-                else:
-                    os.unlink(p)
         try:
-            names = self.runtime.containers("=".join(KEEPER_LABEL))
-        except RuntimeFailure:
-            names = ()
-        for name in names:
-            self._remove_container(name)
+            if os.path.lexists(run):
+                st = os.lstat(run)
+                if not stat.S_ISDIR(st.st_mode):
+                    os.unlink(run)
+                else:
+                    _open_up(run, st)
+                    for name in os.listdir(run):
+                        _remove_tree(run / name)
+        except OSError as exc:
+            where = exc.filename if isinstance(exc.filename, (str, os.PathLike)) else run
+            return [_problem(RULE_ENV, "state", f"the keeper cannot remove the leftover run entry {os.fspath(where)} "
+                             f"in its state ({type(exc).__name__})",
+                             "remove it as the keeper user or as root, then start the keeper again")]
+        return []
 
     # ---- environment record (AN-13) --------------------------------------------------------------------------------
 
@@ -290,6 +321,23 @@ class KeeperInference:
 
     # ---- before the grant ------------------------------------------------------------------------------------------
 
+    def _interpreter_in_trees(self, interpreter: str) -> bool:
+        """The eval trees are mounted at their own paths, so the container path is the host path: it must lie inside
+        a configured tree, and resolve (links followed) to a regular file inside a configured tree."""
+        def inside(p: str, roots: list[str]) -> bool:
+            return any(p == r or p.startswith(r.rstrip("/") + "/") for r in roots)
+        named = [os.path.normpath(os.fspath(t)) for t in self.config.eval_trees]
+        real_trees = [os.path.realpath(t) for t in self.config.eval_trees]
+        if not inside(os.path.normpath(interpreter), named):
+            return False
+        real = os.path.realpath(interpreter)
+        if not inside(real, real_trees):
+            return False
+        try:
+            return stat.S_ISREG(os.lstat(real).st_mode)
+        except OSError:
+            return False
+
     def ready(self, gen: BatchGenerator) -> None:
         """Refused (AN-25, AN-13) unless `gen` can run now; see the module docstring. Called before the grant."""
         bound = GPU_WAIT_S + 2 * gen.time_limit_s + EVAL_SLACK_S
@@ -306,6 +354,12 @@ class KeeperInference:
                                     "keeper's eval trees, and this keeper has no eval tree configured",
                                     "start the keeper with --eval-tree (`gatedtrain setup host` builds "
                                     "/opt/gatedtrain-keeper)")])
+        if gen.eval_trees and not self._interpreter_in_trees(gen.interpreter):
+            raise Refused([_problem(RULE_BATCH, "batch_generator.interpreter", "the batch generator needs the "
+                                    "keeper's eval trees, and its interpreter is not a regular file inside a "
+                                    "configured eval tree (links resolved within the trees)",
+                                    "point the batch generator's interpreter at the eval venv's python under an "
+                                    "--eval-tree of the keeper")])
         if os.path.realpath(gen.script) not in self._distribution_files():
             raise Refused([_problem(RULE_ENV, "batch_generator.script", "the batch generator's script is not a file "
                                     "of a distribution in the keeper's environment record",
@@ -317,7 +371,8 @@ class KeeperInference:
             if self.probe.used_mib() is None:
                 raise Refused([_problem(RULE_BATCH, "gpu", "the keeper cannot read the GPU's memory use "
                                         "(nvidia-smi), so it does not start a GPU generator",
-                                        "install the NVIDIA driver's nvidia-smi at the keeper's --nvidia-smi path")])
+                                        "install the NVIDIA driver's nvidia-smi, or pass its absolute path to "
+                                        "`keeper serve --nvidia-smi`")])
             if not wait_for_gpu(self.probe, sleep=self.sleep, clock=self.clock):
                 raise Refused([_problem(RULE_BATCH, "gpu", f"the GPU is busy: other processes held more than "
                                         f"{GPU_BUSY_MIB} MiB of GPU memory for {GPU_WAIT_S} s",
@@ -380,7 +435,7 @@ class KeeperInference:
     def run_batch(self, gen: BatchGenerator, model: dict, items: list[dict], sampler: dict,
                   seeds: list) -> list[dict]:
         """One container for every item and seed of one arm; the predictions as `batch.read_predictions` returns
-        them, or Refused: AN-9 for a crash, AN-13 when the daemon changed since `ready`."""
+        them, or Refused (AN-9): a crash, or a daemon that changed since `ready` (the grant is already made)."""
         self.last_run = None
         hexid = secrets.token_hex(8)
         name = NAME_PREFIX + hexid
@@ -396,9 +451,10 @@ class KeeperInference:
                 _write_new(run_dir / "sampler.json", canonical_json(sampler_doc(sampler, seeds)))
                 os.mkdir(run_dir / "out", 0o700)
                 spec = self._spec(name, gen, run_dir, model_dir)
-                problems = self._daemon_problems()           # immediately before the start (Task 3 carry)
+                problems = self._daemon_problems()           # immediately before the start, after the grant
                 if problems:
-                    raise Refused(problems)
+                    raise Refused([_problem(RULE_CRASH, "inference", f"{p.message}; the attempt settles as not "
+                                            "passed", p.fix) for p in problems])
                 attempted = True
                 self.runtime.run(spec)
                 started = True
