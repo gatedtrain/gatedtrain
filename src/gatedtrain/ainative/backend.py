@@ -1,0 +1,845 @@
+"""AN-22: the local backend runs one project's jobs on the owner's rootless Docker daemon (design revision 25, 05 §18.10).
+
+A `Job` is checked by the launch rules `ext-launch` applies to a request (`job_problems`: isolation, the argv binding,
+the adapter's launch and argv rules), then recorded and started as a detached container (`runtime.Runtime`):
+
+    <project>/jobs/<seq:04d>-<label>/job.json          the job (environment names only), its key, the stage, the
+                                                       rootless setting, the host configuration hash, the script and
+                                                       interpreter hashes, the docker argument list (names only)
+    <project>/jobs/<seq:04d>-<label>/attempts.jsonl    rows `start`, `end`, `cancel_requested`, `stop`
+    <project>/jobs/<seq:04d>-<label>/attempt-<n>.log   the tail of attempt n's container log (at most 10 MiB)
+    <project>/jobs/<seq:04d>-<label>/lock              the job's lock (`fcntl.flock`)
+    <project>/jobs/output-dirs.jsonl                   the output directories `new_output_dir` created
+    <project>/jobs/lock                                the project's job lock (sequence numbers, keys, output dirs)
+
+Each attempt writes into a fresh directory `<output dir>/a<attempt>` mounted at the job's output path, so a retry
+never sees an earlier attempt's files. `submit` of a job whose key matches a queued, running or succeeded job of the
+project returns that job (a stage re-run after the driver died reattaches to its container). `status` inspects the
+current attempt and records its end once; a daemon error (`RuntimeFailure`) leaves the job's records unchanged.
+Environment values are never recorded or printed: a job's start needs them, so a job this process did not submit
+(or re-submit) is not started here.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import posixpath
+import re
+import stat
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
+
+from ..canonical import canonical_json, file_sha256, sha256_bytes
+from ..errors import Problem, Refused
+from ..ext import launch
+from ..ext.launch import HostConfig
+from .keeper_trust import project_id
+from .project import Project, _refuse_links, _write_atomic, append_jsonl, read_jsonl
+from .runtime import (TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount, RunSpec, Runtime,
+                      RuntimeFailure, docker_run_argv)
+
+JOB_SCHEMA = "gatedtrain.ainative.job"
+JOB_ATTEMPT_SCHEMA = "gatedtrain.ainative.job_attempt"
+OUTPUT_DIR_SCHEMA = "gatedtrain.ainative.output_dir"
+SCHEMA_VERSION = 1
+JOBS_DIR = "jobs"
+RULE = "AN-22"
+
+STATES = ("queued", "running", "succeeded", "failed", "cancelled", "timed_out", "budget_exhausted")
+TERMINAL = ("succeeded", "failed", "cancelled", "timed_out", "budget_exhausted")
+OUTCOMES = ("ok", "oom", "cancelled", "timed_out", "budget_exhausted", "preempted", "lost", "failed")
+RETRIED = ("failed", "preempted", "lost")
+OUTCOME_STATE = {"ok": "succeeded", "oom": "failed", "cancelled": "cancelled", "timed_out": "timed_out",
+                 "budget_exhausted": "budget_exhausted", "preempted": "failed", "lost": "failed", "failed": "failed"}
+STOP_REASONS = ("timed_out", "budget_exhausted")
+RC_SIGNALLED = (137, 143)               # SIGKILL, SIGTERM: a stop or a kill from outside
+LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+JOB_ID_RE = re.compile(r"([0-9]{4,})-([A-Za-z0-9][A-Za-z0-9_.-]{0,63})")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+LOG_CAP_BYTES = 10 * 1024 * 1024        # the saved container log: its tail, at most this many bytes
+LOCK, JOB_FILE, ATTEMPTS, OUTPUT_DIRS = "lock", "job.json", "attempts.jsonl", "output-dirs.jsonl"
+DIR_MODE = 0o755
+LABEL_PROJECT, LABEL_JOB = "gatedtrain.project", "gatedtrain.job"
+FIX = "fix the job and submit it again"
+
+
+def _problem(field: str, message: str, fix: str = FIX) -> Problem:
+    return Problem(RULE, field, message, fix)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _strs(x: Any) -> bool:
+    return isinstance(x, (tuple, list)) and all(isinstance(i, str) for i in x)
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Job:
+    """One container run. `runtime` is `{"kind": "container", "image"}` or `{"kind": "venv_in_container", "image",
+    "venv_lock"}` with the image pinned by digest; `mounts` are read-only inputs; the output directory is mounted
+    read-write at `output_container` (each attempt in its own `<output_dir>/a<n>`); `profile` is the ext profile the
+    adapter's argv rules apply (pre-flight finding 14)."""
+    label: str
+    adapter: str
+    runtime: Mapping[str, str]
+    framework: Mapping[str, str | None]
+    argv: tuple[str, ...]
+    env: Mapping[str, str]
+    mounts: tuple[Mount, ...]
+    output_dir: str
+    output_container: str
+    tmpfs: tuple[str, ...] = ()
+    network: str = "none"
+    gpu: bool = False
+    time_limit_s: int = 21600
+    gpu_hours_est: float = 0.0
+    training_seed: int = 0
+    max_attempts: int = 3
+    profile: str = "full"
+
+    def doc(self) -> dict[str, Any]:
+        """The job as canonical JSON values, the environment as names and values."""
+        return {"label": self.label, "adapter": self.adapter, "profile": self.profile,
+                "runtime": dict(self.runtime), "framework": dict(self.framework), "argv": list(self.argv),
+                "env": dict(self.env),
+                "mounts": [{"host": m.host, "container": m.container, "read_only": m.read_only} for m in self.mounts],
+                "output_dir": self.output_dir, "output_container": self.output_container, "tmpfs": list(self.tmpfs),
+                "network": self.network, "gpu": self.gpu, "time_limit_s": self.time_limit_s,
+                "gpu_hours_est": self.gpu_hours_est, "training_seed": self.training_seed,
+                "max_attempts": self.max_attempts}
+
+    def key(self) -> str:
+        return sha256_bytes(canonical_json(self.doc()))
+
+
+def _record_doc(job: Job) -> dict[str, Any]:
+    """`job.doc()` with the environment names only (MM-35)."""
+    doc = job.doc()
+    doc["env"] = sorted(doc["env"])
+    return doc
+
+
+def job_request(job: Job, cfg: HostConfig) -> dict[str, Any]:
+    """The ext-launch request the job is checked as (`launch.isolation_problems`, kind "request")."""
+    mounts = [{"host": m.host, "container": m.container, "mode": "ro" if m.read_only else "rw"} for m in job.mounts]
+    mounts.append({"host": job.output_dir, "container": job.output_container, "mode": "rw"})
+    return {"area": 0, "label": job.label, "host_work": cfg.host_work, "runtime": dict(job.runtime),
+            "framework": dict(job.framework), "training_seed": job.training_seed, "gpus": job.gpu,
+            "network": job.network, "network_reason": None, "user": launch.container_user(cfg), "env": dict(job.env),
+            "mounts": mounts, "tmpfs": list(job.tmpfs), "output_dir": job.output_dir, "gpu_est_h": job.gpu_hours_est,
+            "argv": list(job.argv)}
+
+
+def _shape_problems(job: Any) -> list[Problem]:
+    """The field types `job_request` and `Job.doc` rely on, and the backend's own limits."""
+    if not isinstance(job, Job):
+        return [_problem("job", f"{type(job).__name__} is not a Job")]
+    out: list[Problem] = []
+    if not (isinstance(job.label, str) and LABEL_RE.fullmatch(job.label)):
+        out.append(_problem("job.label", f"label {job.label!r} is not a plain name of at most 64 characters "
+                            "(letters, digits, _ . -; first a letter or digit)"))
+    if not isinstance(job.adapter, str):
+        out.append(_problem("job.adapter", "the adapter is not a name"))
+    if job.profile not in launch.PROFILES:
+        out.append(_problem("job.profile", f"profile {job.profile!r} is not one of {', '.join(launch.PROFILES)}"))
+    for name in ("runtime", "framework", "env"):
+        if not isinstance(getattr(job, name), Mapping):
+            out.append(_problem(f"job.{name}", f"{name} is not a mapping"))
+    if isinstance(job.env, Mapping) and not all(isinstance(k, str) for k in job.env):
+        out.append(_problem("job.env", "environment names are not strings"))
+    if not (_strs(job.argv) and job.argv):
+        out.append(_problem("job.argv", "argv is not a non-empty sequence of strings"))
+    if not (isinstance(job.mounts, (tuple, list)) and all(
+            isinstance(m, Mount) and isinstance(m.host, str) and isinstance(m.container, str)
+            and isinstance(m.read_only, bool) for m in job.mounts)):
+        out.append(_problem("job.mounts", "mounts are not a sequence of Mount"))
+    for name in ("output_dir", "output_container", "network"):
+        if not isinstance(getattr(job, name), str):
+            out.append(_problem(f"job.{name}", f"{name} is not a string"))
+    if not _strs(job.tmpfs):
+        out.append(_problem("job.tmpfs", "tmpfs is not a sequence of container paths"))
+    if not isinstance(job.gpu, bool):
+        out.append(_problem("job.gpu", "gpu is not true or false"))
+    if not _num(job.gpu_hours_est):
+        out.append(_problem("job.gpu_hours_est", "gpu_hours_est is not a number"))
+    elif job.gpu is True and not job.gpu_hours_est > 0:
+        out.append(_problem("job.gpu_hours_est", f"a GPU job needs a positive GPU-hour estimate, not "
+                            f"{job.gpu_hours_est!r}", "give the job's estimated GPU-hours (from a smoke run)"))
+    if not _int(job.training_seed):
+        out.append(_problem("job.training_seed", "training_seed is not an integer"))
+    for name in ("time_limit_s", "max_attempts"):
+        v = getattr(job, name)
+        if not (_int(v) and v >= 1):
+            out.append(_problem(f"job.{name}", f"{name} {v!r} is not an integer of at least 1"))
+    return out
+
+
+def job_problems(job: Job, cfg: HostConfig, *, socket_gids: set[int] | None = None,
+                 fresh_output: bool = True) -> list[Problem]:
+    """AN-22: every rule the job breaks, before anything starts: the launch rules ext-launch applies to a request
+    (isolation, the argv binding, the adapter's launch and argv rules; the EXT message kept, field `job.<request
+    field>`), an unknown adapter, a GPU job without a positive estimate, a time limit or attempt count below 1, a label
+    that is not a plain name of at most 64 characters. `fresh_output` False drops the empty-output rule (EXT-63), for
+    the job a re-submit reattaches to."""
+    from ..ext import registry
+
+    out = _shape_problems(job)
+    if out:
+        return out
+    try:
+        ad = registry.adapter(job.adapter)
+    except KeyError:
+        return [_problem("job.adapter", f"no ext adapter {job.adapter!r} is registered",
+                         f"use one of {', '.join(sorted(registry.ADAPTERS)) or 'the installed adapters'}")]
+    acfg = launch.adapter_config(cfg, job.adapter)
+    try:
+        req = job_request(job, acfg)
+    except ValueError as exc:                                # container_user: the owner is no user of this host
+        return [_problem("job.user", str(exc), "run the backend as a user of this host")]
+    for f, msg in launch.isolation_problems(req, kind="request", framework=ad.framework_name, config=acfg,
+                                            socket_gids=socket_gids, fresh_output=fresh_output):
+        out.append(_problem(f"job.{f}", msg))
+    binding, why = launch.bind_argv(req["argv"], req["mounts"], interpreter=acfg.interpreter,
+                                    trees=acfg.interpreter_trees, image_interpreters=acfg.image_interpreters,
+                                    interpreter_flags=acfg.interpreter_flags)
+    if binding is None:
+        out.append(_problem("job.argv", why))
+    out += [Problem(RULE, p.field, p.message, p.fix)                                          # EXT-190 to EXT-193
+            for p in launch.adapter_launch_problems(req, adapter=job.adapter, kind="request", flag="job", fix=FIX)]
+    if hasattr(ad, "argv_problems"):                                                          # EXT-133, EXT-156
+        out += [_problem("job.argv", msg) for msg in ad.argv_problems(req["argv"], profile=job.profile)]
+    return out
+
+
+@dataclass(frozen=True)
+class JobStatus:
+    job_id: str
+    state: str
+    attempt: int
+    rc: int | None
+    outcome: str | None
+    gpu_seconds: int
+    seconds: int
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class _View:
+    status: JobStatus
+    pending: bool                   # an attempt is due to start (the first, or a retry)
+    stop_reason: str | None         # the current attempt's `stop` row reason
+
+
+def _summarize(job_id: str, max_attempts: int, rows: list[dict]) -> _View:
+    """The job's state from its attempt rows alone (no runtime)."""
+    starts = [r for r in rows if r.get("event") == "start"]
+    ends = {r["attempt"]: r for r in rows if r.get("event") == "end"}
+    cancel = any(r.get("event") == "cancel_requested" for r in rows)
+    attempt = max((r["attempt"] for r in starts), default=0)
+    stops = [r for r in rows if r.get("event") == "stop" and r.get("attempt") == attempt]
+    stop_reason = stops[-1]["reason"] if stops else None
+    gpu = sum(int(e.get("gpu_seconds") or 0) for e in ends.values())
+    secs = sum(int(e.get("seconds") or 0) for e in ends.values())
+    last = ends.get(attempt)
+    rc = last.get("rc") if last else None
+    outcome = last.get("outcome") if last else None
+    pending = False
+    reason = None
+    if attempt == 0:
+        state, pending = ("cancelled", False) if cancel else ("queued", True)
+        reason = "cancelled before it started" if cancel else None
+    elif last is None:
+        state = "running"
+    elif outcome in RETRIED and attempt < max_attempts:
+        state, pending = ("cancelled", False) if cancel else ("queued", True)
+        reason = f"attempt {attempt} ended {outcome}" + ("" if cancel else "; it is retried")
+    else:
+        state = OUTCOME_STATE.get(outcome, "failed")
+        if state != "succeeded":
+            reason = f"attempt {attempt} ended {outcome}" + (f" (rc {rc})" if rc is not None else "")
+    return _View(JobStatus(job_id, state, attempt, rc, outcome, gpu, secs, reason), pending, stop_reason)
+
+
+def _outcome(st: ContainerState, cancel: bool, stop_reason: str | None) -> str:
+    if st.status == "missing":
+        return "cancelled" if cancel else "lost"
+    if st.exit_code == 0:
+        return "ok"
+    if st.oom_killed:
+        return "oom"
+    if cancel:
+        return "cancelled"
+    if stop_reason in STOP_REASONS:
+        return stop_reason
+    if st.exit_code in RC_SIGNALLED:
+        return "preempted"
+    return "failed"
+
+
+def _seconds(started: str | None, finished: str | None) -> int:
+    if not (started and finished):
+        return 0
+    a = datetime.strptime(started, TIME_FORMAT)
+    b = datetime.strptime(finished, TIME_FORMAT)
+    return max(0, int((b - a).total_seconds()))
+
+
+def _sha256_nofollow(path: str) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        h = hashlib.sha256()
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def _record_argv(argv: list[str]) -> list[str]:
+    """The docker argument list with each `-e NAME=value` replaced by `-e NAME` (MM-35)."""
+    out = list(argv)
+    for i in range(len(out) - 1):
+        if out[i] == "-e":
+            out[i + 1] = out[i + 1].split("=", 1)[0]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The backend
+# ---------------------------------------------------------------------------
+
+class LocalBackend:
+    """AN-22: one project's jobs on one daemon. Nothing is read or started when it is constructed: the runtime
+    (default `DockerCLIRuntime` on the context `gatedtrain`) and the host layout (default `launch.host_config()`) are
+    built at first use. `probe`, `clock` and `sleep` serve the GPU wait, the attempt times and `wait`."""
+
+    def __init__(self, project: Project, runtime: Runtime | None = None, *, host: HostConfig | None = None,
+                 probe: GpuProbe | None = None, clock: Callable[[], datetime] = _utc_now,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+        self.project = project
+        self._runtime = runtime
+        self._host = host
+        self.probe = probe
+        self.clock = clock
+        self.sleep = sleep
+        self._jobs: dict[str, Job] = {}         # jobs this backend submitted: their environment values start them
+        self._pid: str | None = None
+
+    # -- lazily built ------------------------------------------------------------------------------------------------
+
+    @property
+    def runtime(self) -> Runtime:
+        if self._runtime is None:
+            self._runtime = DockerCLIRuntime(context=launch.DOCKER_CONTEXT)
+        return self._runtime
+
+    def host(self) -> HostConfig:
+        if self._host is None:
+            self._host = launch.host_config()
+        return self._host
+
+    def project_hex(self) -> str:
+        if self._pid is None:
+            self._pid = project_id(self.project)[len("sha256:"):]
+        return self._pid
+
+    def _utc(self) -> str:
+        return self.clock().strftime(TIME_FORMAT)
+
+    # -- records -----------------------------------------------------------------------------------------------------
+
+    def _rel(self, *parts: str) -> str:
+        return "/".join((JOBS_DIR,) + parts)
+
+    def _jobs_dir(self) -> Path:
+        _refuse_links(self.project.root, JOBS_DIR)
+        d = self.project.root / JOBS_DIR
+        d.mkdir(exist_ok=True)
+        return d
+
+    @contextlib.contextmanager
+    def _lock(self, rel: str) -> Iterator[None]:
+        _refuse_links(self.project.root, rel)
+        fd = os.open(self.project.root / rel, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    def _append(self, job_id: str, event: str, **fields: Any) -> None:
+        row = {"event": event, **fields, "utc": self._utc(), "schema": JOB_ATTEMPT_SCHEMA,
+               "schema_version": SCHEMA_VERSION}
+        append_jsonl(self.project.root, self._rel(job_id, ATTEMPTS), row)
+
+    def _rows(self, job_id: str) -> list[dict]:
+        return read_jsonl(self.project.root, self._rel(job_id, ATTEMPTS))
+
+    def _record(self, job_id: str) -> dict[str, Any]:
+        if not (isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id)):
+            raise Refused([_problem("job_id", f"{job_id!r} is not a job id (<seq>-<label>)",
+                                    "use an id `submit` or the job list returned")])
+        rel = self._rel(job_id, JOB_FILE)
+        _refuse_links(self.project.root, rel)
+        try:
+            rec = json.loads((self.project.root / rel).read_bytes().decode("utf-8"))
+        except FileNotFoundError:
+            raise Refused([_problem("job_id", f"the project has no job {job_id}",
+                                    "use an id `submit` or the job list returned")]) from None
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise Refused([_problem(rel, f"cannot read the job record ({exc.__class__.__name__})",
+                                    "the record was damaged; restore it from a copy")]) from None
+        if not (isinstance(rec, dict) and rec.get("schema") == JOB_SCHEMA
+                and rec.get("schema_version") == SCHEMA_VERSION and rec.get("job_id") == job_id
+                and isinstance(rec.get("job"), dict)):
+            raise Refused([_problem(rel, f"not a {JOB_SCHEMA} version {SCHEMA_VERSION} record of job {job_id}",
+                                    "the record was damaged; restore it from a copy")])
+        return rec
+
+    def _view(self, job_id: str, rec: Mapping[str, Any]) -> _View:
+        return _summarize(job_id, int(rec["job"]["max_attempts"]), self._rows(job_id))
+
+    def _job_ids(self) -> list[str]:
+        d = self.project.root / JOBS_DIR
+        _refuse_links(self.project.root, JOBS_DIR)
+        if not d.is_dir():
+            return []
+        ids = [e.name for e in os.scandir(d) if JOB_ID_RE.fullmatch(e.name) and e.is_dir(follow_symlinks=False)]
+        return sorted(ids, key=lambda i: (int(i.split("-", 1)[0]), i))
+
+    def _container(self, job_id: str, attempt: int) -> str:
+        return f"gatedtrain-{self.project_hex()[:12]}-{job_id}-a{attempt}"
+
+    @staticmethod
+    def _attempt_dir(rec: Mapping[str, Any], attempt: int) -> str:
+        return os.path.join(rec["job"]["output_dir"], f"a{attempt}")
+
+    # -- checks before a start ---------------------------------------------------------------------------------------
+
+    def _daemon_and_image(self, job: Job, cfg: HostConfig) -> None:
+        """AN-22 before any start: on a rootless host the daemon is rootless and its socket the owner's (pre-flight
+        finding 3); the daemon holds the image (no run pulls one). A daemon error raises RuntimeFailure."""
+        problems = []
+        if cfg.rootless:
+            info = self.runtime.daemon()
+            uid = launch.owner_uid(cfg)
+            if not info.rootless:
+                problems.append(_problem("daemon", "the Docker daemon the backend reaches is not rootless, while the "
+                                         "host file says `rootless = true`: a container would run as root on the "
+                                         "host", "point the context `gatedtrain` at the owner's rootless daemon "
+                                         f"(unix://{launch.rootless_socket(cfg)})"))
+            elif info.socket_uid != uid:
+                problems.append(_problem("daemon", f"the daemon's socket {info.socket or '(not a unix socket)'} is "
+                                         f"owned by uid {info.socket_uid}, not the owner's uid {uid}",
+                                         "point the context `gatedtrain` at the owner's rootless daemon "
+                                         f"(unix://{launch.rootless_socket(cfg)})"))
+        image = job.runtime["image"]
+        if self.runtime.image_id(image) is None:
+            problems.append(_problem("job.runtime.image", f"the daemon does not hold the image {image}; no job pulls "
+                                     "an image", f"pull or build it first: docker --context {launch.DOCKER_CONTEXT} "
+                                     f"pull {image}"))
+        if problems:
+            raise Refused(problems)
+
+    def _spec(self, job: Job, cfg: HostConfig, job_id: str, attempt: int, out_dir: str) -> RunSpec:
+        """The container of one attempt: the request's options as ext-launch prints them, with the adapter's run
+        options (EXT-191) and the attempt's own output directory."""
+        from ..ext import registry
+
+        argv = list(job.argv)
+        script = (posixpath.basename(argv[launch.script_index(argv, registry.interpreter_flags(job.adapter))])
+                  if len(argv) > 1 else "")
+        options, tmpfs_options = registry.run_options(job.adapter, script)
+        shm = [o[len("--shm-size="):] for o in options if o.startswith("--shm-size=")]
+        return RunSpec(name=self._container(job_id, attempt), image=job.runtime["image"], argv=tuple(argv),
+                       env=tuple(sorted(job.env.items())),
+                       mounts=tuple(job.mounts) + (Mount(out_dir, job.output_container, read_only=False),),
+                       user=launch.container_user(cfg), network=job.network,
+                       gpu_options=launch.gpu_options(cfg.rootless) if job.gpu else (),
+                       tmpfs=tuple((t, tmpfs_options or launch.TMPFS_OPTIONS) for t in job.tmpfs),
+                       shm_size=shm[0] if shm else launch.SHM_SIZE[len("--shm-size="):],
+                       labels=((LABEL_JOB, job_id), (LABEL_PROJECT, self.project_hex())),
+                       extra_options=tuple(o for o in options if not o.startswith("--shm-size=")))
+
+    def _fresh_attempt_dir(self, path: str, cfg: HostConfig) -> None:
+        """`<output dir>/a<n>`: created (owner, 0755), or an existing empty owner directory (a start cut short)."""
+        try:
+            os.mkdir(path, DIR_MODE)
+            os.chmod(path, DIR_MODE)
+        except FileExistsError:
+            pass
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != launch.owner_uid(cfg) or os.listdir(path):
+            raise Refused([_problem("job.output_dir", f"the attempt directory {path} exists and is not an empty "
+                                    "directory of the owner; an attempt writes into a fresh directory",
+                                    "remove it, or submit the job with a new output directory")])
+
+    # -- submit ------------------------------------------------------------------------------------------------------
+
+    def _find(self, key: str) -> str | None:
+        """The newest job of the project with this key that is queued, running or succeeded."""
+        for job_id in reversed(self._job_ids()):
+            try:
+                rec = self._record(job_id)
+            except Refused:
+                continue
+            if rec.get("key") == key and self._view(job_id, rec).status.state in ("queued", "running", "succeeded"):
+                return job_id
+        return None
+
+    def submit(self, job: Job, *, stage: str = "") -> str:
+        """AN-22: the job's id. A job of this project with the same key that is queued, running or succeeded is
+        returned after its record is checked against the launch rules (without the fresh-output rule) and nothing
+        starts; else the job is checked (`job_problems`), the daemon and image are checked, the record is written and
+        attempt 1 starts."""
+        problems = _shape_problems(job)
+        if problems:
+            raise Refused(problems)
+        cfg = launch.adapter_config(self.host(), job.adapter)
+        key = job.key()
+        self._jobs_dir()
+        with self._lock(self._rel(LOCK)):
+            found = self._find(key)
+            if found is not None:                                    # reattach (pre-flight finding 1)
+                rec = self._record(found)
+                problems = job_problems(job, cfg, fresh_output=False)
+                if rec["job"] != _record_doc(job):
+                    problems.append(_problem(f"{JOBS_DIR}/{found}/{JOB_FILE}", "the job record does not match the "
+                                             "job of its key: the record was changed",
+                                             "restore the record, or submit the job with a new output directory"))
+                for k, now in (("rootless", cfg.rootless), ("host_config_sha256", launch.host_config_sha256(cfg))):
+                    if rec.get(k) != now:
+                        problems.append(_problem(f"{JOBS_DIR}/{found}/{JOB_FILE}.{k}", f"the job was recorded with "
+                                                 f"{k} {rec.get(k)!r}, this host has {now!r}",
+                                                 "run the job on the host layout it was submitted under"))
+                if problems:
+                    raise Refused(problems)
+                self._jobs[found] = job
+                return found
+            problems = job_problems(job, cfg)
+            if problems:
+                raise Refused(problems)
+            self._daemon_and_image(job, cfg)
+            job_id = self._new_job(job, cfg, key, stage)
+        self._jobs[job_id] = job
+        with self._lock(self._rel(job_id, LOCK)):
+            self._start(job_id, self._record(job_id), job, 1, checked=True)
+        return job_id
+
+    def _new_job(self, job: Job, cfg: HostConfig, key: str, stage: str) -> str:
+        ids = self._job_ids()
+        seq = max((int(i.split("-", 1)[0]) for i in ids), default=0) + 1
+        job_id = f"{seq:04d}-{job.label}"
+        jdir = self.project.root / JOBS_DIR / job_id
+        os.mkdir(jdir, DIR_MODE)
+        out_dir = os.path.join(job.output_dir, "a1")
+        self._fresh_attempt_dir(out_dir, cfg)
+        binding, _ = launch.bind_argv(list(job.argv), job_request(job, cfg)["mounts"], interpreter=cfg.interpreter,
+                                      trees=cfg.interpreter_trees, image_interpreters=cfg.image_interpreters,
+                                      interpreter_flags=cfg.interpreter_flags)
+        spec = self._spec(job, cfg, job_id, 1, out_dir)
+        rec = {"schema": JOB_SCHEMA, "schema_version": SCHEMA_VERSION, "job_id": job_id, "key": key, "stage": stage,
+               "job": _record_doc(job), "rootless": cfg.rootless, "host_config_sha256": launch.host_config_sha256(cfg),
+               "script_sha256": file_sha256(Path(binding.script_host)),
+               "interpreter_sha256": (file_sha256(Path(binding.interpreter_host))
+                                      if binding.interpreter_host is not None else None),
+               "docker_argv": _record_argv(docker_run_argv(spec, context=launch.DOCKER_CONTEXT)),
+               "utc": self._utc()}
+        rel = self._rel(job_id, JOB_FILE)
+        _refuse_links(self.project.root, rel)
+        _write_atomic(self.project.root / rel, canonical_json(rec))
+        return job_id
+
+    # -- one attempt -------------------------------------------------------------------------------------------------
+
+    def _start(self, job_id: str, rec: Mapping[str, Any], job: Job | None, attempt: int, *,
+               checked: bool = False) -> None:
+        """Start attempt `attempt` under the job's lock. A container of that attempt the daemon already holds (a
+        start whose `start` row a crash cut off) is adopted when it is running or exited, and removed when it was only
+        created; a container a failed start left behind is removed (or adopted when it runs after all)."""
+        if job is None or job.key() != rec["key"]:
+            raise Refused([_problem("job_id", f"job {job_id} has an attempt due, and its environment values are "
+                                    "never recorded", "submit the job again (the same job reattaches) and poll it")])
+        cfg = launch.adapter_config(self.host(), job.adapter)
+        if not checked:
+            self._daemon_and_image(job, cfg)
+        name = self._container(job_id, attempt)
+        out_dir = self._attempt_dir(rec, attempt)
+        st = self.runtime.inspect(name)
+        if st.status in ("running", "exited"):
+            self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir)
+            return
+        if st.status == "created":
+            self.runtime.remove(name)
+        self._fresh_attempt_dir(out_dir, cfg)
+        spec = self._spec(job, cfg, job_id, attempt, out_dir)
+        try:
+            cid = self.runtime.run(spec)
+        except RuntimeFailure:
+            with contextlib.suppress(RuntimeFailure):
+                left = self.runtime.inspect(name)
+                if left.status == "running":                        # started after all (a CLI timeout)
+                    self._append(job_id, "start", attempt=attempt, container=name, name=name, output=out_dir)
+                    return
+                if left.status != "missing":
+                    self.runtime.remove(name)
+            raise
+        self._append(job_id, "start", attempt=attempt, container=cid, name=name, output=out_dir)
+
+    def _end(self, job_id: str, rec: Mapping[str, Any], view: _View, st: ContainerState, rows: list[dict]) -> None:
+        """Record the end of the current attempt once (under the job's lock): its outcome, times and the tail of its
+        log; then remove the container."""
+        attempt = view.status.attempt
+        name = self._container(job_id, attempt)
+        cancel = any(r.get("event") == "cancel_requested" for r in rows)
+        outcome = _outcome(st, cancel, view.stop_reason)
+        if st.status != "missing":
+            log = self.runtime.logs(name)
+            rel = self._rel(job_id, f"attempt-{attempt}.log")
+            _refuse_links(self.project.root, rel)
+            _write_atomic(self.project.root / rel, log[-LOG_CAP_BYTES:])
+        seconds = _seconds(st.started_utc, st.finished_utc)
+        self._append(job_id, "end", attempt=attempt, outcome=outcome, rc=st.exit_code, started_utc=st.started_utc,
+                     finished_utc=st.finished_utc, seconds=seconds,
+                     gpu_seconds=seconds if rec["job"]["gpu"] else 0)
+        if st.status != "missing":
+            with contextlib.suppress(RuntimeFailure):                # the end is recorded; a leftover is harmless
+                self.runtime.remove(name)
+
+    def _advance(self, job_id: str, rec: Mapping[str, Any]) -> JobStatus:
+        """Under the job's lock: start a due attempt, or inspect the running one and record its end (then start a
+        retry when one is due). A RuntimeFailure leaves the records as they were."""
+        view = self._view(job_id, rec)
+        if view.status.state in TERMINAL:
+            return view.status
+        if view.status.state == "running":
+            st = self.runtime.inspect(self._container(job_id, view.status.attempt))
+            if st.status in ("running", "created"):
+                return view.status
+            self._end(job_id, rec, view, st, self._rows(job_id))
+            view = self._view(job_id, rec)
+        if view.pending:
+            self._start(job_id, rec, self._jobs.get(job_id), view.status.attempt + 1)
+            view = self._view(job_id, rec)
+        return view.status
+
+    # -- public operations -------------------------------------------------------------------------------------------
+
+    def status(self, job_id: str) -> JobStatus:
+        rec = self._record(job_id)
+        with self._lock(self._rel(job_id, LOCK)):
+            return self._advance(job_id, rec)
+
+    def wait(self, job_id: str, *, poll_s: float = 10.0) -> JobStatus:
+        while True:
+            s = self.status(job_id)
+            if s.state in TERMINAL:
+                return s
+            self.sleep(poll_s)
+
+    def logs(self, job_id: str, *, tail: int | None = 200) -> str:
+        """The current attempt's log: from the daemon while it runs, from the saved tail once its end is recorded."""
+        if tail is not None and not (_int(tail) and tail >= 0):
+            raise Refused([_problem("tail", f"{tail!r} is not a count of lines", "pass a count of lines")])
+        rec = self._record(job_id)
+        rows = self._rows(job_id)
+        attempt = _summarize(job_id, int(rec["job"]["max_attempts"]), rows).status.attempt
+        if attempt == 0:
+            return ""
+        if any(r.get("event") == "end" and r.get("attempt") == attempt for r in rows):
+            rel = self._rel(job_id, f"attempt-{attempt}.log")
+            _refuse_links(self.project.root, rel)
+            try:
+                data = (self.project.root / rel).read_bytes()
+            except FileNotFoundError:
+                data = b""
+            if tail is not None:
+                lines = data.splitlines(keepends=True)
+                data = b"".join(lines[-tail:]) if tail else b""
+        else:
+            data = self.runtime.logs(self._container(job_id, attempt), tail=tail)
+        return data.decode("utf-8", "replace")
+
+    def cancel(self, job_id: str) -> JobStatus:
+        """Record `cancel_requested`, then stop the running container; the end is recorded `cancelled`."""
+        rec = self._record(job_id)
+        with self._lock(self._rel(job_id, LOCK)):
+            view = self._view(job_id, rec)
+            if view.status.state in TERMINAL:
+                return view.status
+            self._append(job_id, "cancel_requested")
+            if view.status.state == "running":
+                self.runtime.stop(self._container(job_id, view.status.attempt))
+            return self._advance(job_id, rec)
+
+    def jobs(self) -> list[JobStatus]:
+        """Every job's state from its records alone (no runtime)."""
+        out = []
+        for job_id in self._job_ids():
+            rec = self._record(job_id)
+            out.append(self._view(job_id, rec).status)
+        return out
+
+    # -- outputs -----------------------------------------------------------------------------------------------------
+
+    def new_output_dir(self, name: str) -> Path:
+        """`<output_root>/gatedtrain-<project id prefix>/<name>` (owner, 0755): created, or returned again when it is
+        a plain owner directory this project created (pre-flight finding 1); otherwise refused."""
+        if not (isinstance(name, str) and NAME_RE.fullmatch(name)):
+            raise Refused([_problem("name", f"{name!r} is not a plain name (letters, digits, _ . -; first a letter or "
+                                    "digit; at most 100 characters)", "pass a plain directory name")])
+        cfg = self.host()
+        uid = launch.owner_uid(cfg)
+        root = cfg.output_root
+        if not os.path.isdir(root):
+            raise Refused([_problem("output_root", f"the output root {root} is not a directory",
+                                    "create it, or set `output_root` in the host file")])
+        base = os.path.join(root, f"gatedtrain-{self.project_hex()[:12]}")
+        target = os.path.join(base, name)
+        self._jobs_dir()
+        rel = self._rel(OUTPUT_DIRS)
+        with self._lock(self._rel(LOCK)):
+            try:
+                os.mkdir(base, DIR_MODE)
+                os.chmod(base, DIR_MODE)
+            except FileExistsError:
+                pass
+            st = os.lstat(base)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                raise Refused([_problem("output_root", f"{base} is not a directory of the owner (uid {uid})",
+                                        "remove it; the backend creates it")])
+            mine = any(r.get("path") == target for r in read_jsonl(self.project.root, rel))
+            try:
+                st = os.lstat(target)
+            except FileNotFoundError:
+                os.mkdir(target, DIR_MODE)
+                os.chmod(target, DIR_MODE)
+                append_jsonl(self.project.root, rel, {"schema": OUTPUT_DIR_SCHEMA, "schema_version": SCHEMA_VERSION,
+                                                      "name": name, "path": target, "utc": self._utc()})
+                return Path(target)
+            if not (mine and stat.S_ISDIR(st.st_mode) and st.st_uid == uid):
+                raise Refused([_problem("name", f"{target} exists and is not a plain directory of the owner that "
+                                        "this project created", "pick another name")])
+            return Path(target)
+
+    def _succeeded_dir(self, job_id: str, op: str) -> str:
+        rec = self._record(job_id)
+        view = self._view(job_id, rec)
+        if view.status.state != "succeeded":
+            raise Refused([_problem("job_id", f"job {job_id} is {view.status.state}; {op} reads a succeeded job's "
+                                    "output only", "wait for the job to succeed")])
+        return self._attempt_dir(rec, view.status.attempt)
+
+    def artifacts(self, job_id: str) -> dict[str, Any]:
+        """The succeeded attempt's files `{path, size, sha256}` sorted by path; a symbolic link or a non-regular file
+        anywhere in the output is refused."""
+        top = self._succeeded_dir(job_id, "artifacts")
+        files: list[dict[str, Any]] = []
+        problems: list[Problem] = []
+
+        def walk(d: str, rel: str) -> None:
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name)
+            for e in entries:
+                r = f"{rel}{e.name}"
+                if e.is_symlink():
+                    problems.append(_problem(f"artifacts.{r}", "is a symbolic link; a job's output holds files and "
+                                             "directories only", "write the file itself, not a link"))
+                elif e.is_dir(follow_symlinks=False):
+                    walk(e.path, r + "/")
+                elif e.is_file(follow_symlinks=False):
+                    files.append({"path": r, "size": e.stat(follow_symlinks=False).st_size,
+                                  "sha256": _sha256_nofollow(e.path)})
+                else:
+                    problems.append(_problem(f"artifacts.{r}", "is not a regular file (a FIFO, socket or device)",
+                                             "write regular files only"))
+
+        st = os.lstat(top)
+        if not stat.S_ISDIR(st.st_mode):
+            raise Refused([_problem("artifacts", f"{top} is not a directory", "rerun the job")])
+        walk(top, "")
+        if problems:
+            raise Refused(problems)
+        return {"job_id": job_id, "output_dir": top, "files": sorted(files, key=lambda f: f["path"])}
+
+    def hand_off(self, job_id: str, paths: list[str]) -> list[dict[str, str]]:
+        """`[{path, sha256}]` for the model files a model reference lists, each checked readable by the keeper user:
+        inside the succeeded attempt's directory, no symbolic link on the way, a regular file with `o+r`, and every
+        directory from the output root down to it with `o+x`."""
+        top = self._succeeded_dir(job_id, "hand_off")
+        top_real = os.path.realpath(top)
+        root_real = os.path.realpath(self.host().output_root)
+        out: list[dict[str, str]] = []
+        problems: list[Problem] = []
+        fix = "make the file a regular file readable by other users, in directories they can enter (chmod o+r, o+x)"
+        for i, p in enumerate(paths):
+            f = f"hand_off.paths[{i}]"
+            if not (isinstance(p, str) and p):
+                problems.append(_problem(f, f"{p!r} is not a path", "pass the model files' paths"))
+                continue
+            path = os.path.normpath(p if os.path.isabs(p) else os.path.join(top, p))
+            rel = os.path.relpath(path, os.path.normpath(top))
+            if rel == "." or rel == ".." or rel.startswith("../"):
+                problems.append(_problem(f, f"{p} is not inside the job's output {top}",
+                                         "hand off files of the succeeded attempt only"))
+                continue
+            why = None
+            cur = top_real
+            parts = rel.split("/")
+            for n, part in enumerate(parts):
+                cur = os.path.join(cur, part)
+                try:
+                    st = os.lstat(cur)
+                except OSError as exc:
+                    why = f"{cur} cannot be read ({exc.__class__.__name__})"
+                    break
+                if stat.S_ISLNK(st.st_mode):
+                    why = f"{cur} is a symbolic link"
+                    break
+                if n < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+                    why = f"{cur} is not a directory"
+                    break
+            else:
+                if not stat.S_ISREG(st.st_mode):
+                    why = f"{cur} is not a regular file"
+                elif not st.st_mode & stat.S_IROTH:
+                    why = f"{cur} is not readable by other users (mode {stat.S_IMODE(st.st_mode):04o}, no o+r)"
+                else:
+                    d = os.path.dirname(cur)
+                    chain = [d]
+                    while d != root_real and d.startswith(root_real + "/"):
+                        d = os.path.dirname(d)
+                        chain.append(d)
+                    for d in reversed(chain):
+                        dm = os.stat(d).st_mode
+                        if not dm & stat.S_IXOTH:
+                            why = f"the directory {d} cannot be entered by other users (mode {stat.S_IMODE(dm):04o}, " \
+                                  "no o+x)"
+                            break
+            if why:
+                problems.append(_problem(f, f"{p}: {why}; the keeper user must read the file", fix))
+                continue
+            out.append({"path": cur, "sha256": _sha256_nofollow(cur)})
+        if problems:
+            raise Refused(problems)
+        return out
+

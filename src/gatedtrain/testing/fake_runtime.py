@@ -29,7 +29,7 @@ from ..ainative.runtime import (TIME_FORMAT, ContainerState, DaemonInfo, Mount, 
 from ..ext import launch
 
 Handler = Callable[[RunSpec, Callable[[str], Path]], int]
-OUTCOMES = ("ok", "preempt", "oom", "hang", "vanish")
+OUTCOMES = ("ok", "preempt", "oom", "hang", "vanish", "unreachable")
 RC_KILLED, RC_STOPPED = 137, 143
 STATE_FILE, RUNS_FILE, LOCK_FILE, LOG_DIR = "state.json", "runs.jsonl", "lock", "logs"
 
@@ -85,7 +85,9 @@ class FakeRuntime:
     0. `image_ids` maps references to image IDs (`image_id`; a run of another image fails as under `--pull never`);
     without it every reference is held, with a stable fake ID. `outcomes` are consumed one per run: `"ok"` (the
     handler's rc), an int (that rc), `"preempt"` (rc 137), `"oom"` (rc 137, `oom_killed`), `"hang"` (running until
-    `stop`, then rc 143, or until `finish`), `"vanish"` (the daemon no longer lists it); only `"ok"` runs the handler.
+    `stop`, then rc 143, or until `finish`), `"vanish"` (the daemon no longer lists it), `"unreachable"` (running, and
+    `inspect`, `logs` and `stop` of it fail as when the daemon cannot be reached, until `reachable`); only `"ok"` runs
+    the handler.
     Each run starts `duration_s` after the previous one, counted from `start_utc`. `rootless`, `socket_uid` (default
     this process's uid) and `socket` are what `daemon()` reports."""
 
@@ -184,7 +186,8 @@ class FakeRuntime:
             st["containers"][cid] = {"id": cid, "name": spec.name, "labels": [list(p) for p in spec.labels],
                                            "status": "running", "exit_code": None, "oom_killed": False,
                                            "started_utc": self._time(begin), "finished_utc": None, "vanished": False,
-                                           "end": self._time(begin + self.duration_s)}
+                                           "end": self._time(begin + self.duration_s),
+                                           "unreachable": outcome == "unreachable"}
             self._record_run(spec)
         log = b""
         if outcome == "ok":
@@ -194,7 +197,7 @@ class FakeRuntime:
         elif isinstance(outcome, int):
             rc = outcome
         else:
-            rc = None                                       # hang, vanish
+            rc = None                                       # hang, vanish, unreachable
         self._put_log(spec.name, log)
         with self._state() as st:
             c = st["containers"][cid]
@@ -221,9 +224,15 @@ class FakeRuntime:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @staticmethod
+    def _reach(c: Mapping[str, Any] | None, op: str) -> None:
+        if c is not None and c.get("unreachable"):
+            raise RuntimeFailure(op, 1)                     # docker's exit code when the daemon cannot be reached
+
     def inspect(self, container: str) -> ContainerState:
         with self._state() as st:
             c = self._find(st, container)
+        self._reach(c, "inspect")
         if c is None:
             return ContainerState("missing", None, False, None, None)
         return ContainerState(c["status"], c["exit_code"], c["oom_killed"], c["started_utc"], c["finished_utc"])
@@ -236,7 +245,9 @@ class FakeRuntime:
 
     def logs(self, container: str, *, tail: int | None = None) -> bytes:
         with self._state() as st:
-            name = self._live(st, "logs", container)["name"]
+            c = self._live(st, "logs", container)
+            self._reach(c, "logs")
+            name = c["name"]
         data = self._get_log(name)
         if tail is None:
             return data
@@ -246,6 +257,7 @@ class FakeRuntime:
     def stop(self, container: str, *, timeout_s: int = 30) -> None:
         with self._state() as st:
             c = self._live(st, "stop", container)
+            self._reach(c, "stop")
             if c["status"] == "running":
                 c.update(status="exited", exit_code=RC_STOPPED, finished_utc=c["end"])
 
@@ -256,6 +268,11 @@ class FakeRuntime:
             if c["status"] != "running":
                 raise RuntimeFailure("finish", 1)
             c.update(status="exited", exit_code=int(rc), finished_utc=c["end"])
+
+    def reachable(self, container: str) -> None:
+        """Make an `unreachable` container answer again (still running, as `hang`)."""
+        with self._state() as st:
+            self._live(st, "reachable", container)["unreachable"] = False
 
     def remove(self, container: str) -> None:
         with self._state() as st:

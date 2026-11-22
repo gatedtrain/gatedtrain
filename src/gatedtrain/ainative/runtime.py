@@ -351,7 +351,7 @@ class NvidiaSmiProbe:
             line = line.strip()
             if not line:
                 continue
-            if not line.isdigit():
+            if not re.fullmatch(r"[0-9]+", line):      # ASCII digits only: `str.isdigit` accepts other scripts' digits
                 return UNREADABLE_MIB
             total += int(line)
         return total

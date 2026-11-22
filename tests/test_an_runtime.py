@@ -355,6 +355,11 @@ class TestGpu(_Tmp):
                 self.assertGreater(used, rt.GPU_BUSY_MIB)
                 self.assertFalse(wait_for_gpu(self.smi(out), timeout_s=0, sleep=lambda s: None))
 
+    def test_non_ascii_digits_count_as_busy(self) -> None:
+        for out in ("\uff11\uff10\n", "\u00b2\n", "\u0661\n"):      # fullwidth, superscript and Arabic-Indic digits
+            with self.subTest(out=out):
+                self.assertEqual(self.smi(out).used_mib(), rt.UNREADABLE_MIB)
+
     def test_no_tool_or_failure_is_none(self) -> None:
         self.assertIsNone(NvidiaSmiProbe(str(self.tmp / "absent")).used_mib())
         self.assertIsNone(self.smi("", rc=9).used_mib())
@@ -406,6 +411,19 @@ class TestFakeRuntime(_Tmp):
         self.assertEqual(fake.inspect("e").status, "missing")
         with self.assertRaises(RuntimeFailure):
             fake.stop("e")
+
+    def test_unreachable(self) -> None:
+        fake = FakeRuntime({IMAGE: _echo}, outcomes=["unreachable"])
+        fake.run(_spec("a"))
+        for op, call in (("inspect", lambda: fake.inspect("a")), ("logs", lambda: fake.logs("a")),
+                         ("stop", lambda: fake.stop("a"))):
+            with self.subTest(op=op), self.assertRaises(RuntimeFailure) as cm:
+                call()
+            self.assertEqual((cm.exception.op, cm.exception.rc), (op, 1))
+        fake.reachable("a")
+        self.assertEqual(fake.inspect("a").status, "running")
+        fake.stop("a")
+        self.assertEqual(fake.inspect("a").exit_code, 143)
 
     def test_docker_like_refusals(self) -> None:
         fake = FakeRuntime(image_ids={IMAGE_REF: IMAGE})

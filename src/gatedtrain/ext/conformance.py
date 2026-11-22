@@ -44,7 +44,10 @@ SHA = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _abs(p: Any) -> bool:
-    """An absolute path, or one under the host's output root (`{output_root}/...`, filled in by ext-launch)."""
+    """An absolute path, or the host's output root or one under it (`{output_root}`, `{output_root}/...`, filled in by
+    ext-launch)."""
+    if p == "{output_root}":
+        return True
     if isinstance(p, str) and p.startswith("{output_root}/"):
         p = "/" + p[len("{output_root}/"):]
     return isinstance(p, str) and PurePosixPath(p).is_absolute()
