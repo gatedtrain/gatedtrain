@@ -328,7 +328,7 @@ class TestModelFiles(unittest.TestCase):
         return cm.exception.problems
 
     def test_suffix_lists(self):
-        self.assertEqual(envcheck.MODEL_FILE_SUFFIXES, (".safetensors", ".json", ".jsonl", ".txt"))
+        self.assertEqual(envcheck.MODEL_FILE_SUFFIXES, (".safetensors", ".json", ".jsonl", ".txt", ".jinja"))
         self.assertEqual(envcheck.PICKLE_SUFFIXES, (".pt", ".pth", ".bin", ".pkl", ".pickle", ".ckpt", ".joblib"))
 
     def test_pickle_suffix_refused(self):

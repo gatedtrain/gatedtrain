@@ -26,7 +26,9 @@ is not checked; site-packages is not walked as a whole.
 The environment record names those distributions with a hash of their files; the keeper signs it once at start.
 
 Model files are read as data: a pickle-based or unknown format, pickle or zip (the torch format) content, a symbolic
-link, or a hash that differs from the one the driver sent is refused before any alpha is spent.
+link, or a hash that differs from the one the driver sent is refused before any alpha is spent. The keeper copies the
+files a model reference lists into its own state and hashes the copy (`copy_model_files`); the generator receives the
+record with the copies' paths (`copied_record`), so the hash in the claim is the hash of what runs.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import os
 import pwd
 import site
 import re
+import shutil
 import stat
 import sys
 import sysconfig
@@ -53,7 +56,7 @@ RULE = "AN-13"
 ROOT_DISTRIBUTION = "gatedtrain"
 SCENARIO_ENTRY_POINT_GROUP = "gatedtrain.scenarios"
 
-MODEL_FILE_SUFFIXES = (".safetensors", ".json", ".jsonl", ".txt")
+MODEL_FILE_SUFFIXES = (".safetensors", ".json", ".jsonl", ".txt", ".jinja")
 PICKLE_SUFFIXES = (".pt", ".pth", ".bin", ".pkl", ".pickle", ".ckpt", ".joblib")
 _PICKLE_MAGIC = b"\x80"
 _ZIP_MAGIC = b"PK\x03\x04"
@@ -409,7 +412,11 @@ def _read_model_file(path: Path) -> tuple[str, bytes]:
     return "sha256:" + h.hexdigest(), head
 
 
-def _model_file_problem(field: str, entry: object) -> tuple[Problem | None, dict | None]:
+TRAVERSE_FIX = "put model files under a directory the keeper user can traverse, such as the output root (mode 0755)"
+
+
+def _entry_problem(field: str, entry: object) -> tuple[Problem | None, os.stat_result | None]:
+    """The checks on an entry before its file is opened: shape, suffix, and a regular file that is not a link."""
     if not (isinstance(entry, dict) and isinstance(entry.get("path"), str) and isinstance(entry.get("sha256"), str)):
         return _problem(field, "a model file entry must be {path, sha256} strings",
                         "list each model file with its path and sha256"), None
@@ -423,26 +430,46 @@ def _model_file_problem(field: str, entry: object) -> tuple[Problem | None, dict
                         f"use one of: {', '.join(MODEL_FILE_SUFFIXES)}"), None
     try:
         st = os.lstat(path)
-    except OSError:
+    except FileNotFoundError:
         return _problem(field, f"{path.name}: cannot read the file", "pass an existing model file"), None
+    except OSError:
+        return _problem(field, f"{path.name}: the keeper cannot reach the file", TRAVERSE_FIX), None
     if stat.S_ISLNK(st.st_mode):
         return _problem(field, f"{path.name} is a symbolic link", "pass the file itself, not a link"), None
     if not stat.S_ISREG(st.st_mode):
         return _problem(field, f"{path.name} is not a regular file", "pass a regular model file"), None
+    return None, st
+
+
+def _head_problem(field: str, name: str, head: bytes) -> Problem | None:
+    if head.startswith(_PICKLE_MAGIC):
+        return _problem(field, f"{name} holds pickle data, which runs code on load", "save the model as safetensors")
+    if head.startswith(_ZIP_MAGIC):
+        return _problem(field, f"{name} is a zip archive (the torch format, pickle inside)",
+                        "save the model as safetensors")
+    return None
+
+
+def _hash_problem(field: str, name: str, digest: str, sent: str) -> Problem | None:
+    if digest != sent:
+        return _problem(field, f"{name}: the file's sha256 differs from the one sent",
+                        "send the hash of the file as it is now, or stop changing the file")
+    return None
+
+
+def _model_file_problem(field: str, entry: object) -> tuple[Problem | None, dict | None]:
+    problem, _ = _entry_problem(field, entry)
+    if problem is not None:
+        return problem, None
+    path = Path(entry["path"])
     try:
         digest, head = _read_model_file(path)
     except OSError:
         return _problem(field, f"{path.name}: cannot read the file as a regular file",
                         "pass a regular model file"), None
-    if head.startswith(_PICKLE_MAGIC):
-        return _problem(field, f"{path.name} holds pickle data, which runs code on load",
-                        "save the model as safetensors"), None
-    if head.startswith(_ZIP_MAGIC):
-        return _problem(field, f"{path.name} is a zip archive (the torch format, pickle inside)",
-                        "save the model as safetensors"), None
-    if digest != entry["sha256"]:
-        return _problem(field, f"{path.name}: the file's sha256 differs from the one sent",
-                        "send the hash of the file as it is now, or stop changing the file"), None
+    problem = _head_problem(field, path.name, head) or _hash_problem(field, path.name, digest, entry["sha256"])
+    if problem is not None:
+        return problem, None
     return None, {"path": entry["path"], "sha256": digest}
 
 
@@ -461,3 +488,97 @@ def check_model_files(record: dict) -> list[dict]:
     if problems:
         raise Refused(problems)
     return hashed
+
+
+def _copy_one(field: str, entry: dict, checked: os.stat_result, target: Path) -> tuple[Problem | None, dict | None]:
+    """Open the checked file without following a link, check it is the file that was checked, and stream it into
+    `target` (created exclusively, mode 0600) while hashing; the head is checked before anything is written."""
+    path = Path(entry["path"])
+    try:
+        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return _problem(field, f"{path.name}: the keeper cannot open the file", TRAVERSE_FIX), None
+    with os.fdopen(src, "rb") as handle:
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (checked.st_dev, checked.st_ino):
+            return _problem(field, f"{path.name} changed between the check and the copy",
+                            "stop changing the model files while the keeper evaluates"), None
+        h = hashlib.sha256()
+        size = 0
+        try:
+            chunk = handle.read(_CHUNK)
+        except OSError:
+            return _problem(field, f"{path.name}: the keeper cannot read the file", TRAVERSE_FIX), None
+        problem = _head_problem(field, path.name, chunk)
+        if problem is not None:
+            return problem, None
+        try:
+            dst = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
+            return _problem(field, f"{path.name}: the keeper cannot copy the file into its state",
+                            "check the keeper's state directory and its disk"), None
+        with os.fdopen(dst, "wb") as out:
+            try:
+                while chunk:
+                    h.update(chunk)
+                    size += len(chunk)
+                    out.write(chunk)
+                    chunk = handle.read(_CHUNK)
+                out.flush()
+                os.fsync(out.fileno())
+            except OSError:
+                return _problem(field, f"{path.name}: the keeper cannot copy the file into its state",
+                                "check the keeper's state directory and its disk"), None
+    digest = "sha256:" + h.hexdigest()
+    problem = _hash_problem(field, path.name, digest, entry["sha256"])
+    if problem is not None:
+        return problem, None
+    return None, {"name": path.name, "sha256": digest, "size": size}
+
+
+def copy_model_files(record: dict, dest: Path) -> list[dict]:
+    """Copy each file `record["files"]` lists into `dest/<base name>` and hash the copy (AN-13): the checks of
+    `check_model_files`, then the file is opened with `O_NOFOLLOW | O_NONBLOCK`, must be the regular file that was
+    checked, and is streamed into a new file (`O_EXCL`, mode 0600) while hashing. `dest` must not exist; it is created
+    with mode 0700. Refused (AN-13) naming every bad entry: also two entries with one base name and a file the keeper
+    cannot open; on a refusal `dest` is removed. Returns `[{"name", "sha256", "size"}]` in the listed order."""
+    entries = record.get("files", [])
+    if not isinstance(entries, list):
+        raise Refused([_problem("files", "the model files must be a list", "send a list of {path, sha256}")])
+    os.mkdir(dest, 0o700)
+    os.chmod(dest, 0o700)
+    problems: list[Problem] = []
+    copied: list[dict] = []
+    names: set[str] = set()
+    try:
+        for i, entry in enumerate(entries):
+            field = f"files[{i}]"
+            problem, checked = _entry_problem(field, entry)
+            if problem is None:
+                name = os.path.basename(entry["path"])
+                if name in names:
+                    problem = _problem(field, f"{name}: another listed file has the same base name",
+                                       "list files with distinct base names (the keeper copies them into one "
+                                       "directory)")
+                else:
+                    names.add(name)
+                    problem, ok = _copy_one(field, entry, checked, dest / name)
+            if problem is not None:
+                problems.append(problem)
+            else:
+                copied.append(ok)
+        if problems:
+            raise Refused(problems)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return copied
+
+
+def copied_record(record: dict, dest: Path) -> dict:
+    """The model record with each `files[].path` replaced by `dest/<base name>`: what the generator, per-item or
+    batch, receives once `copy_model_files(record, dest)` succeeded (a record without `files` is returned as is)."""
+    if "files" not in record:
+        return dict(record)
+    return {**record, "files": [{**e, "path": str(Path(dest) / os.path.basename(e["path"]))}
+                                for e in record.get("files", [])]}
