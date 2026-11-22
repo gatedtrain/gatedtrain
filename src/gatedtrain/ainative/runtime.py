@@ -98,7 +98,7 @@ class ContainerState:
 
 @dataclass(frozen=True)
 class DaemonInfo:
-    """What the daemon says about itself (pre-flight finding 3): whether it runs rootless (`docker info` security
+    """What the daemon says about itself: whether it runs rootless (`docker info` security
     options hold `name=rootless`), and for a `unix://` endpoint the resolved socket path and its owner uid (None for
     another endpoint, or when the socket cannot be read)."""
     rootless: bool
@@ -146,7 +146,7 @@ def docker_run_argv(spec: RunSpec, *, context: str | None = None, host: str | No
     [--log-driver D] --network NET --user U --cap-drop ALL --security-opt no-new-privileges [--read-only]
     [--shm-size=S] [gpu options] [extra options] [--tmpfs p:o]... [-e K=V sorted]... [-v src:dst:ro|rw]...
     [--label k=v sorted]... IMAGE ARGV...`. No `--rm`: the backend reads the exit state, then removes the container.
-    `--pull never`: an image the daemon does not hold fails the start instead of being pulled (pre-flight finding 27).
+    `--pull never`: an image the daemon does not hold fails the start instead of being pulled.
     Each `-v` source is the mount's strict `realpath` (EXT-69, `launch.mount_source`); a value before the image that
     docker would read as an option raises ValueError (EXT-39, `launch.option_value`), as does a GPU option set other
     than GPU_OPTION_SETS or an environment name that is not a plain name."""
@@ -242,7 +242,7 @@ class DockerCLIRuntime:
         return cid
 
     def inspect(self, container: str) -> ContainerState:
-        """`missing` only when `docker ps -a` succeeds and lists no such container (pre-flight finding 21); a daemon
+        """`missing` only when `docker ps -a` succeeds and lists no such container; a daemon
         that cannot be reached raises RuntimeFailure, so the caller leaves the job's state unchanged."""
         listed = self._text("inspect", ["ps", "-a", "--no-trunc", "--filter", _name_filter(container), "--format",
                                         "{{.ID}}"])
@@ -297,7 +297,7 @@ class DockerCLIRuntime:
         return endpoint[len("unix://"):] if endpoint.startswith("unix://") else None
 
     def daemon(self) -> DaemonInfo:
-        """Whether the daemon is rootless, from `docker info`, and the owner of its socket (pre-flight finding 3)."""
+        """Whether the daemon is rootless, from `docker info`, and the owner of its socket."""
         out = self._text("daemon", ["info", "--format", "{{json .SecurityOptions}}"])
         try:
             options = json.loads(out)

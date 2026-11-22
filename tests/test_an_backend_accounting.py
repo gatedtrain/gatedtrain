@@ -107,7 +107,7 @@ class TestAccounting(_Acc):
         self.assertEqual(b.gpu_seconds(), 1800)
 
     def test_retry_stops_at_budget(self) -> None:
-        """Review Focus 5, pre-flight finding 8: the job's own estimate counts once; the third start would pass the
+        """The job's own estimate counts once; the third start would pass the
         budget, so it is refused and the job ends budget_exhausted."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=[1, 1, 1], duration_s=1800)
         b = self.make_backend(rt)
@@ -141,7 +141,7 @@ class TestAccounting(_Acc):
         self.assertEqual(self.events(jid), ["start", "stop", "end"])
 
     def test_running_gpu_attempt_stopped_at_budget(self) -> None:
-        """Pre-flight finding 8: a GPU attempt is stopped once it used the budget left when it started."""
+        """A GPU attempt is stopped once it used the budget left when it started."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=["ok", "hang"])
         b = self.make_backend(rt)
         other = b.submit(self.gpu_job("first", est=0.25))            # 60 s recorded
@@ -186,7 +186,7 @@ class TestAccounting(_Acc):
         self.assertEqual(len(rt.runs), 3)
 
     def test_gpu_busy_refuses(self) -> None:
-        """Review Focus 5: a GPU busy past GPU_WAIT_S refuses the start; no `start` row; the next poll starts it."""
+        """A GPU busy past GPU_WAIT_S refuses the start; no `start` row; the next poll starts it."""
         probe = Probe(2048)
         b = self.make_backend(probe=probe)
         with self.assertRaises(Refused) as cm:
@@ -308,7 +308,7 @@ class TestRoundOne(_Acc):
         self.assertLessEqual(b.gpu_seconds(), 3600)
 
     def test_concurrent_gpu_jobs_stay_within_budget(self) -> None:
-        """Review round 1, Important 3: two GPU jobs (0.4 h each) run at once and longer than estimated; each poll
+        """Two GPU jobs (0.4 h each) run at once and longer than estimated; each poll
         recomputes the budget left from the recorded time and both attempts' run times, so together they overrun the
         1 h budget by at most one poll interval each."""
         rt = ClockedRuntime(self.clock, {IMAGE: _train}, outcomes=["hang", "hang"], duration_s=0)
@@ -381,7 +381,7 @@ class TestRoundOne(_Acc):
         self.assertEqual(self.gpu_log().read_text(), "no table here\n")
 
     def test_inputs_changed_stops_cut_off_container(self) -> None:
-        """Minor 8: a container of the due attempt runs (its `start` row was cut off); it is stopped and recorded
+        """A container of the due attempt runs (its `start` row was cut off); it is stopped and recorded
         before the refusal."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=["preempt", "hang"])
         b = self.make_backend(rt)
@@ -398,7 +398,7 @@ class TestRoundOne(_Acc):
 
 class TestGpuLog(_Acc):
     def test_log_ending_in_notes(self) -> None:
-        """Important 1: the documented log (tests/fixtures/ext/gpu-log.fixture.md) ends in notes; a new table is
+        """The documented log (tests/fixtures/ext/gpu-log.fixture.md) ends in notes; a new table is
         appended and its total counts."""
         fixture = Path(__file__).parent / "fixtures" / "ext" / "gpu-log.fixture.md"
         shutil.copyfile(fixture, self.gpu_log())
@@ -426,7 +426,7 @@ class TestGpuLog(_Acc):
         self.assertEqual(self.gpu_log().read_text().count("| Step |"), 2)  # the second row joined the new table
 
     def test_gpu_log_row(self) -> None:
-        """Pre-flight finding 7: an absent log is created with the header and the first row at once (total from 0);
+        """An absent log is created with the header and the first row at once (total from 0);
         later rows add to the last running total; CPU jobs get a row too."""
         self.assertFalse(self.gpu_log().exists())
         rt = FakeRuntime({IMAGE: _train}, outcomes=["preempt", "ok"], duration_s=900)
@@ -487,7 +487,7 @@ class TestGpuLog(_Acc):
         self.assertFalse(target.exists())
 
     def test_end_recorded_once(self) -> None:
-        """Review Focus 1, pre-flight finding 16: two drivers poll at once; the fake runtime's inspect holds the first
+        """Two drivers poll at once; the fake runtime's inspect holds the first
         until the second arrives (or a timeout, when the job lock keeps the second out): one `end`, one retry."""
         rt = FakeRuntime({IMAGE: _train}, outcomes=["preempt", "hang"])
         job = self.gpu_job()

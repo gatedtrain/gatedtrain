@@ -77,7 +77,7 @@ def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath,
                inference_image: str | None = None, eval_trees: list[str] | tuple[str, ...] = (),
                docker_host: str | None = None) -> list[str]:
     """The keeper's `serve` command as argv, the one source of the unit's `ExecStart=` (here) and of the inference
-    drop-in `gatedtrain setup host` prints (preflight finding 17). The caller has validated every value."""
+    drop-in `gatedtrain setup host` prints. The caller has validated every value."""
     argv = [str(venv / "bin" / "gatedtrain"), "keeper", "serve", "--state", str(state), "--socket", str(socket),
             "--owner-uid", str(owner_uid)]
     if inference_image is not None:

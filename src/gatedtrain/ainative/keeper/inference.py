@@ -12,7 +12,7 @@ empty keeper-owned output directory `/out`. Nothing about the items is passed in
 `KeeperInference`:
 - `start_problems` (AN-13, at `serve`): waits up to 60 s for the daemon's socket (the keeper user's daemon may start
   after the keeper), then refuses a daemon that is not rootless or whose socket is not owned by the keeper uid under a
-  directory of mode 0700 (pre-flight finding 3), an image ID other than the configured one, an eval tree that fails
+  directory of mode 0700, an image ID other than the configured one, an eval tree that fails
   `envcheck.eval_tree_problems`, (for the Docker CLI runtime) a Docker CLI or `nvidia-smi` that fails the
   keeper's ownership check, and a subordinate id range of the owner that covers the keeper's uid or gid (or one of
   the keeper's that covers the owner's), read from /etc/subuid and /etc/subgid (an unreadable file refuses);
@@ -65,11 +65,11 @@ RUN_DIR = "run"
 SUBID_FILES = ("/etc/subuid", "/etc/subgid")
 CONTAINER_USER = "0:0"           # the keeper uid on the host under the keeper's rootless daemon (05 §18.10)
 SHM_SIZE = "8g"
-SOCKET_WAIT_S = 60.0             # pre-flight finding 20
+SOCKET_WAIT_S = 60.0
 SOCKET_POLL_S = 1.0
 POLL_S = 2.0                     # how often a running container is inspected
 STOP_TIMEOUT_S = 10
-EVAL_SLACK_S = 600               # pre-flight finding 11: GPU wait + 2 time limits + this must fit the client's wait
+EVAL_SLACK_S = 600               # GPU wait + 2 time limits + this must fit the client's wait
 DEFAULT_DOCKER = Path("/usr/bin/docker")
 DEFAULT_NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
 CRASH_FIX = ("check the keeper's inference image and the scenario pack's batch generator, then train a new candidate "

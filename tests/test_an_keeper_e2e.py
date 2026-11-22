@@ -3,7 +3,7 @@
 Every call is a subprocess of `tests/fixtures/ainative/run_cli.py --json ...` (the synthetic pack injected, as in
 `test_an_e2e.py`); every decision comes from a file; stderr is empty on every call (AN-1). The keeper is a subprocess of
 the test user (`tests/_keeper.py`). A second candidate in one project comes from the test-only `train` decision key
-`noise_override` (preflight finding 1): on `toy.jsonl` (exact match, margin 0.05) `noise_override` 1.0 gates
+`noise_override`: on `toy.jsonl` (exact match, margin 0.05) `noise_override` 1.0 gates
 INCONCLUSIVE at alpha 0.02375 and the rerun at the pipeline's noise 0 gates PASS at 0.011586107554417413.
 
 Tampering: every signed copy in a project (the registration, each receipt line, the gate result, report.json,

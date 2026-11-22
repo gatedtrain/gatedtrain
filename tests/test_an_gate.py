@@ -707,7 +707,7 @@ class ReportTest(GateBase):
 
 
 class TrustWiringTest(GateBase):
-    """Review round 1, critical 1: a plugin cannot stand in for a trust stage's records."""
+    """A plugin cannot stand in for a trust stage's records."""
 
     def problems(self, mutate) -> list:
         from gatedtrain.ainative.pipeline import load_pipeline, pipeline_problems
@@ -892,7 +892,7 @@ class ForgeBase(GateBase):
 
 
 class ModelBindingTest(GateBase):
-    """Review round 1, important 1: the arms are the registered base and a trained candidate."""
+    """The arms are the registered base and a trained candidate."""
 
     def refused_eval(self, **attrs) -> str:
         for k, v in attrs.items():

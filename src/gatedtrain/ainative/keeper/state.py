@@ -34,7 +34,7 @@ Layout under the state directory (every file mode 0600, every directory 0700, ne
 Files are written by temp file plus rename, except `records.jsonl`, which is append-only: one `O_APPEND | O_NOFOLLOW`
 write per line, as step 1's ledger (a torn last line from a crash is dropped at the next start, before any append).
 
-Item-level seal tracking (AN-16, plan interpretations 1 and 4, preflight finding 12): an item is the sha256 of its
+Item-level seal tracking (AN-16): an item is the sha256 of its
 canonical `input`. A data file whose sha256 was taken in before reuses its sealed set (refused once a report closed
 it); any other data holding an input that was ever sealed is refused, naming a count only; an input released as
 training is forced into the training part of every later split, so it is never sealed.
@@ -47,7 +47,7 @@ a refusal or not, settles the attempt as not passed and returns the spend's enve
 the exception class only); `gate` decides at alpha_j once
 and settles the ledger; `report` builds and signs `report.json` (`schema_version` 2) from keeper records and closes
 the set. An attempt still open at a restart is gated normally when its per-item records were stored, else it settles
-as not passed (MISSING); either happens on the next `evaluate`, `gate` or `report` on the set (preflight finding 8).
+as not passed (MISSING); either happens on the next `evaluate`, `gate` or `report` on the set.
 At start, envelopes an attempt file or report holds but `records.jsonl` lacks (a crash between the two writes) are
 appended again.
 
@@ -60,7 +60,7 @@ container run is noted in the attempt as `inference` (arm, image ID, seconds, GP
 too, and signed in its gate record; `report` sums the project's runs into `compute.keeper` and states the driver's
 optional `compute` totals as `compute.backend`, marked as the driver's (AN-10).
 
-Rootful-access detection (AN-21, preflight finding 2): `root_docker` is called at intake, sealed summary, evaluate,
+Rootful-access detection (AN-21): `root_docker` is called at intake, sealed summary, evaluate,
 gate and report on a set (and `hello` passes its own result); a positive result is a fact about the host, so it is
 recorded once on every sealed set not yet closed, whichever set the op touched (a closed set and an existing record
 are never changed). The intake summary, the report and `hello` for every project on such a set state the downgraded
@@ -459,7 +459,7 @@ class KeeperState:
                 and os.path.lexists(d / n / "items.json") and not self._closed(f"sha256:{n}")]
 
     def record_root_docker(self, reasons: list[str]) -> None:
-        """A positive detection (fix round 1, finding 1): write `root_docker_seen` once on every open set that has
+        """A positive detection: write `root_docker_seen` once on every open set that has
         none; closed sets and existing records stay as they are. Nothing for an empty `reasons`."""
         if not reasons:
             return
@@ -483,7 +483,7 @@ class KeeperState:
                                       root_docker=self.root_docker_seen(sealed_id) is not None)
 
     def root_docker_for(self, project_id: str, reasons: list[str]) -> tuple[bool, list[str]]:
-        """`hello` for a project (preflight finding 2): (rootful access now or recorded on the project's set, the
+        """`hello` for a project: (rootful access now or recorded on the project's set, the
         reasons: the current ones, else the recorded ones with their first time). A project the keeper does not know,
         or one without a sealed set yet, reports the current state."""
         with self._mutex:
@@ -1276,7 +1276,7 @@ def _keeper_compute(mine: list[dict]) -> dict:
 
 def _canonical_output(fn: Any) -> Any:
     """The generator with its output checked: a value canonical JSON cannot encode is a crash (ValueError), so the
-    attempt settles as not passed (Review Focus 2)."""
+    attempt settles as not passed."""
     def generate(*args: Any, **kwargs: Any) -> Any:
         out = fn(*args, **kwargs)
         try:

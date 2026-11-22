@@ -124,7 +124,7 @@ class Job:
     """One container run. `runtime` is `{"kind": "container", "image"}` or `{"kind": "venv_in_container", "image",
     "venv_lock"}` with the image pinned by digest; `mounts` are read-only inputs; the output directory is mounted
     read-write at `output_container` (each attempt in its own `<output_dir>/a<n>`); `profile` is the ext profile the
-    adapter's argv rules apply (pre-flight finding 14)."""
+    adapter's argv rules apply."""
     label: str
     adapter: str
     runtime: Mapping[str, str]
@@ -642,7 +642,7 @@ class LocalBackend:
         return float(b)
 
     def _budget_left_s(self, job: Job, *, exclude: str | None) -> tuple[Problem | None, int]:
-        """The budget check of one GPU attempt start (pre-flight finding 8): committed = the recorded GPU seconds plus
+        """The budget check of one GPU attempt start: committed = the recorded GPU seconds plus
         the estimates of the other queued or running GPU jobs; the start is refused when committed plus the job's own
         estimate exceeds the budget. Else no problem and the budget left in seconds (the attempt's GPU limit)."""
         budget = self._budget_hours()
@@ -752,8 +752,8 @@ class LocalBackend:
     # -- checks before a start ---------------------------------------------------------------------------------------
 
     def _daemon_and_image(self, job: Job, cfg: HostConfig) -> None:
-        """AN-22 before any start: on a rootless host the daemon is rootless and its socket the owner's (pre-flight
-        finding 3); the daemon holds the image (no run pulls one). A daemon error raises RuntimeFailure."""
+        """AN-22 before any start: on a rootless host the daemon is rootless and its socket the owner's; the
+        daemon holds the image (no run pulls one). A daemon error raises RuntimeFailure."""
         problems = []
         if cfg.rootless:
             info = self.runtime.daemon()
@@ -836,7 +836,7 @@ class LocalBackend:
         self._jobs_dir()
         with self._lock(self._rel(LOCK)):
             found = self._find(key)
-            if found is not None:                                    # reattach (pre-flight finding 1)
+            if found is not None:                                    # reattach
                 rec = self._record(found)
                 problems = job_problems(job, cfg, fresh_output=False)
                 if rec["job"] != _record_doc(job):
@@ -863,7 +863,7 @@ class LocalBackend:
         self._jobs[job_id] = job
         with self._lock(self._rel(job_id, LOCK)):
             # Re-read under the job's lock: another driver may have reattached and started attempt 1, or a cancel may
-            # have come, between the record and this lock (review finding, round 1).
+            # have come, between the record and this lock.
             self._advance(job_id, self._record(job_id), key=key, raise_budget=True)
         return job_id
 
@@ -958,7 +958,7 @@ class LocalBackend:
 
     def _limit(self, job: Job, job_id: str, left_s: int | None = None) -> dict[str, Any]:
         """The attempt's run-time limit for its `start` row: the time limit, or for a GPU attempt the budget left when
-        it starts when that comes first (pre-flight finding 8)."""
+        it starts when that comes first."""
         if job.gpu and left_s is None:
             left_s = self._budget_left_s(job, exclude=job_id)[1]
         if job.gpu and left_s is not None and left_s < job.time_limit_s:
@@ -987,7 +987,7 @@ class LocalBackend:
         seconds = _seconds(st.started_utc, st.finished_utc)
         if st.status == "missing":
             # No container times: the attempt counts from its `start` row up to now, at most its limit, so a lost GPU
-            # attempt is not free and its retries cannot overspend the budget (review round 1).
+            # attempt is not free and its retries cannot overspend the budget.
             limit_s = view.limit[0] if view.limit else int(rec["job"]["time_limit_s"])
             seconds = min(int(self._elapsed(_start_row(rows, attempt))), limit_s)
         self._append(job_id, "end", attempt=attempt, outcome=outcome, rc=st.exit_code, started_utc=st.started_utc,
@@ -1055,7 +1055,7 @@ class LocalBackend:
 
     def _budget_remaining_s(self) -> float:
         """The project's GPU budget minus its recorded GPU seconds and the time every running GPU attempt has run so
-        far (from its `start` row): what all running GPU attempts together may still use (review round 1)."""
+        far (from its `start` row): what all running GPU attempts together may still use."""
         used = 0.0
         for job_id in self._job_ids():
             if not (self.project.root / JOBS_DIR / job_id / JOB_FILE).exists():
@@ -1149,10 +1149,10 @@ class LocalBackend:
 
         Without `key` (a job's inputs directory, which the stage rewrites): created, or returned again when it is a
         plain owner directory this project created. With `key` (`Job.key()` of the job the directory is the output
-        of; review round 1): the directory recorded for this name and key is returned again, so a stage re-run of the
+        of): the directory recorded for this name and key is returned again, so a stage re-run of the
         same job reattaches, unless every job of that key that used it ended without success (failed, cancelled,
         timed_out, budget_exhausted): a re-run then gets a fresh directory like a job with another key, `<name>` when
-        free, else `<name>.<n>`. Anything else is refused (pre-flight finding 1)."""
+        free, else `<name>.<n>`. Anything else is refused."""
         if not (isinstance(name, str) and NAME_RE.fullmatch(name)):
             raise Refused([_problem("name", f"{name!r} is not a plain name (letters, digits, _ . -; first a letter or "
                                     "digit; at most 100 characters)", "pass a plain directory name")])
@@ -1195,7 +1195,7 @@ class LocalBackend:
                             raise Refused([_problem("name", f"the output directory {path} of this job is gone or "
                                                     "not a plain directory of the owner", "restore or remove it")])
                         if self._spent(path, key):
-                            break                       # a re-run after a failure: a fresh directory (Task 4 carry)
+                            break                       # a re-run after a failure: a fresh directory
                         return Path(path)
                 n = 1
                 while True:

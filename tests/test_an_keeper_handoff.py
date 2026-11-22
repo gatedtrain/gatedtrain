@@ -278,7 +278,7 @@ class KeeperHandoffTest(unittest.TestCase):
         self.assertEqual(self.recorder.contents, {WEIGHTS})          # every call read the copy
         self.assertEqual(att["claim"]["record"]["candidate_model_sha256"], arm(self.candidate([entry]))["sha256"])
 
-    def test_copy_refuses_before_spend(self):                    # Review Focus 2
+    def test_copy_refuses_before_spend(self):
         before, records = self.state.alpha(self.pid), self.state.records(self.pid)
         real = self._file("real.safetensors", WEIGHTS)
         link = self.out / "link.safetensors"
@@ -365,7 +365,7 @@ class KeeperHandoffTest(unittest.TestCase):
         self.assertEqual(self.models_left(), [])
         self.assertEqual(self.recorder.paths, set())
 
-    def test_opened_file_inside_state_refused(self):             # fix round 1, Important
+    def test_opened_file_inside_state_refused(self):
         plant = self.dir / "plant"
         plant.mkdir(mode=0o700)
         self.assert_fd_check_refuses(plant, "inside the keeper's state directory")
@@ -414,7 +414,7 @@ class KeeperHandoffTest(unittest.TestCase):
         os.chmod(secret, 0o755)                                   # searchable: the same file passes
         self.assertEqual(self.evaluate(self.candidate([entry], "open"))["j"], 1)
 
-    def test_cleanup_failure_does_not_change_the_result(self):  # fix round 1, best-effort removal
+    def test_cleanup_failure_does_not_change_the_result(self):
         with mock.patch.object(state_mod.shutil, "rmtree", side_effect=OSError("busy")):
             att = self.evaluate(self.candidate([self._file("model.safetensors", WEIGHTS)]))
         self.assertEqual(att["j"], 1)

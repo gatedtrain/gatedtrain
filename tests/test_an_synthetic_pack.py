@@ -1,4 +1,4 @@
-"""Task 8: the synthetic scenario pack runs the AI-native stage machine end to end on the CPU."""
+"""The synthetic scenario pack runs the AI-native stage machine end to end on the CPU."""
 
 from __future__ import annotations
 

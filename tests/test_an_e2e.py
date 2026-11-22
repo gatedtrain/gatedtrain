@@ -1,4 +1,4 @@
-"""Task 9: `gatedtrain project` end to end, as subprocesses, on the synthetic scenario pack.
+"""`gatedtrain project` end to end, as subprocesses, on the synthetic scenario pack.
 
 The pack is not registered through entry points, so every subprocess runs `tests/fixtures/ainative/run_cli.py`, which
 injects it and then calls `gatedtrain.cli.main`. Every call uses `--json`.

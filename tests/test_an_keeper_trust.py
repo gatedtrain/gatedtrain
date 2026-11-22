@@ -4,7 +4,7 @@ stages branch on `ctx.trust.mode` (tests/README.md section 13).
 
 The keeper runs as a subprocess of the test user (`tests/_keeper.py`); the synthetic pack is injected in this process
 too (`inject_pack`), so the pipeline's own stages run here. A second candidate in one project comes from the test-only
-`train` decision key `noise_override` (preflight finding 1). Verified statuses on `toy.jsonl` (exact match, margin
+`train` decision key `noise_override`. Verified statuses on `toy.jsonl` (exact match, margin
 0.05, n_sealed 399): `noise_override` 1.0 (every answer wrong, like the empty base) is INCONCLUSIVE (zero-width
 interval); the noise-free table is PASS.
 """
@@ -161,7 +161,7 @@ class KeeperPipelineTest(KeeperProject, unittest.TestCase):
         self.assertEqual((reg["schema_version"], reg["alpha"]), (2, 0.02375))
         full = KeeperTrust(proj).registration(reg["hash"])
         self.assertEqual(full["clause"]["alpha"], 0.02375)
-        self.assertIn(ai.RULE, full["signed_by"])                       # the rule id (preflight finding 13)
+        self.assertIn(ai.RULE, full["signed_by"])                       # the rule id
         reg_receipts = [r for r in self.receipts(proj) if r["kind"] == "registration"]
         self.assertEqual(reg["envelope_sha256"], reg_receipts[-1]["sha256"])
 
@@ -214,7 +214,7 @@ class KeeperPipelineTest(KeeperProject, unittest.TestCase):
         self.assertFalse((proj.root / "trust" / "sealed").exists())
         self.assert_no_sealed_input(proj, self.sealed_inputs(proj))
 
-    def test_registration_plan_states_alpha_investing(self):       # preflight finding 13
+    def test_registration_plan_states_alpha_investing(self):
         proj = self.make()
         for ref in UPTO_TRAIN[:3]:
             self.go(proj, ref)
@@ -245,7 +245,7 @@ class KeeperPipelineTest(KeeperProject, unittest.TestCase):
                 call()
             self.assertEqual(rule_of(cm.exception), "AN-8")
 
-    def test_intake_forwards_accept_inconclusive(self):             # Task 8 carry
+    def test_intake_forwards_accept_inconclusive(self):
         proj = self.make(data=jsonl(fixture_rows(100)))
         with self.assertRaises(Refused) as cm:
             self.go(proj, "intake_seal", {})
@@ -281,7 +281,7 @@ class KeeperBindingTest(KeeperProject, unittest.TestCase):
             bind_project(proj, self.kp.socket)                       # a binding to another key is never replaced
         self.assertEqual(rule_of(cm.exception), "AN-14")
 
-    def test_deleting_the_binding_never_falls_back(self):          # AN-14, preflight finding 11
+    def test_deleting_the_binding_never_falls_back(self):          # AN-14
         proj = self.make()
         self.upto_train(proj)
         for ref in ("evaluate_sealed", "gate"):
@@ -343,7 +343,7 @@ class RefusalAfterSpendTest(KeeperProject, unittest.TestCase):
     def setUp(self):
         self.start()
 
-    def test_a_refusal_after_the_grant_is_a_failed_attempt(self):  # preflight finding 9
+    def test_a_refusal_after_the_grant_is_a_failed_attempt(self):
         proj = self.make()
         self.upto_train(proj)
         with self.assertRaises(Refused) as cm:
@@ -363,7 +363,7 @@ class RefusalAfterSpendTest(KeeperProject, unittest.TestCase):
 @skip_unless_linux
 class BusyKeeperTest(KeeperProject, unittest.TestCase):
     """The key check (`hello`) before each op waits behind another client's long op with the long-op deadline: the
-    wait is queueing, not work (Task 10 review). Every candidate call sleeps 5 ms in the keeper, so an evaluation
+    wait is queueing, not work. Every candidate call sleeps 5 ms in the keeper, so an evaluation
     takes a few seconds; the client's short deadline is patched to 0.5 s in this process (the keeper subprocess keeps
     its own)."""
 

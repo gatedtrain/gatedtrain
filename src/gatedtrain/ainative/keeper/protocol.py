@@ -5,14 +5,14 @@ Request line: `{"op": str, "project": "sha256:<64 hex>" | null, "args": object}`
 request per connection. Lines are capped while they are read, and a refusal never echoes what the peer sent.
 
 A refusal after the keeper granted alpha (a sealed evaluation whose scoring failed) still carries the signed claim
-and ledger envelopes in `result` alongside `ok: false` (preflight finding 9); the client raises `RefusedAfterSpend`
+and ledger envelopes in `result` alongside `ok: false`; the client raises `RefusedAfterSpend`
 holding them, so the driver logs the spend.
 
 Client deadlines: the keeper serves one connection at a time, and a client's deadline starts before it connects. The
 ops that split, score or gate (`LONG_OPS`: intake of up to 64 MiB, evaluate, gate, report) get `LONG_OP_TIMEOUT_S`,
 3900 s: a sealed evaluation of a batch generator waits for the GPU (at most 900 s) and runs one container per arm (at
 most the generator's time limit each), and the keeper refuses before the grant a generator whose time limit would not
-fit (900 s + 2 time limits + 600 s, pre-flight finding 11); every other op keeps `SOCKET_TIMEOUT_S`. A client that
+fit (900 s + 2 time limits + 600 s); every other op keeps `SOCKET_TIMEOUT_S`. A client that
 gives up while its request waits behind another is not served: the keeper drops a request whose peer has already
 closed. A client that gives up during its own evaluation can send the identical request again and gets the stored
 claim.

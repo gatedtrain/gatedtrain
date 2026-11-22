@@ -277,7 +277,7 @@ class TestCommand(TmpCase):
                          build_command(self.record(), {}, est_h=1.0))
 
     def test_option_value_and_mount_source(self):
-        """Finding 17: the value and mount-source guards of the printed commands, in one place."""
+        """The value and mount-source guards of the printed commands, in one place."""
         self.assertEqual(option_value("none"), "none")
         for bad in ("", "-v", "--privileged"):
             with self.assertRaises(ValueError):
@@ -425,7 +425,7 @@ class TestExtLaunchRootless(RootlessLaunchCase):
 
 
 class TestSidecarRootless(RootlessLaunchCase):
-    """Finding 13: under rootless the sidecar's spool is owned by the owner (the sidecar runs as 0:0 too)."""
+    """Under rootless the sidecar's spool is owned by the owner (the sidecar runs as 0:0 too)."""
 
     def setUp(self):
         super().setUp()

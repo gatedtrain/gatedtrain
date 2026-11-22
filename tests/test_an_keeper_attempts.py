@@ -3,13 +3,13 @@ keeper gates, settles the ledger and builds the signed report; a report closes t
 section 13).
 
 The keeper runs as a subprocess of the test user (`tests/_keeper.py`). Candidates are model records built here from
-the training rows the keeper returned, so several candidates fit in one project without a pipeline (preflight
-finding 1). Verified statuses of the fixtures on `toy.jsonl` (exact match, margin 0.05, n_sealed 399): `noise=1.0`
+the training rows the keeper returned, so several candidates fit in one project without a pipeline.
+Verified statuses of the fixtures on `toy.jsonl` (exact match, margin 0.05, n_sealed 399): `noise=1.0`
 (every answer wrong, like the base) is INCONCLUSIVE (zero-width interval), a table that knows one token is FAIL at
 each of the first three bids, the noise-free table is PASS.
 
 The generator switch `GATEDTRAIN_TEST_GENERATOR` (`tests/fixtures/ainative/run_cli.py`) counts, raises, blocks or
-slows the generator inside the keeper subprocess (preflight finding 15).
+slows the generator inside the keeper subprocess.
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
         self.assertEqual((exc.problems[0].rule, exc.problems[0].fix), ("AN-15", NEW_DATA_FIX))
         self.assertEqual(self.alpha(pid), before)                # nothing granted
 
-    def test_pass_earns_back(self):                            # AN-15, plan interpretation 5
+    def test_pass_earns_back(self):                            # AN-15
         pid = self.ready("p1")
         self.gate(pid, self.evaluate(pid, self.one_token(pid)))
         a2 = self.evaluate(pid, self.noisy(pid, 0.0))
@@ -326,7 +326,7 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
                          ["sealed_guarantee", "original_data", "oracles", "metric_confirmation", "model_reference",
                           "alpha_rule", "sealed_evaluations"])
         limits = {x["id"]: x["text"] for x in report["known_limits"]}
-        self.assertEqual(limits["oracles"], texts.LIMIT_ORACLES)        # final review finding 3
+        self.assertEqual(limits["oracles"], texts.LIMIT_ORACLES)
         self.assertEqual(limits["alpha_rule"], texts.LIMIT_ALPHA_RULE)
         self.assertIn("valid given the earlier outcomes", texts.LIMIT_ALPHA_RULE)   # final review 6e
         self.assertEqual(report["known_limits"][0]["text"], texts.KEEPER_SAME_USER_GUARANTEE)
@@ -374,7 +374,7 @@ class KeeperGeneratorTest(Attempts, unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="gk-gen-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def test_generator_crash_costs_alpha(self):                 # Review Focus 2, preflight finding 9
+    def test_generator_crash_costs_alpha(self):
         for mode in ("raise", "nan"):
             with self.subTest(mode):
                 self.start({"GATEDTRAIN_TEST_GENERATOR": mode})
@@ -412,7 +412,7 @@ class KeeperGeneratorTest(Attempts, unittest.TestCase):
         per_arm = 399 * len(pack.EVAL_SEEDS)
         self.assertEqual((calls.count(b"b"), calls.count(b"c")), (per_arm, 3 * per_arm))
 
-    def test_concurrent_claims_serialised(self):               # Review Focus 3
+    def test_concurrent_claims_serialised(self):
         self.start()
         p1, p2 = self.ready("p1"), self.ready("p2")
         cands = {p1: self.one_token(p1, 0), p2: self.one_token(p2, 1)}
@@ -440,7 +440,7 @@ class KeeperGeneratorTest(Attempts, unittest.TestCase):
         self.assertEqual([(r["entry"], r["j"]) for r in rows], [("grant", 1), ("settle", 1), ("grant", 2)])
         self.assertEqual(rows[2]["wealth_before"], rows[1]["wealth_after"])
 
-    def test_slow_evaluate_ahead_of_a_second_client(self):      # Task 6 carry: no silent spend behind a slow op
+    def test_slow_evaluate_ahead_of_a_second_client(self):      # no silent spend behind a slow op
         self.start({"GATEDTRAIN_TEST_GENERATOR": "slow:0.003"})
         p1, p2 = self.ready("p1"), self.ready("p2")
         done: dict[str, object] = {}
@@ -460,7 +460,7 @@ class KeeperGeneratorTest(Attempts, unittest.TestCase):
         self.assertEqual([r["j"] for r in self.ledger_records(p1)], [1])
         self.assertEqual(self.evaluate(p2, self.one_token(p2, 1))["j"], 2)
 
-    def test_killed_between_claim_and_gate(self):              # Review Focus 4, preflight finding 8
+    def test_killed_between_claim_and_gate(self):
         # kill point 1: after the records are stored -> gated normally after the restart
         self.start()
         pid = self.ready("p1")
@@ -558,7 +558,7 @@ class KeeperStateAttemptsTest(unittest.TestCase):
         tok = sorted(full)[k]
         return arm(model({tok: full[tok]}, f"one-token-{k}"))
 
-    def test_tampered_ledger_refused(self):                    # Task 3 carry: replay checks every stored number
+    def test_tampered_ledger_refused(self):                    # replay checks every stored number
         pid, r, reg = self.ready()
         a = self.state.evaluate(pid, reg, arm(BASE), self.candidate(r, 0))
         self.state.gate(pid, a["attempt_id"])
@@ -573,7 +573,7 @@ class KeeperStateAttemptsTest(unittest.TestCase):
             again.alpha(pid)
         self.assertEqual(cm.exception.problems[0].rule, "AN-14")
 
-    def test_resigned_ledger_with_wrong_arithmetic_refused(self):    # Task 3 carry: a valid signature is not enough
+    def test_resigned_ledger_with_wrong_arithmetic_refused(self):    # a valid signature is not enough
         pid, r, reg = self.ready()
         a = self.state.evaluate(pid, reg, arm(BASE), self.candidate(r, 0))
         self.state.gate(pid, a["attempt_id"])
@@ -617,7 +617,7 @@ class _ScenarioEP:
 _ORIGINAL_EPS = trust_stages._scenario_entry_points
 
 
-class ReplayChecksTest(unittest.TestCase):                    # Task 3 carry
+class ReplayChecksTest(unittest.TestCase):
     def rows(self, outcomes) -> list[dict]:
         rows, w = [], ai.INITIAL_WEALTH
         for passed in outcomes:

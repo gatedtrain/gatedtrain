@@ -74,7 +74,7 @@ def problem(cm) -> object:
 
 class TextsTest(unittest.TestCase):
     def test_keeper_guarantee_is_the_spec_sentence(self):
-        self.assertEqual(texts.KEEPER_GUARANTEE,          # design 05 §18.9, revision 25 (pre-flight finding 5)
+        self.assertEqual(texts.KEEPER_GUARANTEE,          # design 05 §18.9, revision 25
                          "the sealed items, registrations, claims, ledger and per-item records are held by a separate "
                          "OS user running code the user's account cannot change, and every record is signed; the "
                          "keeper found no rootful Docker or containerd access by the user's account, nor the account "
@@ -89,7 +89,7 @@ class TextsTest(unittest.TestCase):
                          "account; a root user, also one reached through sudo, or the keeper's own account can break "
                          "all of it.")
 
-    def test_separate_user_text(self):                  # preflight finding 24: the separate-user text is pinned in CI
+    def test_separate_user_text(self):                  # the separate-user text is pinned in CI
         self.assertEqual(texts.sealed_guarantee(1001, 1000), texts.KEEPER_GUARANTEE)
 
     def test_same_user_text(self):
@@ -215,7 +215,7 @@ class KeeperIntakeTest(unittest.TestCase):
         self.assertEqual(self.call("intake", pid, intake_args(small)), r)          # stored result, flag not needed
         self.assertIs(self.intake(self.opened("p2"), small)["reused"], True)     # byte-identical reuse unaffected
 
-    def test_same_data_second_project_reuses_the_sealed_set(self):     # AN-16, plan interpretation 1
+    def test_same_data_second_project_reuses_the_sealed_set(self):     # AN-16
         first = self.intake(self.opened("p1"))
         second = self.intake(self.opened("p2"))
         self.assertIs(second["reused"], True)
@@ -239,7 +239,7 @@ class KeeperIntakeTest(unittest.TestCase):
                 self.assertNotIn(target, p.message + p.field + p.fix)
         self.assert_no_sealed_text(sealed)
 
-    def test_released_training_inputs_are_never_sealed_later(self):    # AN-16, preflight finding 12
+    def test_released_training_inputs_are_never_sealed_later(self):    # AN-16
         first = self.intake(self.opened("p1"))
         released = first["train_rows"]
         fresh = [{"input": f"fresh-{i}", "label": f"L{i % 5}"} for i in range(400)]
@@ -288,7 +288,7 @@ class KeeperIntakeTest(unittest.TestCase):
         self.assertEqual(self.call("records", pid), records)
         self.assertEqual(self.call("latest_registration", pid), out["hash"])
 
-    def test_scorer_that_cannot_take_the_sealed_labels_refused(self):  # Review Focus 1, AN-17
+    def test_scorer_that_cannot_take_the_sealed_labels_refused(self):  # AN-17
         pid = self.opened("p1")
         r = self.intake(pid)
         self.call("confirm_metric", pid, confirm_args("set_f1"))
@@ -394,7 +394,7 @@ class KeeperStateTest(unittest.TestCase):
         out = self.state.register(pid, registration(r["sealed_id"], "numeric_match", params={"abs_tol": 0.5}))
         self.assertEqual(out["hash"], self.state.latest_registration(pid))
 
-    def test_pack_scorer_with_a_larger_planning_sd_refused(self):     # preflight finding 19, AN-17
+    def test_pack_scorer_with_a_larger_planning_sd_refused(self):     # AN-17
         tsc.inject_pack(self)
         tsc.TEST_SCORERS["wide"] = tsc.pack_decl(id="wide.t17@0.1", planning_sd=0.9)
         tsc.TEST_SCORERS["pack_iou"] = tsc.pack_decl()
@@ -416,7 +416,7 @@ class KeeperStateTest(unittest.TestCase):
         changed = registration(r["sealed_id"], margin=0.1)
         second = self.state.register(pid, changed)               # before any claim: a change is free
         self.assertEqual(self.state.latest_registration(pid), second["hash"])
-        self.state._record_attempt(pid, "attempt-1")             # what a claim (Task 9) records
+        self.state._record_attempt(pid, "attempt-1")             # what a claim records
         with self.assertRaises(Refused) as cm:
             self.state.register(pid, registration(r["sealed_id"]))
         self.assertEqual(problem(cm).rule, "AN-8")
@@ -430,7 +430,7 @@ class KeeperStateTest(unittest.TestCase):
 
     def test_reuse_of_a_closed_set_refused(self):                      # AN-16
         _, r = self.ready()
-        self.state._close_set(r["sealed_id"])                    # what a report (Task 9) does
+        self.state._close_set(r["sealed_id"])                    # what a report does
         pid2 = project_id("p2")
         self.state.open_project(pid2)
         with self.assertRaises(Refused) as cm:

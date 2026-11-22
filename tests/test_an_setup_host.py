@@ -3,7 +3,7 @@ section 14).
 
 `setup host` prints one root bash script (never runs it) that sets up rootless Docker for the owner and the keeper
 user, removes the owner from the rootful `docker` group before any user manager or rootless daemon of the owner is
-started (preflight finding 4), and with `--inference-image` wires the keeper's inference options into a drop-in of
+started, and with `--inference-image` wires the keeper's inference options into a drop-in of
 its unit. Every check (root, the owner's uid, an NVIDIA CDI spec, the eval interpreter tree, the parents of the
 created directories) comes before the first change. `setup keeper --inference-image ID --eval-tree DIR --docker-host
 URL` prints them into `ExecStart=`. Nothing here starts a process or creates a file; the only shell use is the
@@ -88,7 +88,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         self.assertTrue(script.startswith("#!/bin/bash\n"), script[:80])
         self.assertIn("set -euo pipefail\ncd /\numask 022", cmds)      # no program runs in the caller's cwd
         self.assertIn("gatedtrain-host-setup.sh", script.split("set -euo pipefail")[0])     # header: save, run, delete
-        # the checks, then the changes in the order the brief and preflight finding 4 give
+        # the checks, then the changes in order (the group removal before any user manager of the owner starts)
         self.assert_order(cmds, ['"$(id -u)"', 'id -u "$OWNER"', "nvidia.com/gpu", "apt-get install -y uidmap",
                                  "docker-ce-rootless-extras=", "usr.bin.rootlesskit", "--add-subuids",
                                  "gpasswd -d", "loginctl enable-linger", '"cdi": true',
@@ -106,7 +106,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         self.assertIn("XDG_RUNTIME_DIR=/run/user/", cmds)
         self.assertIn("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/", cmds)
         self.assertIn("unix:///run/user/1234/docker.sock", cmds)
-        # no inference, no eval venv; an earlier inference drop-in is removed (fix round 1, item 4)
+        # no inference, no eval venv; an earlier inference drop-in is removed
         for absent in ("--inference-image", "--eval-tree", "-m venv", "--require-hashes", "cat > /etc/systemd"):
             self.assertNotIn(absent, cmds)
         self.assert_order(cmds, [f"rm -f {hostsetup.DROPIN_PATH}", "systemctl daemon-reload",
@@ -168,9 +168,9 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
 
     def test_network_driver_and_extras_hold(self):
         cmds = commands_only(self.script())
-        # a rootless network driver is checked before any change (item 7)
+        # a rootless network driver is checked before any change
         self.assert_order(cmds, ["cd /", "command -v slirp4netns", "command -v pasta", "apt-get install -y uidmap"])
-        # the extras: skipped at the right version, unheld and held again around the install (item 1)
+        # the extras: skipped at the right version, unheld and held again around the install
         self.assert_order(cmds, ["apt-get install -y uidmap",
                                  "dpkg-query -W -f='${Version}' docker-ce-rootless-extras",
                                  '"$EXTRAS_VERSION" != "$DOCKER_CE_VERSION"',
@@ -179,7 +179,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
                                  '--allow-downgrades --no-install-recommends '
                                  '"docker-ce-rootless-extras=$DOCKER_CE_VERSION"',
                                  "apt-mark hold docker-ce-rootless-extras", "usr.bin.rootlesskit"])
-        # a replaced daemon.json is reported with its backup (item 5)
+        # a replaced daemon.json is reported with its backup
         self.assertIn("daemon.json.before-gatedtrain", cmds[cmds.index("echo ", cmds.index("as_owner cp")):])
         self.assertRegex(cmds, r'echo "[^"\n]*replaced[^"\n]*daemon\.json\.before-gatedtrain')
 
@@ -209,7 +209,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
                                  f"chmod -R go-w {venv}", "docker pull", "image inspect -f '{{.Id}}'",
                                  "^sha256:[0-9a-f]{64}$", "inference.conf", "systemctl daemon-reload",
                                  "systemctl try-restart gatedtrain-keeper.service"])
-        # root runs the interpreter isolated from the cwd and the environment (fix round 1, items 2 and 3)
+        # root runs the interpreter isolated from the cwd and the environment
         self.assertIn(f'"$EVAL_PYTHON" -I -m venv --clear {venv}', cmds)
         pip = next(line for line in cmds.splitlines() if "--require-hashes" in line)
         for text in ("PIP_CONFIG_FILE=/dev/null", "--isolated", "--only-binary :all:", "--require-hashes",
@@ -226,7 +226,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
         serve = setup.serve_argv(PurePosix(setup.DEFAULT_VENV), PurePosix(setup.DEFAULT_STATE),
                                  PurePosix(setup.DEFAULT_SOCKET), 1234, inference_image="${IMG}",
                                  eval_trees=[PYROOT, venv], docker_host="unix:///run/user/${KUID}/docker.sock")
-        self.assertIn("ExecStart=" + " ".join(serve) + "\n", dropin)       # one serve builder (finding 17)
+        self.assertIn("ExecStart=" + " ".join(serve) + "\n", dropin)       # one serve builder
         self.assertIn(f"--eval-tree {PYROOT} --eval-tree {venv}", dropin)
         self.assertNotIn("sudo", cmds)
         self.assert_bash_parses(script)

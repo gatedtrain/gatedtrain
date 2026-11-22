@@ -6,7 +6,7 @@ starts `tests/fixtures/ainative/run_cli.py keeper serve --state ... --socket ...
 and removes the directory; a start that fails cleans up before it raises.
 
 The keeper's rootful-access detection (AN-21) reads a fake host tree, never the real host (the CI runner is in the
-`docker` group, preflight finding 19): unless `env` sets `GATEDTRAIN_TEST_HOST_VIEW`, `KeeperProcess` writes a clean
+`docker` group): unless `env` sets `GATEDTRAIN_TEST_HOST_VIEW`, `KeeperProcess` writes a clean
 tree (`write_host_tree`) under its directory and points the variable at it.
 """
 
@@ -126,7 +126,7 @@ class KeeperProcess:
         cmd = [sys.executable, str(RUN_CLI), "keeper", "serve", "--state", str(self.state),
                "--socket", str(self.socket), "--owner-uid", str(self.owner_uid), *self.args]
         env = {**cli_env(), **self.env}
-        if not env.get(HOST_VIEW_ENV):           # never the real host's docker group (preflight finding 19)
+        if not env.get(HOST_VIEW_ENV):           # never the real host's docker group
             env[HOST_VIEW_ENV] = str(write_host_tree(self.tmp / "host", owner_uid=self.owner_uid))
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
                                      env=env, cwd=str(self.tmp))

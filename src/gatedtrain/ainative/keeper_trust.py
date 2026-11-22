@@ -284,8 +284,8 @@ class KeeperTrust:
 
     def sync(self) -> int:
         """Append to the receipts every envelope the keeper signed for this project that they lack, each verified
-        against the bound key for this project first (AN-14); returns how many were appended (final review finding 1:
-        a claim and grant the driver never received)."""
+        against the bound key for this project first (AN-14); returns how many were appended (for example a claim
+        and grant the driver never received)."""
         held = self._call("records")
         if not isinstance(held, list):
             raise _anchor("records", "the keeper's record list is malformed", "check the keeper")
@@ -376,7 +376,7 @@ class KeeperTrust:
     def evaluate(self, registration_hash: str, baseline: tuple[dict, str], candidate: tuple[dict, str]) -> dict:
         """Ask the keeper for a sealed attempt: it grants alpha, signs the claim and scores both arms. Returns the
         claim record. A refusal after the grant (the scoring failed) appends the spend's envelopes before it is
-        raised, so the machine logs the attempt `failed` (preflight finding 9). Either way the receipts are then synced
+        raised, so the machine logs the attempt `failed`. Either way the receipts are then synced
         with the keeper (`sync`), which also brings in an earlier attempt this driver gave up on."""
         args = {"registration_hash": registration_hash,
                 "baseline": {"record": baseline[0], "sha256": baseline[1]},
