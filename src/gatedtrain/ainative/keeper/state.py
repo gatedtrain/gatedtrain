@@ -13,6 +13,8 @@ Layout under the state directory (every file mode 0600, every directory 0700, ne
   of the rows released as training.
 - `sets/<sealed hex>/items.json`: the sealed items (canonical JSON; the file's sha256 is the sealed set id);
   `sets/<sealed hex>/closed`: present once a report closed the set;
+  `sets/<sealed hex>/root_docker_seen.json`: written once, at the first check on the set that found rootful access
+  by the owner (AN-21: first time and reasons); from then on the set's guarantee is the downgraded text;
   `sets/<sealed hex>/attempts/<j>.json`: sealed attempt j on the set (from any project): its claim and ledger `grant`
   envelopes, and once settled its gate record, gate summary and ledger `settle` envelopes. The attempt files are the
   set's alpha-investing ledger; the grant is committed (this file written) before anything is scored;
@@ -43,6 +45,11 @@ the set. An attempt still open at a restart is gated normally when its per-item 
 as not passed (MISSING); either happens on the next `evaluate`, `gate` or `report` on the set (preflight finding 8).
 At start, envelopes an attempt file or report holds but `records.jsonl` lacks (a crash between the two writes) are
 appended again.
+
+Rootful-access detection (AN-21, preflight finding 2): `root_docker` is called at intake, sealed summary, evaluate,
+gate and report on a set (and by `hello` for a project); a positive result is recorded once for the set and stays, so
+the intake summary, the report and `hello` for every project on that set state the downgraded guarantee from then on,
+also after the access ended. Without `root_docker` (tests that construct the state in process) nothing is detected.
 """
 
 from __future__ import annotations
@@ -55,6 +62,7 @@ import pwd
 import re
 import stat
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +90,7 @@ SCHEMA_REGISTRATION = "gatedtrain.ainative.keeper_registration"
 SCHEMA_ATTEMPT = "gatedtrain.ainative.keeper_attempt"
 SCHEMA_ARM_RECORDS = "gatedtrain.ainative.keeper_arm_records"
 SCHEMA_STORED_REPORT = "gatedtrain.ainative.keeper_report"
+SCHEMA_ROOT_DOCKER_SEEN = "gatedtrain.ainative.keeper_root_docker_seen"
 REPORT_SCHEMA_VERSION = 2
 NEW_DATA_FIX = "a new test needs new labelled data"
 PASSED_FIX = "this project passed; write its report"
@@ -116,11 +125,12 @@ def _damaged(rel: str) -> Refused:
 
 
 class KeeperState:
-    def __init__(self, state_dir: Path, *, owner_uid: int | None = None) -> None:
+    def __init__(self, state_dir: Path, *, owner_uid: int | None = None,
+                 root_docker: Callable[[], list[str]] | None = None) -> None:
         self.dir = Path(state_dir)
         self.keeper_uid = os.geteuid()
         self.owner_uid = self.keeper_uid if owner_uid is None else owner_uid
-        self.guarantee = texts.sealed_guarantee(self.keeper_uid, self.owner_uid)
+        self.root_docker = root_docker
         self._mutex = threading.RLock()
         self.environment_sha256: str | None = None     # set by `serve` once it signed the environment record
         self._lock_fd: int | None = self._take_lock()
@@ -313,7 +323,7 @@ class KeeperState:
 
     def _result(self, rec: dict, reused: bool) -> dict:
         summary = {"schema": SCHEMA_SEALED_SUMMARY, "schema_version": ARTIFACT_SCHEMA_VERSION, **rec["sealed_summary"],
-                   "guarantee": self.guarantee}
+                   "guarantee": self._guarantee(rec["sealed_id"])}
         power = {"schema": SCHEMA_POWER, "schema_version": ARTIFACT_SCHEMA_VERSION, **rec["power"]}
         return {"sealed_id": rec["sealed_id"], "train_rows": rec["train_rows"], "sealed_summary": summary,
                 "power": power, "reused": bool(reused)}
@@ -381,6 +391,7 @@ class KeeperState:
                 rec = self._intake_record(data_sha256)
                 if rec is None:
                     raise _damaged(f"{self._project_rel(project_id)}/project.json")
+                self._check_set(rec["sealed_id"])
                 return self._result(rec, doc["reused"])
             rec = self._intake_record(data_sha256)
             if rec is not None:
@@ -393,12 +404,62 @@ class KeeperState:
                 reused = False
             doc.update(data_sha256=data_sha256, sealed_id=rec["sealed_id"], reused=reused)
             self._save_project(doc)
+            self._check_set(rec["sealed_id"])
             return self._result(rec, reused)
 
     def sealed_summary(self, project_id: str) -> dict:
         with self._mutex:
             doc, rec = self._taken_in(project_id)
+            self._check_set(rec["sealed_id"])
             return self._result(rec, doc["reused"])["sealed_summary"]
+
+    # ---- rootful-access detection (AN-21) ------------------------------------------------------------------------
+
+    def detect_root_docker(self) -> list[str]:
+        """The current detection's reasons ([] without a detector); a detector that fails counts as positive."""
+        if self.root_docker is None:
+            return []
+        try:
+            return list(self.root_docker())
+        except Exception as exc:                     # fail closed
+            return [f"the rootful-access detection failed ({type(exc).__name__}): counted as rootful access"]
+
+    def root_docker_seen(self, sealed_id: str) -> dict | None:
+        """The set's `root_docker_seen` record (`{first_utc, reasons}`), or None."""
+        return self._read_json(f"{self._set_rel(sealed_id)}/root_docker_seen.json", SCHEMA_ROOT_DOCKER_SEEN)
+
+    def _check_set(self, sealed_id: str, reasons: list[str] | None = None) -> bool:
+        """Run the detection (or take `reasons`), record a positive result once for the set; True when the set was
+        ever seen with rootful access."""
+        reasons = self.detect_root_docker() if reasons is None else reasons
+        seen = self.root_docker_seen(sealed_id)
+        if reasons and seen is None:
+            seen = {"schema": SCHEMA_ROOT_DOCKER_SEEN, "schema_version": STATE_SCHEMA_VERSION, "sealed_id": sealed_id,
+                    "first_utc": _utc_now(), "reasons": list(reasons)}
+            self._write_json(f"{self._set_rel(sealed_id)}/root_docker_seen.json", seen)
+        return seen is not None
+
+    def _guarantee(self, sealed_id: str) -> str:
+        """The guarantee for the set (its recorded detection; run `_check_set` first)."""
+        return texts.sealed_guarantee(self.keeper_uid, self.owner_uid,
+                                      root_docker=self.root_docker_seen(sealed_id) is not None)
+
+    def root_docker_for(self, project_id: str, reasons: list[str]) -> tuple[bool, list[str]]:
+        """`hello` for a project (preflight finding 2): (rootful access now or recorded on the project's set, the
+        reasons: the current ones, else the recorded ones with their first time). A project the keeper does not know,
+        or one without a sealed set yet, reports the current state."""
+        with self._mutex:
+            doc = self._read_json(f"{self._project_rel(project_id)}/project.json", SCHEMA_PROJECT)
+            sealed_id = doc.get("sealed_id") if doc is not None else None
+            if not sealed_id:
+                return bool(reasons), list(reasons)
+            if not self._check_set(sealed_id, reasons):
+                return False, []
+            if reasons:
+                return True, list(reasons)
+            seen = self.root_docker_seen(sealed_id) or {}
+            return True, [f"recorded on this sealed set at {seen.get('first_utc')}: {r}"
+                          for r in seen.get("reasons", [])]
 
     # ---- signed records -------------------------------------------------------------------------------------------
 
@@ -775,6 +836,7 @@ class KeeperState:
         with self._mutex:
             doc, _ = self._taken_in(project_id)
             sealed_id = doc["sealed_id"]
+            self._check_set(sealed_id)
             self._settle_open(sealed_id)
             if self._closed(sealed_id):
                 raise _problem("AN-16", "sealed set", "a report closed this sealed set; no further attempt is allowed "
@@ -944,6 +1006,7 @@ class KeeperState:
         """The attempt's gate summary and ledger settle envelopes (AN-9); computed once, then the stored ones."""
         with self._mutex:
             doc, _ = self._taken_in(project_id)
+            self._check_set(doc["sealed_id"])
             found = [a for a in self._attempts(doc["sealed_id"])
                      if a["attempt_id"] == attempt_id and a["project_id"] == project_id]
             if not found:
@@ -962,6 +1025,7 @@ class KeeperState:
         with self._mutex:
             doc, rec = self._taken_in(project_id)
             sealed_id = doc["sealed_id"]
+            self._check_set(sealed_id)
             rel = f"{self._project_rel(project_id)}/report.json"
             stored = self._read_json(rel, SCHEMA_STORED_REPORT)
             if stored is not None:
@@ -1000,6 +1064,7 @@ class KeeperState:
                            "keeper runs, so the metric's unit is unknown", "register again with a scorer it serves")
         gate = head["gate_record"]["record"]["result"]
         power = dict(rec["power"])
+        guarantee = self._guarantee(rec["sealed_id"])
         registration = {"hash": head["registration_hash"], "scorer": clause.get("metric"),
                         "direction": clause.get("direction"), "margin": clause.get("margin"),
                         "alpha": clause.get("alpha"),
@@ -1019,8 +1084,8 @@ class KeeperState:
                 "gate_result": gate,
                 "display": sealed_eval.display_block(gate, power),
                 "ledger": ledger, "attempts": attempts,
-                "sealed_guarantee": self.guarantee,
-                "known_limits": texts.known_limits(self.guarantee, len(atts)),
+                "sealed_guarantee": guarantee,
+                "known_limits": texts.known_limits(guarantee, len(atts)),
                 "alpha_rule": {"rule": ai.RULE, "initial_wealth": ai.INITIAL_WEALTH, "payout": ai.PAYOUT,
                                "min_bid": ai.MIN_BID, "planning_alpha": PLANNING_ALPHA, "guarantee": ai.GUARANTEE},
                 "keeper": {"fingerprint": signing.fingerprint(self.key),

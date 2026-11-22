@@ -198,12 +198,13 @@ class CliProject(KeeperProject):
 
     @contextlib.contextmanager
     def separate_user_keeper(self):
-        """`hello` answers as a keeper under its own OS user would (`same_user` false); CI has no second user."""
+        """`hello` answers as a keeper under its own OS user would (`same_user` false) on a host where the owner reaches
+        no rootful daemon (`owner_has_root_docker` false, AN-21); CI has no second user."""
         real = KeeperClient.call
 
         def call(client, op, project, args):
             out = real(client, op, project, args)
-            return {**out, "same_user": False} if op == "hello" else out
+            return {**out, "same_user": False, "owner_has_root_docker": False} if op == "hello" else out
         with mock.patch.object(KeeperClient, "call", call):
             yield
 
@@ -217,7 +218,8 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         code, doc = run(["keeper", "fingerprint", "--socket", str(self.kp.socket)])
         self.assertEqual((code, doc["command"]), (0, "keeper fingerprint"), doc)
         self.assertEqual(doc["data"], {"fingerprint": signing.fingerprint(self.public()),
-                                       "sealed_guarantee": texts.KEEPER_SAME_USER_GUARANTEE})
+                                       "sealed_guarantee": texts.KEEPER_SAME_USER_GUARANTEE,
+                                       "owner_has_root_docker": False, "root_docker_reasons": []})    # AN-21
         code, doc = run(["keeper", "fingerprint", "--socket", str(self.tmp / "none.sock")])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-12"), doc)
 

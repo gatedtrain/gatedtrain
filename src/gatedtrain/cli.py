@@ -640,8 +640,12 @@ def cmd_keeper_fingerprint(args) -> int:
         hello = _keeper_hello(Path(args.socket).absolute())
     except Refused as exc:
         return _krefuse(args, exc.problems)
-    data = {"fingerprint": hello["fingerprint"], "sealed_guarantee": hello.get("sealed_guarantee")}
-    return _kfinish(args, data, f"fingerprint: {data['fingerprint']}\nguarantee: {data['sealed_guarantee']}\n")
+    data = {"fingerprint": hello["fingerprint"], "sealed_guarantee": hello.get("sealed_guarantee"),
+            "owner_has_root_docker": hello.get("owner_has_root_docker"),
+            "root_docker_reasons": hello.get("root_docker_reasons")}
+    reasons = "".join(f"  {r}\n" for r in data["root_docker_reasons"] or [])
+    return _kfinish(args, data, f"fingerprint: {data['fingerprint']}\nguarantee: {data['sealed_guarantee']}\n"
+                                f"owner has rootful access (AN-21): {data['owner_has_root_docker']}\n{reasons}")
 
 
 CONFIRM_PROMPT = "Type yes to record this confirmation in the keeper: "
@@ -701,23 +705,35 @@ def cmd_setup_keeper(args) -> int:
 
 def cmd_verify(args) -> int:
     """AN-14: exit 0 when the project's signed records check against an anchor (the keeper's key or --fingerprint),
-    1 when there is no anchor and only their consistency was checked (no anchor given, or a keeper that runs as the
-    owner's own uid, which can read its key), 3 on a bad signature or a mismatch."""
-    from .ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_KEEPER, verify_project
+    1 when there is no anchor and only their consistency was checked (no anchor given, a keeper that runs as the
+    owner's own uid, or one whose owner reaches a rootful daemon (AN-21), either of which can read its key), 1 also
+    under any anchor when a report states the downgraded or the unchecked revision 23 guarantee, 3 on a bad signature
+    or a mismatch."""
+    from .ainative.verify import (CONSISTENCY_ONLY, OFFLINE_LIMIT, ROOT_DOCKER_KEEPER, SAME_USER_KEEPER,
+                                  report_warnings, verify_project)
 
     try:
         out = verify_project(Path(args.root), keeper=Path(args.keeper) if args.keeper else None,
                              fingerprint=args.fingerprint)
     except Refused as exc:
         return _krefuse(args, exc.problems)
+    reports = report_warnings(out)
     if out["anchor"] == "none":
         return _kfinish(args, out, f"consistent: {out['checked']} records under key {out['fingerprint']}\n",
-                        ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY, OFFLINE_LIMIT])
+                        ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY, OFFLINE_LIMIT, *reports])
     if out["anchor"] == "keeper" and out["same_user"]:
         return _kfinish(args, out, f"consistent with a same-user keeper: {out['checked']} records under key "
                                    f"{out['fingerprint']}\n", ok=False, exit_code=EXIT_NOT_PASS,
-                        warnings=[SAME_USER_KEEPER])
+                        warnings=[SAME_USER_KEEPER, *reports])
+    if out["anchor"] == "keeper" and out["root_docker"]:
+        return _kfinish(args, out, f"consistent with a keeper whose owner reaches a rootful daemon: {out['checked']} "
+                                   f"records under key {out['fingerprint']}\n", ok=False, exit_code=EXIT_NOT_PASS,
+                        warnings=[ROOT_DOCKER_KEEPER, *reports])
     warnings = [] if out["anchor"] == "keeper" else [OFFLINE_LIMIT]       # only the keeper sees a deleted record
+    if reports:
+        return _kfinish(args, out, f"verified against the {out['anchor']}, but the report's guarantee does not hold: "
+                                   f"{out['checked']} records under key {out['fingerprint']}\n", ok=False,
+                        exit_code=EXIT_NOT_PASS, warnings=[*warnings, *reports])
     return _kfinish(args, out, f"verified against the {out['anchor']}: {out['checked']} records under key "
                                f"{out['fingerprint']}\n", warnings=warnings)
 
