@@ -643,6 +643,8 @@ def credential_name_problem(root: str, limit: int = SCAN_LIMIT, *, skip: tuple[s
         return f"{root} has a credential-like name (`{glob}`; EXT-80)"
     if not os.path.isdir(root):
         return None
+    if _variants(root) & skipped:
+        return None
     errors: list[OSError] = []
     seen = 0
     for top, dirs, files in os.walk(root, onerror=errors.append):

@@ -343,6 +343,32 @@ class TestCredentialNames5(TmpCase):
         why = credential_name_problem(str(src), skip=(str(src / "v" / ".venv"),))
         self.assertIn("token", why)
 
+    def test_skip_path_as_the_source(self):
+        """A source that is itself a configured skip directory is not walked."""
+        from gatedtrain.ext.launch import credential_name_problem
+        src = self.source(".venv/lib/anthropic/lib/credentials/_auth.py")
+        venv = src / ".venv"
+        self.assertIsNone(credential_name_problem(str(venv), skip=(str(venv),)))
+        why = credential_name_problem(str(venv), skip=())
+        self.assertIn("credentials", why)
+
+    def test_skip_path_as_the_source_resolved(self):
+        """The skip path may be a link to the source, or the source a link to the skip path."""
+        from gatedtrain.ext.launch import credential_name_problem
+        src = self.source(".venv/lib/anthropic/lib/credentials/_auth.py")
+        venv = src / ".venv"
+        link = src / "link"
+        link.symlink_to(venv, target_is_directory=True)
+        self.assertIsNone(credential_name_problem(str(venv), skip=(str(link),)))
+        self.assertIsNone(credential_name_problem(str(link), skip=(str(venv),)))
+
+    def test_skip_root_own_name_still_matched(self):
+        from gatedtrain.ext.launch import credential_name_problem
+        src = self.source("x.txt")
+        env = src / ".env"
+        env.mkdir()
+        self.assertIsNotNone(credential_name_problem(str(env), skip=(str(env),)))
+
     def test_stdlib_secrets_in_the_interpreter_tree_only(self):
         """Q1 (round 5): the exemption needs `<tree>/lib/python3.N/` exactly, `<tree>` a declared interpreter tree."""
         from gatedtrain.ext.launch import credential_name_problem
