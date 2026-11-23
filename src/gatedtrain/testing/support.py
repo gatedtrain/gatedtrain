@@ -12,6 +12,13 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+# A test never reads the developer's host file (`~/.config/gatedtrain/host.toml`): its daemon lists enter
+# `host_config_sha256`, so the layouts the tests build would not match. Unless the environment names a host file, an
+# empty one applies, in process and in the CLI subprocesses the tests start. Only the test helpers (this module and
+# `gatedtrain.testing.ext`, which imports it) do this; the modules a distribution registers through entry points do
+# not, so an installed `gatedtrain` command that loads them still reads the user's host file.
+os.environ.setdefault("GATEDTRAIN_HOST_CONFIG", os.devnull)
+
 EXIT_OK = 0
 EXIT_GATE_NOT_PASS = 1
 EXIT_USAGE = 2

@@ -6,11 +6,7 @@ labels, the host-layout hash, the gpu-step.sh stand-in). They deliberately do no
 checks gatedtrain's hashes against a second implementation. `gatedtrain.testing.synthetic`: a synthetic external-run adapter,
 registered only on request (`install()`, or `python -m gatedtrain.testing.synthetic <gatedtrain arguments>`), on which gatedtrain's
 own external-run tests run, and an example of the adapter interface for adapter authors.
+
+Importing the test helpers (`support`, `ext`) makes an unset `GATEDTRAIN_HOST_CONFIG` the empty host file; importing
+this package or the modules registered through entry points does not.
 """
-
-import os
-
-# A test never reads the developer's host file (`~/.config/gatedtrain/host.toml`): its daemon lists enter
-# `host_config_sha256`, so the layouts the tests build would not match. Unless the environment names a host file, an
-# empty one applies, in process and in the CLI subprocesses the tests start.
-os.environ.setdefault("GATEDTRAIN_HOST_CONFIG", os.devnull)
