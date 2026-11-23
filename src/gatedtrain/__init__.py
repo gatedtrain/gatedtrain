@@ -4,7 +4,7 @@ prototype, unpromotable. The Tier A trainer and evaluator are stand-ins
 marked skeleton-stub (MVP-SPEC section 3).
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 PACKAGE = "gatedtrain"
 # The analysis code version (05 section 3.7, design revision 24): every registration records

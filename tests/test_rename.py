@@ -61,7 +61,7 @@ class TestAnalysisVersion(unittest.TestCase):
     registration, unchanged."""
 
     def test_does_not_follow_the_package_version(self):
-        self.assertEqual(__version__, "0.4.0")
+        self.assertEqual(__version__, "0.5.0")
         self.assertEqual(ANALYSIS_VERSION, "0.3.0")
         self.assertEqual(ANALYSIS_CODE_VERSION, f"{PACKAGE} {ANALYSIS_VERSION}")
         self.assertNotEqual(ANALYSIS_CODE_VERSION, f"{PACKAGE} {__version__}")
