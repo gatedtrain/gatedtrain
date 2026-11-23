@@ -6,7 +6,10 @@ to find which checkpoints may have consumed a training shard, for example after 
 
 This is a prototype. Outputs carry the tags `prototype` and `unpromotable`.
 
-## Changes since 0.4.0 (unreleased)
+## Changes in 0.5.0
+
+The analysis code version stays `gatedtrain 0.3.0` (the gate statistics and registration semantics did not change),
+so registrations made with 0.3.0 or 0.4.0 stay valid.
 
 AI-native step 3a, a preview on Linux (see "Rootless containers, the local backend and the keeper's container (step
 3a)" below):
@@ -28,6 +31,18 @@ Behaviour that changes for 0.4.0 users:
   separate-user guarantee.
 - Upgrade the keeper's environment (the venv `setup keeper` installed) together with the driver: the driver now sends
   the project with `hello`, and a 0.4.0 keeper states no rootful-access check.
+- A scenario pack scorer whose id is also an ext evaluator row id is refused (AN-17); before, the row shadowed the
+  scorer at registration and `preregister` refused with an unclear message. Give the scorer its own id.
+
+Fixes:
+
+- The credential file-name scan no longer walks a read-only source that is itself one of the adapter's `scan_skip`
+  directories (for example a job that mounts a runtime's `.venv` directly); the source's own name is still checked.
+- `keeper confirm` without `--yes` and with no answer on stdin (a shell started without input) now says no answer was
+  read and to rerun with `--yes` after reading the sentence.
+- Importing a scenario pack or ext adapter plugin that uses `gatedtrain.testing` no longer makes CLI processes ignore
+  the host file (`~/.config/gatedtrain/host.toml`); only the test helpers (`gatedtrain.testing.support`, `.ext`)
+  default an unset `GATEDTRAIN_HOST_CONFIG` to an empty host file.
 
 ## Changes in 0.4.0
 
