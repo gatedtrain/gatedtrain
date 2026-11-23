@@ -177,6 +177,10 @@ def _pack_spec(name: str, pack: str, decl: Mapping) -> ScorerSpec:
     sid, fn, sd, rng = decl["id"], decl["fn"], decl["planning_sd"], decl["range"]
     if not (isinstance(sid, str) and sid):
         raise _refuse(f"{field}.id", "the evaluator id is not a non-empty string", "give an id such as name.pack@0.1")
+    from ...ext import registry as ext_registry   # lazy: trust_stages imports this package lazily too
+    if sid in ext_registry.EVALUATOR_ROWS:
+        raise _refuse(field, "the pack scorer has the id of an ext evaluator row, which would resolve before it at "
+                      "registration", "give the pack scorer its own id")
     if not callable(fn):
         raise _refuse(f"{field}.fn", "fn is not callable", "give the scoring function fn(prediction, label)")
     if not (_num(sd) and sd > 0):

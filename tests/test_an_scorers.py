@@ -210,6 +210,19 @@ class PackScorerTest(unittest.TestCase):
         trust_stages._reset_scenario_snapshot()
         self.assertIn("library", self.refused("other"))
 
+    def test_pack_scorer_id_of_an_ext_row_refused(self) -> None:
+        from gatedtrain.ext import registry
+        row_id = "pack_iou.t17@0.1"
+        registry.EVALUATOR_ROWS[row_id] = {}
+        self.addCleanup(registry.EVALUATOR_ROWS.pop, row_id, None)
+        TEST_SCORERS["pack_iou"] = pack_decl(id=row_id)
+        trust_stages._reset_scenario_snapshot()
+        message = self.refused("pack_iou")
+        self.assertIn("ext evaluator row", message)
+        with self.assertRaises(Refused) as cm:
+            resolve("pack_iou")
+        self.assertIn("its own id", cm.exception.problems[0].fix)
+
     def test_unknown_name_and_bad_declarations_are_refused(self) -> None:
         self.refused("vibes")
         for bad in ({"planning_sd": 0}, {"planning_sd": float("nan")}, {"direction": "up"}, {"range": [1, 0]},
