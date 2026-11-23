@@ -699,6 +699,9 @@ def cmd_keeper_confirm(args) -> int:
             print(sentence, file=sys.stderr)
             print(CONFIRM_PROMPT, end="", file=sys.stderr, flush=True)
             answer = sys.stdin.readline()
+            if answer == "":                         # EOF: nothing was typed (closed stdin, no terminal)
+                raise Refused([Problem("AN-18", "stdin", "no answer was read: stdin is closed or not a terminal",
+                                       "read the sentence above and rerun with --yes to confirm it")])
             if answer.strip() != "yes":
                 raise Refused([Problem("AN-18", "stdin", "the confirmation was not given (the answer was not `yes`)",
                                        "read the sentence and answer yes to confirm it, or change --decision "

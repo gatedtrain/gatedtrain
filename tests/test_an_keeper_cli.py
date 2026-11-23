@@ -248,6 +248,13 @@ class KeeperCliTest(CliProject, unittest.TestCase):
             code, text, err = run_text(argv, stdin=answer)
             self.assertEqual((code, text), (3, ""), (answer, err))
             self.assertIn("error[AN-18]", err)
+            if answer:                                                 # a wrong answer keeps its message
+                self.assertIn("the answer was not `yes`", err)
+                self.assertNotIn("no answer was read", err)
+            else:                                                      # nothing to read: name the flag that works
+                self.assertIn("no answer was read: stdin is closed or not a terminal", err)
+                self.assertIn("rerun with --yes to confirm it", err)
+                self.assertNotIn("the answer was not `yes`", err)
         code, doc = run(argv, stdin="yes\n")                          # --json never prompts (AN-1): refused
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-18"), doc)
         self.assertIn("--yes", doc["problems"][0]["fix"])
