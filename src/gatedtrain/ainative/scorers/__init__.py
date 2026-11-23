@@ -160,8 +160,8 @@ def _pack_scorers() -> Mapping[str, tuple[str, Mapping]]:
 
 
 def _pack_spec(name: str, pack: str, decl: Mapping) -> ScorerSpec:
-    """The spec of a pack scorer declaration, refused (AN-17) when malformed, clashing with the library or when its
-    code hash is not the hash of the file defining `fn`."""
+    """The spec of a pack scorer declaration, refused (AN-17) when malformed, clashing with the library or with an
+    ext evaluator row id, or when its code hash is not the hash of the file defining `fn`."""
     field = f"scenario pack {pack}: scorers.{name}"
     missing = sorted(PACK_KEYS - set(decl))
     extra = sorted(set(decl) - PACK_KEYS - PACK_OPTIONAL_KEYS)
@@ -179,7 +179,7 @@ def _pack_spec(name: str, pack: str, decl: Mapping) -> ScorerSpec:
         raise _refuse(f"{field}.id", "the evaluator id is not a non-empty string", "give an id such as name.pack@0.1")
     from ...ext import registry as ext_registry   # lazy: trust_stages imports this package lazily too
     if sid in ext_registry.EVALUATOR_ROWS:
-        raise _refuse(field, "the pack scorer has the id of an ext evaluator row, which would resolve before it at "
+        raise _refuse(field, f"the pack scorer id {sid!r} is the id of an ext evaluator row, which would resolve before it at "
                       "registration", "give the pack scorer its own id")
     if not callable(fn):
         raise _refuse(f"{field}.fn", "fn is not callable", "give the scoring function fn(prediction, label)")
