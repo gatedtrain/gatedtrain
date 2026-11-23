@@ -633,7 +633,8 @@ def credential_name_problem(root: str, limit: int = SCAN_LIMIT, *, skip: tuple[s
     """EXT-80, EXT-93: why the read-only source `root` may hold a credential file, judged on names only (no file
     is opened): an entry whose normalised name matches CREDENTIAL_NAME_GLOBS or CREDENTIAL_DIR_NAMES, a directory
     that cannot be listed, or more than `limit` entries. Only the directories in `skip` (exact paths, lexical or
-    resolved) are not descended into; links are not followed. The stdlib `secrets` module is exempt in
+    resolved) are not descended into, and a `root` that is itself a skip path is not walked (its own name is still
+    matched); links are not followed. The stdlib `secrets` module is exempt in
     `interpreter_trees` only."""
     root = str(root)
     skipped = set().union(*(_variants(d) for d in skip)) if skip else set()

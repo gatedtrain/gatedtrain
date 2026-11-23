@@ -219,6 +219,7 @@ class PackScorerTest(unittest.TestCase):
         trust_stages._reset_scenario_snapshot()
         message = self.refused("pack_iou")
         self.assertIn("ext evaluator row", message)
+        self.assertIn(repr(row_id), message)
         with self.assertRaises(Refused) as cm:
             resolve("pack_iou")
         self.assertIn("its own id", cm.exception.problems[0].fix)

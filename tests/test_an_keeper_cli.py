@@ -252,7 +252,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
                 self.assertIn("the answer was not `yes`", err)
                 self.assertNotIn("no answer was read", err)
             else:                                                      # nothing to read: name the flag that works
-                self.assertIn("no answer was read: stdin is closed or not a terminal", err)
+                self.assertIn("no answer was read: stdin ended before an answer", err)
                 self.assertIn("rerun with --yes to confirm it", err)
                 self.assertNotIn("the answer was not `yes`", err)
         code, doc = run(argv, stdin="yes\n")                          # --json never prompts (AN-1): refused
