@@ -21,6 +21,8 @@ AI-native step 3a, a preview on Linux (see "Rootless containers, the local backe
   list | logs | cancel` show and stop them.
 - The keeper's container: `keeper serve --inference-image ...` runs a scenario pack's batch generator in a container
   of the keeper's own rootless daemon, on a copy of the model files the keeper hashed.
+- `ext-launch` on a rootless host (`rootless = true` in the host file): the launch rules accept the owner's rootless
+  daemon and print `--device nvidia.com/gpu=all` in place of `--runtime=nvidia --gpus all` (EXT-263).
 
 Behaviour that changes for 0.4.0 users:
 
