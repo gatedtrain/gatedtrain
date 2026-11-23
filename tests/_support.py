@@ -35,7 +35,7 @@ VENV_PYTHON = Path(sys.executable)
 # file with a neutral layout, since gatedtrain itself has no built-in host path. Set for in-process code and for the CLI
 # subprocesses.
 HOST_CONFIG = FIXTURES / "host.toml"
-if os.environ.get("GATEDTRAIN_HOST_CONFIG") in (None, os.devnull):   # gatedtrain.testing sets the empty one
+if os.environ.get("GATEDTRAIN_HOST_CONFIG") in (None, os.devnull):   # gatedtrain.testing.support sets the empty one
     os.environ["GATEDTRAIN_HOST_CONFIG"] = str(HOST_CONFIG)
 HOST_WORK = "/srv/gatedtrain/tierb"          # = HOST_CONFIG host_work
 HOST_ENV = {"GATEDTRAIN_HOST_CONFIG": str(HOST_CONFIG)}     # for a test that passes host_config its own environment
