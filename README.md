@@ -13,26 +13,32 @@ promoting a model.
 
 ## How it works
 
-You fix the test before training, train, then score the old and the new model on test data the trainer never saw,
-and a gate gives one of four results, which go into a report and a ledger of what was used.
+You fix the test before training. You train while a ledger records which data was read, then score the old and the
+new model on held-out test data, and a gate gives one of four results in a report.
 
 ```mermaid
 flowchart LR
     data["Your data"] --> train_part["Training data"]
     data --> sealed["Sealed test set (held back)"]
     reg["Criterion registered before training"] --> gate
-    train_part --> cand["Train a candidate"]
+    base["Base model"] --> cand["Train a candidate"]
+    train_part --> cand
+    cand --> ledger["Consumption ledger (what training read)"]
     cand --> eval["Score base and candidate on the sealed set"]
+    base --> eval
     sealed --> eval
     eval --> gate{"Gate"}
     gate --> result["PASS / FAIL / INCONCLUSIVE / MISSING"]
-    result --> out["Report and consumption ledger"]
+    result --> report["Gate report"]
 ```
 
 - The **registration** fixes the criterion before training: the metric, the margin to beat and how sure the test
-  must be. A run refuses if the file changed after it was pinned.
-- The **sealed test set** is the evaluation data, kept apart from the training data.
-- The **gate** compares the two models item by item. Only PASS means "better by the registered rule".
+  must be. The spec records the registration file's SHA-256 hash; `validate` and `run` refuse if the file no longer
+  matches.
+- The **sealed test set** is the evaluation data, kept apart from the training data. How strictly this is enforced
+  depends on how you use gatedtrain; see
+  [Concepts](https://github.com/gatedtrain/gatedtrain/blob/main/docs/concepts.md#sealed-test-set).
+- The **gate** compares the two models item by item. Only PASS means the candidate met the registered rule.
 - The **consumption ledger** records which training data each run read, so the `impact` command can trace data to
   checkpoints.
 

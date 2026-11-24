@@ -37,16 +37,16 @@ bound to a keeper, the keeper stores the registration and signs it (see
 The sealed test set is the evaluation data: the items both models are scored on. It is kept apart from training, so
 that a good score cannot come from having seen the answers.
 
-The picture shows what each side can see: training uses the training data and the base model; only the evaluation
-reads the sealed items and their labels.
+The picture shows what each side is meant to see: training uses the training data and the base model; only the
+evaluation reads the sealed items and their labels (by design; how strictly this is enforced is below).
 
 ```mermaid
 flowchart LR
-    subgraph train_side["What training can see"]
+    subgraph train_side["Meant for training"]
         tdata["Training data"]
         base["Base model"]
     end
-    subgraph eval_side["What only the evaluation sees"]
+    subgraph eval_side["Meant only for the evaluation"]
         sealed["Sealed items and labels"]
     end
     tdata --> cand["Candidate checkpoint"]
@@ -62,8 +62,10 @@ How strongly the separation is enforced depends on how you use gatedtrain:
 - **CPU demo.** The evaluation prompts are in their own directory (`demo/data/heldout`), and the spec declares them
   disjoint from the training data. The demo does not check this: the report says `disjoint_from: not-assessed
   (skeleton)`.
-- **External runs.** `ext-collect` refuses when an evaluation item's text exactly equals a training row's, unless the
-  registration allows the overlap (`contamination: {allow_exact_overlap: true}`).
+- **External runs.** `ext-collect` refuses when an evaluation item's text exactly equals a training row's (or, for
+  adapters that log their training episodes, a logged training episode's), unless the registration allows the
+  overlap (`contamination: {allow_exact_overlap: true}`). Some adapters add their own overlap rules, which refuse
+  whatever the registration allows.
 - **AI-native projects.** gatedtrain makes the split itself. The first stage, `intake_seal`, removes duplicate inputs,
   seals a part of the data for evaluation and passes on only the training part, the sealed part's hash and size, and
   a few summary numbers. Without a keeper the sealed items still sit in plain files that your own account can read;
@@ -132,9 +134,9 @@ flowchart LR
 
 Each answer states its precision: `row` when the exact rows each step read are known, `iteration` when only the
 shards each step read are known (the CPU demo), or `stage` when only the fact that the training stage used the
-dataset is known (then every checkpoint of the stage is returned). Only a `row` answer says "consumed"; the others say "possibly consumed". `--runs-root` searches
-every run under a directory. More in the [CPU quickstart](quickstart.md#2-first-run) and
-[Commands](commands.md).
+dataset is known (then every checkpoint of the stage is returned). Only a `row` answer says "consumed"; the others
+say "possibly consumed". `--runs-root` searches every run under a directory. More in the
+[CPU quickstart](quickstart.md#2-first-run) and [Commands](commands.md).
 
 ## Other terms
 
