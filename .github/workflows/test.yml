@@ -1,5 +1,5 @@
 # Run the test suite on every push and pull request, on CPU, with the design set checked out for the tests that
-# read it. Tests that need NeMo RL or NeMo Evaluator clones or a GPU host's records skip (README "Tests").
+# read it. Tests that need NeMo RL or NeMo Evaluator clones or a GPU host's records skip (docs/development.md "Tests").
 name: test
 
 on:
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      # The design revision this version implements (README "Design references"), outside the checkout.
+      # The design revision this version implements (docs/development.md "Design references"), outside the checkout.
       - run: git clone --quiet --depth 1 --branch rev-19 https://github.com/gatedtrain/gatedtrain-design "$RUNNER_TEMP/gatedtrain-design"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:

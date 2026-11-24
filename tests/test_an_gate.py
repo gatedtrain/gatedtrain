@@ -625,9 +625,9 @@ class ReportTest(GateBase):
             self.assertIn(f"- {x['text']}\n", section)
 
     def test_the_readme_quotes_the_guarantee_exactly(self) -> None:
-        readme = " ".join((Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8").split())
-        self.assertTrue(f'"{UNSEALED_GUARANTEE}"' in readme, "README.md must quote sealed_guarantee exactly")
-        self.assertTrue("alpha is per project" in readme, "README.md must say the alpha is per project")
+        readme = " ".join((Path(__file__).resolve().parents[1] / "docs" / "ai-native.md").read_text(encoding="utf-8").split())
+        self.assertTrue(f'"{UNSEALED_GUARANTEE}"' in readme, "docs/ai-native.md must quote sealed_guarantee exactly")
+        self.assertTrue("alpha is per project" in readme, "docs/ai-native.md must say the alpha is per project")
 
     def test_every_number_in_report_md_is_in_report_json(self) -> None:
         proj = self.make()

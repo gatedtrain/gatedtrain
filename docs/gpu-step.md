@@ -7,7 +7,7 @@ not published either: an operator writes their own to the interface below. Every
 or prints (`src/gatedtrain/ext/launch.py`, `src/gatedtrain/ext/collect.py`); the rules are MULTIMODAL-SPEC MM-31 and
 MM-36 and `tests/README.md` EXT-24, EXT-28, EXT-46, EXT-53, EXT-57, EXT-64, EXT-67, EXT-82 and EXT-105.
 
-`host_work` is the directory named by the host file (`host_work`, or `GATEDTRAIN_EXT_HOST_WORK`; see `README.md`,
+`host_work` is the directory named by the host file (`host_work`, or `GATEDTRAIN_EXT_HOST_WORK`; see `docs/configuration.md`,
 "Configuration"). It holds:
 
 | Path | Written by | Read by gatedtrain |

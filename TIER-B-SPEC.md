@@ -1,6 +1,6 @@
 # Tier B helpers for the RTX 4090 run: specification
 
-- See the [design references](README.md#design-references) for the rule and decision IDs used here.
+- See the [design references](docs/development.md#design-references) for the rule and decision IDs used here.
 - **Inputs:**
   - a research draft (since folded into `docs/tier-b-runbook.md`), with facts verified at NeMo RL `4f39fd8` and NeMo Evaluator `ea35ba3`;
   - the interim rules G-7 (`tests/README.md` section 9) and G-14 to G-17 (maintainers' working material, not published);
