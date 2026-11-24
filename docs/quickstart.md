@@ -6,7 +6,7 @@ file formats the ledger and pairing code read from NeMo RL (`4f39fd8`) and NeMo 
 
 ## 1. Install
 
-Use the pip setup in the [repository README](../README.md#install-and-run-the-demo), including the `tier-a` extra.
+Use the pip setup in the [repository README](../README.md#try-it), including the `tier-a` extra.
 On macOS you can also use the locked environment. From the repository root, run the following command with
 [`uv`](https://docs.astral.sh/uv/). It downloads a managed CPython 3.13 if needed.
 

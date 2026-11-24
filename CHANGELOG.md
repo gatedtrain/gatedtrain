@@ -1,12 +1,16 @@
 # Changelog
 
+Release notes, newest first. Each release lists what is new and what changes for users of the earlier release. The
+"Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
+each rule to its tests.
+
 ## Changes in 0.5.0
 
 The analysis code version stays `gatedtrain 0.3.0` (the gate statistics and registration semantics did not change),
 so registrations made with 0.3.0 or 0.4.0 stay valid.
 
-AI-native step 3a, a preview on Linux (see "Rootless containers, the local backend and the keeper's container (step
-3a)" below):
+AI-native step 3a, a preview on Linux (see [Rootless containers, the local backend and the keeper's container (step
+3a)](docs/ai-native.md#rootless-containers-the-local-backend-and-the-keepers-container-step-3a)):
 
 - Rootless host setup: `gatedtrain setup host` prints one root script that sets up a rootless Docker daemon for the
   owner and one for the keeper user and removes the owner from the rootful `docker` group. gatedtrain never runs it.
@@ -16,7 +20,7 @@ AI-native step 3a, a preview on Linux (see "Rootless containers, the local backe
 - The keeper's container: `keeper serve --inference-image ...` runs a scenario pack's batch generator in a container
   of the keeper's own rootless daemon, on a copy of the model files the keeper hashed.
 - `ext-launch` on a rootless host (`rootless = true` in the host file): the launch rules accept the owner's rootless
-  daemon and print `--device nvidia.com/gpu=all` in place of `--runtime=nvidia --gpus all` (EXT-263).
+  daemon and print `--device nvidia.com/gpu=all` in place of `--runtime=nvidia --gpus all`.
 
 Behaviour that changes for 0.4.0 users:
 
@@ -27,7 +31,7 @@ Behaviour that changes for 0.4.0 users:
   separate-user guarantee.
 - Upgrade the keeper's environment (the venv `setup keeper` installed) together with the driver: the driver now sends
   the project with `hello`, and a 0.4.0 keeper states no rootful-access check.
-- A scenario pack scorer whose id is also an ext evaluator row id is refused (AN-17); before, the row shadowed the
+- A scenario pack scorer whose id is also an ext evaluator row id is refused; before, the row shadowed the
   scorer at registration and `preregister` refused with an unclear message. Give the scorer its own id.
 
 Fixes:
@@ -39,6 +43,8 @@ Fixes:
 - Importing a scenario pack or ext adapter plugin that uses `gatedtrain.testing` no longer makes CLI processes ignore
   the host file (`~/.config/gatedtrain/host.toml`); only the test helpers (`gatedtrain.testing.support`, `.ext`)
   default an unset `GATEDTRAIN_HOST_CONFIG` to an empty host file.
+
+Rules: EXT-263, AN-17.
 
 ## Changes in 0.4.0
 
@@ -58,16 +64,16 @@ New required dependency: `cryptography>=50.0.2` (Ed25519 signatures of the AI-na
 
 New in this release:
 
-- Resumable external runs (EXT-RES-1 to EXT-RES-7): `ext-collect` reads a resumed run as a chain of attempts with
+- Resumable external runs: `ext-collect` reads a resumed run as a chain of attempts with
   their cuts, keeps the records after a non-final attempt's last committed cut in the ledger as `orphaned` (consumption
   ledger schema 1.1; a 1.0 ledger reads as kept rows), and `impact --json` adds an `orphaned` section for resumed runs.
 - AI-native projects, a preview: step 1, `gatedtrain project` (in process, CPU only), and step 2, the keeper daemon
   that holds the sealed items, registrations and alpha ledger and signs its records (`keeper`, `setup keeper`,
-  `verify`, Linux only). See "AI-native projects (preview)" below. AI-native code is new in 0.4.0; a registration
-  made with the library scorers of `gatedtrain.ainative.scorers` on unreleased main before 0.4.0 pins an older
-  evaluator hash, which no longer matches the scorer: register it again (a new `preregister`).
+  `verify`, Linux only). See [AI-native projects (preview)](docs/ai-native.md). AI-native code is new in 0.4.0; a
+  registration made with the library scorers of `gatedtrain.ainative.scorers` on unreleased main before 0.4.0 pins
+  an older evaluator hash, which no longer matches the scorer: register it again (a new `preregister`).
 
-Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs/findings.md,
+Breaking for arm writers and for `ext-collect` ([MULTIMODAL-SPEC](MULTIMODAL-SPEC.md); [findings](docs/findings.md),
 "Review of the 3.12 path fix" and "Review of PR 2"):
 
 - A symbolic link anywhere in an `output_ref` path, or as an arm's `items.jsonl`, `eval_meta.json` or `merge.json`,
@@ -84,5 +90,6 @@ Breaking for arm writers and for `ext-collect` (MULTIMODAL-SPEC MM-1, MM-5; docs
 - Tests run as any non-root user (the launch fixtures run the container as the running user and its primary group).
   With `GATEDTRAIN_REQUIRE_CONTAINER_USER=1`, as in CI, the tests that need such a user fail instead of skipping.
 
+Rules: EXT-RES-1 to EXT-RES-7 (resumable runs), MM-1 and MM-5 (arm writers).
 
 Earlier releases are listed by their git tags.
