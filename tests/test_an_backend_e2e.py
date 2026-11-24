@@ -416,7 +416,7 @@ class ExtLaunchStandinTest(_E2EBase):
 
 
 class DocsTest(unittest.TestCase):
-    """README.md quotes the step 3a texts the code states, and the scenario pack contract of `gatedtrain.ainative.batch`;
+    """docs/ai-native.md quotes the step 3a texts the code states, and the scenario pack contract of `gatedtrain.ainative.batch`;
     docs/gpu-step.md describes the backend's own GPU log rows."""
 
     def test_readme_and_gpu_step(self) -> None:
@@ -424,7 +424,7 @@ class DocsTest(unittest.TestCase):
         from gatedtrain.ainative.keeper import texts
 
         repo = Path(__file__).resolve().parents[1]
-        readme = " ".join((repo / "README.md").read_text(encoding="utf-8").split())
+        readme = " ".join((repo / "docs" / "ai-native.md").read_text(encoding="utf-8").split())
         for text in (texts.KEEPER_GUARANTEE, texts.KEEPER_ROOT_DOCKER_GUARANTEE, texts.COMPUTE_BACKEND_SOURCE):
             self.assertIn(f'"{text}"', readme)
         for value in ('json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)',

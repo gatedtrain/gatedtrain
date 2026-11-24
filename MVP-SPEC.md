@@ -1,6 +1,6 @@
 # Walking-skeleton prototype: specification
 
-- See the [design references](README.md#design-references) for the rule and decision IDs used here.
+- See the [design references](docs/development.md#design-references) for the rule and decision IDs used here.
 - **Decision:** maintainers' decision of 2026-11-09 to build a walking-skeleton prototype.
 - **Shape source:** verification-plan E2E-SKEL, L2-E-skel-compat and UX-03.
 - **Design sources:**

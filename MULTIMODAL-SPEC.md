@@ -1,6 +1,6 @@
 # Multi-framework, multi-modality prototype: specification
 
-- See the [design references](README.md#design-references) for rule IDs and the [recipe path mapping](README.md#unpublished-references).
+- See the [design references](docs/development.md#design-references) for rule IDs and the [recipe path mapping](docs/development.md#unpublished-references).
 - **Scope (maintainers' decision, 2026-11-11):** 8 areas, 9 runs, one GPU (an RTX 4090, 24 GB). GPU hours are logged in `<HOST_WORK>/gpu-log.md` and every full run is preceded by a smoke; the launcher passes `GATEDTRAIN_GPU_CAP_H=1000` to the operator's `gpu-step.sh` wrapper as a budget ceiling high enough not to limit runs. The runs are a controlled prototype under design R10-11.
 - **Design sources (revision 10):**
   - 05 §3.1, §3.3-§3.8 (gates), §6.1 (independence, scorer validity), §11-§12 (lineage, precision, `ConsumptionRecord`), §14 (seeds);

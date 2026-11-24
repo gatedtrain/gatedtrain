@@ -312,7 +312,7 @@ class KeeperEndToEndTest(unittest.TestCase):
 
 class ReadmeTest(unittest.TestCase):
     def test_the_readme_quotes_the_keeper_texts_exactly(self):
-        readme = " ".join((Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8").split())
+        readme = " ".join((Path(__file__).resolve().parents[1] / "docs" / "ai-native.md").read_text(encoding="utf-8").split())
         for text in (texts.KEEPER_GUARANTEE, texts.KEEPER_SAME_USER_GUARANTEE, ai.GUARANTEE):
             self.assertIn(f'"{text}"', readme)
         for value in ("W0 = 0.05 * (1 - 0.05) = 0.0475", "alpha_j = W_{j-1} / 2", "alpha_j / (1 - alpha_j)",

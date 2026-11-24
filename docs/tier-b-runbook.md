@@ -18,7 +18,7 @@
   - `<repo>`: a checkout of this repository on the host.
   - **Estimate** marks a number that nothing measured.
   - **Unverified** marks a fact the pinned sources could not confirm; check it on the host.
-  - Development rule and decision IDs are described in the [design references](../README.md#design-references).
+  - Development rule and decision IDs are described in the [design references](development.md#design-references).
 - **Rule for every step:** run each command on its own, read its output, and stop at the first stop condition. Record what you saw; do not work around it.
 
 ## 1. GPU-hour budget and GPU-time log
