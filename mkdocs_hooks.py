@@ -8,6 +8,7 @@ to any other file of the repository becomes a link to that file on GitHub.
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import re
 from pathlib import Path
@@ -16,6 +17,10 @@ from mkdocs.structure.files import File
 
 ROOT = Path(__file__).resolve().parent
 BLOB = "https://github.com/gatedtrain/gatedtrain/blob/main/"
+TREE = "https://github.com/gatedtrain/gatedtrain/tree/main/"
+
+# A warning fails `mkdocs build --strict`.
+log = logging.getLogger("mkdocs.hooks.gatedtrain")
 
 # Repository files that become site pages, by their path in the repository and their path in the site's docs.
 GENERATED = {"README.md": "index.md", "CHANGELOG.md": "changelog.md"}
@@ -60,6 +65,10 @@ def rewrite(target: str, page_src: str) -> str:
         return target
     docs_path = _docs_path(path)
     if docs_path is None:
+        if (ROOT / path).is_dir():
+            return TREE + rest
+        if not (ROOT / path).is_file():
+            log.warning("%s: link to %r, which is not a file of the repository", page_src, target)
         return BLOB + rest
     rel = posixpath.relpath(docs_path, posixpath.dirname(page_src) or ".")
     return rel + sep + anchor
