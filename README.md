@@ -77,6 +77,8 @@ report and shows control runs that FAIL or come out INCONCLUSIVE on purpose.
 
 ## Learn more
 
+The guides below are also published as a website: <https://gatedtrain.github.io/gatedtrain/>.
+
 - [Concepts](https://github.com/gatedtrain/gatedtrain/blob/main/docs/concepts.md): registration, sealed test set,
   gate results, alpha spending, the consumption ledger and `impact`
 - [Commands](https://github.com/gatedtrain/gatedtrain/blob/main/docs/commands.md): every subcommand

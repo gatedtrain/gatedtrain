@@ -27,6 +27,18 @@ variable, when it is unset:
 `GATEDTRAIN_SKIP_SLOW=1` skips the slow end-to-end runs. The suite uses a synthetic adapter. See the
 [test reference](../tests/README.md) for coverage and fixture details.
 
+## Documentation site
+
+The pages under `docs/`, with `README.md` as the home page and `CHANGELOG.md`, are also published as a website by
+MkDocs (`mkdocs.yml`; `mkdocs_hooks.py` adds the two root files and rewrites links written for GitHub). Every pull
+request builds it with `mkdocs build --strict`, so a broken link fails the check; main publishes it to GitHub Pages.
+To preview it locally:
+
+```sh
+python -m pip install -r requirements-docs.txt
+mkdocs serve
+```
+
 ## Design references
 
 This version implements revision 19 of [gatedtrain-design](https://github.com/gatedtrain/gatedtrain-design).
