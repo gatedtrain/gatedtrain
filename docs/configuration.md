@@ -16,6 +16,19 @@ output_root = "/srv/gatedtrain/out"       # launches write strictly under this d
 
 `GATEDTRAIN_EXT_HOST_WORK`, `GATEDTRAIN_EXT_OUTPUT_ROOT` and `GATEDTRAIN_EXT_INPUT_ROOTS` override it.
 
+**Rootless hosts.** A host whose containers run on the owner's rootless Docker daemon (the context `gatedtrain` pointing
+at `unix:///run/user/<owner uid>/docker.sock`) says so in the host file. The launch rules then require the container
+user `0:0` (the owner on the host), an output directory owned by the owner, and an owner whose primary group owns no
+rootful Docker socket, and print `--device nvidia.com/gpu=all` in place of `--runtime=nvidia --gpus all`. The value is a
+TOML boolean, set in the file only (no environment override); `true` enters `host_config_sha256` and the launch record
+(`"rootless": true`), and a record written under the other setting is refused:
+
+```toml
+rootless = true
+```
+
+Rules: EXT-263 (rootless hosts; see the [test reference](../tests/README.md)).
+
 ## Fixed defaults
 
 Fixed defaults in `gatedtrain.ext.launch` that a host may need to know about:
@@ -36,19 +49,6 @@ Fixed defaults in `gatedtrain.ext.launch` that a host may need to know about:
   ```
 - `GPU_CAP_H = 1000`: the GPU-hour budget ceiling passed to `gpu-step.sh` (`GATEDTRAIN_GPU_CAP_H`), high enough not to
   limit runs; hours are still logged in `gpu-log.md` and every full run is preceded by a smoke.
-- A host whose containers run on the owner's rootless Docker daemon (the context `gatedtrain` pointing at
-  `unix:///run/user/<owner uid>/docker.sock`) says so in the host file. The launch rules then require the container
-  user `0:0` (the owner on the host), an output directory owned by the owner, and an owner whose primary group owns no
-  rootful Docker socket, and print `--device nvidia.com/gpu=all` in place of `--runtime=nvidia --gpus all`.
-  The value is a TOML boolean, set in the file only (no environment override); `true` enters `host_config_sha256` and
-  the launch record (`"rootless": true`), and a record written under the other setting is refused:
-
-  ```toml
-  rootless = true
-  ```
-
-Rules: EXT-263 (rootless hosts; see the [test reference](../tests/README.md)).
-
 ## The GPU wrapper script
 
 `bin/gpu-step.sh` is not part of gatedtrain, and the reference host's script is not published: an operator writes
