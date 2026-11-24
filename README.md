@@ -46,8 +46,6 @@ Each idea is explained in [Concepts](https://github.com/gatedtrain/gatedtrain/bl
 
 ## Try it
 
-<a id="install-and-run-the-demo"></a>
-
 The demo trains a very small model on two-digit addition, on a CPU. From a checkout with Python 3.12 or 3.13:
 
 ```sh

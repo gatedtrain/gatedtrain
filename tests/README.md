@@ -1,14 +1,14 @@
 # Tests and public interface
 
 The tests pin the CLI, report and file formats described below. See the repository README for
-[unpublished references and recipe paths](../README.md#unpublished-references).
+[unpublished references and recipe paths](../docs/development.md#unpublished-references).
 
 - **Short forms:** `04` is `04-workflow-and-composition.md`, `05` is `05-evaluation-and-lineage.md`, and `VP` is `verification-plan.md`. Line numbers are those of the design revision the test was written against (revision 9 or later) and may have shifted since; sections and rule ids are the stable references.
 - **Pinned clones:** NeMo RL `4f39fd8`, NeMo Evaluator `ea35ba3`. Every line cited from them was re-checked.
 
 ## 1. Environment and how to run
 
-- **Environment:** `.venv` at the repository root. Use the pip setup in the [repository README](../README.md#install-and-run-the-demo) or, on macOS, `uv sync --python 3.13 --python-preference only-managed --locked --extra tier-a`.
+- **Environment:** `.venv` at the repository root. Use the pip setup in the [repository README](../README.md#try-it) or, on macOS, `uv sync --python 3.13 --python-preference only-managed --locked --extra tier-a`.
   - Python 3.13.13.
   - Pinned in `uv.lock`: numpy 2.5.4, scipy 1.18.1, pyarrow 26.0.1, duckdb 2.0.0, pyyaml 6.0.3, torch 2.15.0.
   - torch is the macOS arm64 PyPI wheel, a CPU build: `torch.version.cuda` is None.
