@@ -13,7 +13,7 @@ the interpreter that runs the suite):
 ```
 
 The full suite takes about 13 minutes on a CPU; `.github/workflows/test.yml` runs it on Python 3.12 and 3.13 for
-every push and pull request, with the design set at `rev-19`. Some tests read external sources and skip, naming the
+every push and pull request, with the design set at `rev-25`. Some tests read external sources and skip, naming the
 variable, when it is unset:
 
 | Variable | Contents |
@@ -41,7 +41,8 @@ mkdocs serve
 
 ## Design references
 
-This version implements revision 19 of [gatedtrain-design](https://github.com/gatedtrain/gatedtrain-design).
+This version implements revision 25 of [gatedtrain-design](https://github.com/gatedtrain/gatedtrain-design), except
+the training-seed unit of revision 20 (05 §3.3).
 The local specifications cover the [CPU demo](../MVP-SPEC.md), [Tier B helpers](../TIER-B-SPEC.md) and
 [external adapters](../MULTIMODAL-SPEC.md). The [findings log](findings.md) records design questions and
 regression fixes.
