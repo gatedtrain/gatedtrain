@@ -92,4 +92,4 @@ Breaking for arm writers and for `ext-collect` ([MULTIMODAL-SPEC](MULTIMODAL-SPE
 
 Rules: EXT-RES-1 to EXT-RES-7 (resumable runs), MM-1 and MM-5 (arm writers).
 
-Earlier releases are listed by their git tags.
+Earlier releases are listed by their [git tags](https://github.com/gatedtrain/gatedtrain/tags).

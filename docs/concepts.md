@@ -1,7 +1,8 @@
 # Concepts
 
 This page explains the main ideas of gatedtrain in plain words. Each section is short; the linked pages hold the
-details. gatedtrain is a prototype, and every output carries the tags `prototype` and `unpromotable`.
+details. gatedtrain is a prototype. Reports and records of the demo and of external runs carry the tags `prototype` and
+`unpromotable`, which mark them as not fit for promoting a model; AI-native projects are a preview.
 
 A few words used throughout:
 
@@ -115,8 +116,8 @@ checkpoints each run saved and the last step each one includes. `run`, `tierb-co
 into the run directory.
 
 `gatedtrain impact <shard>` uses them to answer one question: which checkpoints may have used this shard? It finds
-the first step that read the shard and returns every checkpoint of that training stage saved at or after that step.
-A checkpoint saved before the shard was first read is not returned, and neither is the base model.
+the first step that read the shard and returns every checkpoint of that training stage saved at or after that step,
+and every checkpoint later trained from one of those. A checkpoint saved before the shard was first read is not returned, and neither is the base model.
 
 In the picture, shard 3 was first read at step 120 of run A and at step 10 of run B, so `impact` returns A's
 step-200 checkpoint and B's step-50 checkpoint, but not A's step-100 checkpoint.
