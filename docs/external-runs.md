@@ -8,16 +8,16 @@ recipe repositories that ship ready-made adapters.
 ## How an external run flows
 
 The picture shows the flow: `ext-launch` checks your run request and prints the command; you run your trainer and
-your evaluator; the evaluation results of the base and the candidate become one arm directory each; `ext-collect`
-reads the run's outputs through the adapter, compares the two arms and writes the consumption ledger, the checkpoint
-lineage and the gate report.
+your evaluator; the evaluation results of the base and the candidate become one arm directory each (per clause);
+`ext-collect` reads the run's outputs through the adapter, compares the two arms and writes the consumption ledger,
+the checkpoint lineage and the gate report.
 
 ```mermaid
 flowchart TB
     trainer["Your trainer (you run it; ext-launch checks the request first)"]
     trainer --> out["Run outputs: checkpoints, consumption logs"]
     out --> evaluator["Your evaluator: scores the base and the candidate"]
-    evaluator --> arms["Arm files: per-item results, one directory per model"]
+    evaluator --> arms["Arm files: per-item results, one directory per model (per clause)"]
     arms --> collect["ext-collect"]
     out -->|"read through the adapter"| collect
     collect --> ledger["Consumption ledger and lineage"]
@@ -26,15 +26,15 @@ flowchart TB
 ```
 
 1. `ext-launch` checks the run request, writes the launch record and prints the command; you run it.
-2. Your evaluator scores the base and the candidate on the registered items. Its results become one arm directory
-   per model (`items.jsonl` and `eval_meta.json`); `ext-from-nel`, `ext-merge-eval` and `ext-arm-fill` build and
-   verify these.
+2. Your evaluator scores the base and the candidate on the registered items. Its results become one arm directory per
+   model (per clause) holding `items.jsonl` and `eval_meta.json`; `ext-from-nel`, `ext-merge-eval` and `ext-arm-fill`
+   build and verify these.
 3. `ext-collect` compares the two arms item by item and writes the run directory: gate report, consumption ledger
    and checkpoint lineage. `impact` then works on it.
 
 Every command and its flags: [Commands](commands.md) and section 7 of the
-[CPU quickstart](quickstart.md#7-external-runs-adapters-gpu-run-by-an-operator). How `ext-collect` checks that the
-evaluation items were not in the training data: [Concepts](concepts.md#sealed-test-set).
+[CPU quickstart](quickstart.md#7-external-runs-adapters-gpu-run-by-an-operator). How `ext-collect` checks the
+evaluation items against the training data (exact text matches): [Concepts](concepts.md#sealed-test-set).
 
 ## Adapter plugins
 

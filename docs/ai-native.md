@@ -6,16 +6,23 @@ OS user, the rootless containers that run the jobs, and scenario packs. It is a 
 below are stated exactly, and the quoted texts are the ones the reports print. New to the ideas? Read
 [Concepts](concepts.md) first.
 
+The preview grew in steps, and the page uses their names: step 1 runs every stage in your own process, step 2 adds
+the keeper, and step 3a adds rootless containers. These steps are not pipeline stages.
+
 ## How a project runs
 
 `gatedtrain project` runs one goal as a project directory: a fixed pipeline of five trust stages (`intake_seal`,
-`preregister`, `evaluate_sealed`, `gate`, `report`) around the stages a pipeline file plugs in. Step 1 is a preview
-for CPU-only work and the synthetic scenario pack in `gatedtrain.testing`, which is not registered as an entry point.
+`preregister`, `evaluate_sealed`, `gate`, `report`) around the stages a pipeline file plugs in. The trust stages are
+gatedtrain's own: they seal the data, register the criterion, score, gate and report, and their names are reserved,
+so a pack cannot replace them. Step 1 is a preview for CPU-only work and the synthetic scenario pack in
+`gatedtrain.testing`, which is not registered as an entry point.
 
-The picture shows the stages of the synthetic scenario pack's pipeline, in order. The five stages marked "trust" are
-gatedtrain's own; the others are the pack's stages, named in the pipeline file. The backend gives GPU jobs only to a
-stage that declares `needs: gpu` (here `train`; a cooperative rule, see [What is cooperative](#what-is-cooperative)),
-and with a keeper, a batch generator scores in the keeper's container, on a GPU when it asks for one.
+The synthetic scenario pack's pipeline runs in three phases: seal and register (`intake_seal`, `profile_data`,
+`choose_task_and_base`, `preregister`), train (`build_train_set`, `write_recipe`, `smoke`, `train`), then score and
+gate (`evaluate_sealed`, `gate`, `report`). The stages marked "trust" are gatedtrain's; the others are the pack's
+stages, named in the pipeline file. The backend gives GPU jobs only to a stage that declares `needs: gpu` (here
+`train`; a cooperative rule, see [What is cooperative](#what-is-cooperative)), and with a keeper, a batch generator
+scores in the keeper's container, on a GPU when it asks for one.
 
 ```mermaid
 flowchart LR
@@ -33,7 +40,7 @@ flowchart LR
     end
     subgraph judge["3. Score and gate"]
         direction TB
-        evals["evaluate_sealed (trust; may use a GPU in the keeper's container)"] --> gate["gate (trust)"]
+        evals["evaluate_sealed (trust; with a keeper, may use a GPU in its container)"] --> gate["gate (trust)"]
         gate --> report["report (trust)"]
     end
     prepare --> training
@@ -89,8 +96,9 @@ its own may connect.
 
 The picture shows the two OS accounts once the keeper and the rootless containers of step 3a are set up. Your (the
 owner's) account runs the driver and the training containers. The keeper's account holds the sealed items and
-labels, the registrations, the alpha ledger and the signing key, and runs the inference container. Model files and
-their hashes go in; signed records come out; the inference container gets the sealed inputs, never the labels. The
+labels, the registrations, the alpha ledger and the signing key, and runs the inference container for batch
+generators (a per-item generator runs the candidate inside the keeper process instead). Model files and their
+hashes go in; signed records come out; the inference container gets the sealed inputs, never the labels. The
 job records and the GPU budget on your side are cooperative (see [What is cooperative](#what-is-cooperative)), and
 the keeper still answers some questions with counts (see [Oracles](#oracles)).
 
@@ -104,7 +112,7 @@ flowchart LR
     subgraph keeperside["Keeper's OS account"]
         keeper["Keeper"]
         store["Sealed items and labels, registrations, alpha ledger, signing key"]
-        infer["Inference container on the keeper's rootless Docker, no network"]
+        infer["Inference container (batch generators) on the keeper's rootless Docker, no network"]
     end
     jobs -->|"model files"| handoff
     driver -->|"requests with model file paths and hashes"| keeper
@@ -115,7 +123,9 @@ flowchart LR
     keeper -->|"signed records"| driver
 ```
 
-The [Guarantee](#guarantee) below says exactly what this separation covers and what it does not.
+The [Guarantee](#guarantee) below says exactly what this separation covers and what it does not ("a root user, also
+one reached through sudo, or the keeper's own account can break all of it"); while your account has rootful Docker
+access, the keeper states a weaker text instead (see [Rootful access](#rootful-access)).
 
 ### Setting up and binding a project
 

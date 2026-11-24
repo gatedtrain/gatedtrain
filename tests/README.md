@@ -1,6 +1,6 @@
 # Tests and public interface
 
-The tests pin the CLI, report and file formats described below. See the repository README for
+The tests pin the CLI, report and file formats described below. See the development notes for
 [unpublished references and recipe paths](../docs/development.md#unpublished-references).
 
 - **Short forms:** `04` is `04-workflow-and-composition.md`, `05` is `05-evaluation-and-lineage.md`, and `VP` is `verification-plan.md`. Line numbers are those of the design revision the test was written against (revision 9 or later) and may have shifted since; sections and rule ids are the stable references.
