@@ -49,6 +49,7 @@ Fixed defaults in `gatedtrain.ext.launch` that a host may need to know about:
   ```
 - `GPU_CAP_H = 1000`: the GPU-hour budget ceiling passed to `gpu-step.sh` (`GATEDTRAIN_GPU_CAP_H`), high enough not to
   limit runs; hours are still logged in `gpu-log.md` and every full run is preceded by a smoke.
+
 ## The GPU wrapper script
 
 `bin/gpu-step.sh` is not part of gatedtrain, and the reference host's script is not published: an operator writes

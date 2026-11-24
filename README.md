@@ -1,6 +1,6 @@
 # gatedtrain
 
-gatedtrain checks whether a newly trained model checkpoint is really better than the model it started from. It
+gatedtrain checks whether a newly trained model checkpoint is really better than (or, if you choose, no worse than) the model it started from. It
 calls the new checkpoint better only when it beats a criterion you registered before training, on held-out test
 data the trainer never saw. It also records what went into each training run, so that you can later ask which
 checkpoints may have used a given piece of training data, for example after finding a problem in it.
@@ -8,8 +8,8 @@ checkpoints may have used a given piece of training data, for example after find
 It is for people who fine-tune models and want a decision they can defend, made by rules that were fixed before
 the results came in. It works with external trainers and evaluators.
 
-This is a prototype. Every output carries the tags `prototype` and `unpromotable`, which mark it as not fit for
-promoting a model.
+This is a prototype. Reports and records of the demo and of external runs carry the tags `prototype` and
+`unpromotable`, which mark them as not fit for promoting a model. AI-native projects are a preview.
 
 ## How it works
 

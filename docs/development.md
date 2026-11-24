@@ -1,5 +1,8 @@
 # Development
 
+This page is for people who change gatedtrain or run its tests. It shows how to run the tests, lists the design
+references the code and tests cite, and says where the unpublished references and recipe paths stand.
+
 ## Tests
 
 From the repository root, with the package and its `tier-a` extra installed in `.venv` (the tests run the CLI with

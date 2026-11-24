@@ -1,6 +1,6 @@
 # Development findings
 
-This log records design questions, run findings and the fixes that followed. See the repository README for
+This log records design questions, run findings and the fixes that followed. See the development notes for
 [unpublished references and recipe paths](development.md#unpublished-references).
 
 - **Interim rules:** G-1 to G-20 (G-3 revised on 2026-11-09) and the maintainers' decisions D-1 to D-5 are applied as written. F-1, F-2, F-3, F-6 and F-13 are resolved by those rules; F-5 stays open.

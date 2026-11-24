@@ -21,7 +21,8 @@ The synthetic scenario pack's pipeline runs in three phases: seal and register (
 `choose_task_and_base`, `preregister`), train (`build_train_set`, `write_recipe`, `smoke`, `train`), then score and
 gate (`evaluate_sealed`, `gate`, `report`). The stages marked "trust" are gatedtrain's; the others are the pack's
 stages, named in the pipeline file. The backend gives GPU jobs only to a stage that declares `needs: gpu` (here
-`train`; a cooperative rule, see [What is cooperative](#what-is-cooperative)), and with a keeper, a batch generator
+`train`, which the example pack declares as needing a GPU but runs on the CPU; a cooperative rule, see
+[What is cooperative](#what-is-cooperative)), and with a keeper, a batch generator
 scores in the keeper's container, on a GPU when it asks for one.
 
 ```mermaid
@@ -125,7 +126,7 @@ flowchart LR
 
 The [Guarantee](#guarantee) below says exactly what this separation covers and what it does not ("a root user, also
 one reached through sudo, or the keeper's own account can break all of it"); while your account has rootful Docker
-access, the keeper states a weaker text instead (see [Rootful access](#rootful-access)).
+access, or for good on a sealed set that was in use when such access was found, the keeper states a weaker text instead (see [Rootful access](#rootful-access)).
 
 ### Setting up and binding a project
 
