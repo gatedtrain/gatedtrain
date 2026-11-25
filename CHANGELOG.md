@@ -4,16 +4,45 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
-## Unreleased
+## Changes in 0.6.0
 
-Registered greedy decoding for the AI-native path (design revision 26, AN-26):
+The analysis code version stays `gatedtrain 0.3.0`: `gates.py` did not change, and the one change in `registration.py`
+is an opt-in mode that is refused unless a path asks for it, so registrations made with 0.3.0 to 0.5.0 stay valid.
 
-- A deployment record may register `sampler.decoding: greedy` with temperature 0, one evaluation seed and one sample
-  per item. It is refused everywhere else, and `temperature: 0` alone is still refused. See [Greedy
-  decoding](docs/ai-native.md#greedy-decoding).
-- `evaluate_sealed` (the keeper and the in-process path) generates every greedy item once more under a control seed
-  that the registration does not name and refuses an arm whose predictions differ.
-- No change to the gate statistics, the power plan or alpha-investing; `ANALYSIS_VERSION` stays `gatedtrain 0.3.0`.
+Registered greedy decoding for the AI-native path (design revision 26, rules REG-GREEDY and AN-26; see [Greedy
+decoding](docs/ai-native.md#greedy-decoding)):
+
+- Greedy is an **explicit opt-in registration mode**: `sampler.decoding: greedy` with `temperature: 0`, a `top_p` that
+  is absent or 1, one evaluation seed and one sample per item. `temperature: 0` alone is still refused, and so is
+  greedy decoding on every path that cannot check it (`ext-*`, Tier B, `check_contents` without `greedy_allowed`).
+  Violations are refused with `REG-GREEDY`.
+- **AN-26, the keeper's determinism check.** `evaluate_sealed` (the keeper and the in-process path) generates every
+  greedy item once more under a control seed that the registration does not name, drawn by the keeper per arm and
+  attempt, and refuses the attempt if the predictions differ. The check runs after the alpha grant: a refused attempt
+  settles as not passed and costs its alpha. The refusal states no count and no prediction. The keeper compares the
+  predictions itself and takes nothing about determinism from the container.
+- No change to the gate statistics, the power plan or alpha-investing: the item is the resampled unit, so one sample per
+  item is the K = 1 case of the same estimator. A greedy score is the greedy decoder's score; it is not comparable with
+  a score at temperature above 0.
+
+Known limits (read before registering greedy decoding):
+
+- **vLLM's default batching is not deterministic.** On a GPU run of the VLM pack (Qwen3.5-0.8B, 512-token chain of
+  thought, 399 items), 54 to 56 % of the items of the base model and 30 % of those of the trained model differed between
+  two greedy passes with the default batching; the same seed in two processes differed as much, so this is batch-
+  dependent numerics, not the seed. With `max_num_seqs=1` (one request at a time) the same runs gave 0 of 399 differing
+  items for both models. vLLM's batch-invariant mode does not support Qwen3.5 (`GDN_ATTN`). AN-26 therefore fails
+  closed: **a pack must pass a determinism probe (two passes, different seeds, on items outside the sealed set) before
+  it registers greedy decoding**, or its sealed evaluations will be refused after spending alpha.
+- **The text pack (`gatedtrain-pack-text-gsm8k`) has not been probed** and still needs `gatedtrain<0.6`; it does not
+  register greedy decoding.
+- The control pass runs in the same process as the registered pass, so differences between processes are not seen.
+  A sampler whose outputs all agree under two seeds on the sealed set passes the check.
+- **Reports and the owner's metric confirmation do not yet state the decoding mode.** It is in the signed registration,
+  whose hash the report names. Stating it needs a change of the keeper's report and confirmation texts.
+- A keeper older than 0.6.0 refuses a greedy registration (`REG-FIELD`, unknown sampler field `decoding`): upgrade the
+  keeper's environment together with the driver and the pack.
+- Packs that pin `gatedtrain>=0.5,<0.6` need a release that allows 0.6.
 
 Rules: REG-GREEDY, AN-26.
 

@@ -212,7 +212,7 @@ Each manifest document is canonical JSON with these keys:
 - `spec_sha256`, `registration_sha256`;
 - `config_hash`: `sha256:` of the trainer config file bytes;
 - `allow_list_checked: false`;
-- `backend: {trainer: {...}, evaluator: {...}}`, each with `{name: "cpu_stub", package: "gatedtrain", package_version: "0.5.0", torch_version}` (`package_version` is the package release that ran, `gatedtrain.__version__`);
+- `backend: {trainer: {...}, evaluator: {...}}`, each with `{name: "cpu_stub", package: "gatedtrain", package_version: "0.6.0", torch_version}` (`package_version` is the package release that ran, `gatedtrain.__version__`);
 - `artifacts`: `{<manifest name>: manifest_hash}` for every manifest except `gate_report`.
 
 Tier B records the container digest and the NeMo RL commit instead.
@@ -327,7 +327,7 @@ A checkpoint is returned exactly when `last_step_included >= first_step(shard)` 
 
 The modules below exist (`test_stubs_docs_tierb`):
 
-- `gatedtrain/{__init__ (__version__ = "0.5.0", ANALYSIS_VERSION = "0.3.0"), __main__, cli, spec, registration, canonical, gates, ledger, impact, report}.py`;
+- `gatedtrain/{__init__ (__version__ = "0.6.0", ANALYSIS_VERSION = "0.3.0"), __main__, cli, spec, registration, canonical, gates, ledger, impact, report}.py`;
 - `gatedtrain/stubs/` (task, model, trainer and evaluator stand-ins, each containing `skeleton-stub`);
 - `gatedtrain/backends/{nemo_rl, nemo_evaluator}.py`.
 
@@ -1917,11 +1917,11 @@ Run-side `utc` values in `attempts.jsonl` are written as `%Y-%m-%dT%H:%M:%SZ`; r
 
 ### 11.36 Analysis code version separate from the package version (0.4.0; design revision 24, 2026-11-22)
 
-Every registration records `analysis_code_version` and is refused (REG-FIELD) when it differs from the running code's `gatedtrain.ANALYSIS_CODE_VERSION` (05 section 3.7). Up to 0.3.0 that was `gatedtrain <__version__>`, so every package release would have invalidated every existing registration. From 0.4.0 it is `gatedtrain <ANALYSIS_VERSION>`, a separate constant that names the analysis code (gate statistics in `gates.py`, registration semantics in `registration.py`) and changes only when that code's behaviour changes. In 0.4.0 `__version__` is 0.4.0 and `ANALYSIS_VERSION` stays 0.3.0: since v0.3.0 `gates.py` changed one docstring and `registration.py` added the optional `base_model` field and the AI-native evaluator ids' hash resolution, neither of which changes a registration that does not use them. In 0.5.0 `__version__` is 0.5.0 and `ANALYSIS_VERSION` still 0.3.0: neither file changed since v0.4.0.
+Every registration records `analysis_code_version` and is refused (REG-FIELD) when it differs from the running code's `gatedtrain.ANALYSIS_CODE_VERSION` (05 section 3.7). Up to 0.3.0 that was `gatedtrain <__version__>`, so every package release would have invalidated every existing registration. From 0.4.0 it is `gatedtrain <ANALYSIS_VERSION>`, a separate constant that names the analysis code (gate statistics in `gates.py`, registration semantics in `registration.py`) and changes only when that code's behaviour changes. In 0.4.0 `__version__` is 0.4.0 and `ANALYSIS_VERSION` stays 0.3.0: since v0.3.0 `gates.py` changed one docstring and `registration.py` added the optional `base_model` field and the AI-native evaluator ids' hash resolution, neither of which changes a registration that does not use them. In 0.5.0 `__version__` is 0.5.0 and `ANALYSIS_VERSION` still 0.3.0: neither file changed since v0.4.0. In 0.6.0 `__version__` is 0.6.0 and `ANALYSIS_VERSION` still 0.3.0: `gates.py` did not change, and `registration.py` gained the opt-in greedy decoding mode (REG-GREEDY), which `check_contents` refuses unless the caller passes `greedy_allowed`, so no registration that was valid before changes its verdict.
 
 Identities that a registration pins follow the analysis version: `ANALYSIS_CODE_VERSION`, and the stand-in evaluator's identity hash (`runner.stub_evaluator_hash`, the Tier A deciding evaluator's `manifest_hash`), so this release leaves the current demo and fixture registrations and the demo specs unchanged. That does not make a Tier A stand-in registration written with 0.3.0 valid: the hash also covers the stand-in code files, and `stubs/model.py` changed after v0.3.0 (oneDNN turned off in the CPU demo), so the demo registration's `manifest_hash` changed from `sha256:e7d57d2f...` (v0.3.0) to `sha256:b09acedc...`, and a 0.3.0 stand-in registration gates MISSING (`evaluator_hash_mismatch`) and must be registered again. Registrations whose evaluators are Tier B, external-run or recipe evaluators keep their resolved hashes and stay valid. Identities that record which package wrote something follow `__version__`: the lockfile backends' `package_version`, the ledger `writer_id` (`gatedtrain.ledger@<__version__>`), the keeper's `hello` `keeper_version`, the `setup keeper` install pin `gatedtrain==<__version__>`, and `--version`. No reader compares these with the running package.
 
-**Tests.** `test_rename.TestAnalysisVersion`: `__version__` is 0.5.0 while `ANALYSIS_CODE_VERSION` stays `gatedtrain 0.3.0`, and the stand-in evaluator hash does not change with `__version__` but does with `ANALYSIS_VERSION`. `test_rename.TestNewNames.test_identifiers` checks the ledger `writer_id` against `__version__`; `test_e2e_slow` checks the report's `analysis_code_version` against `ANALYSIS_CODE_VERSION` and the lockfile backends' `package_version` against `__version__`; `test_r18_clauses` builds its registration with `ANALYSIS_CODE_VERSION`; `test_stubs_docs_tierb.test_version` checks `__version__`.
+**Tests.** `test_rename.TestAnalysisVersion`: `__version__` is 0.6.0 while `ANALYSIS_CODE_VERSION` stays `gatedtrain 0.3.0`, and the stand-in evaluator hash does not change with `__version__` but does with `ANALYSIS_VERSION`. `test_rename.TestNewNames.test_identifiers` checks the ledger `writer_id` against `__version__`; `test_e2e_slow` checks the report's `analysis_code_version` against `ANALYSIS_CODE_VERSION` and the lockfile backends' `package_version` against `__version__`; `test_r18_clauses` builds its registration with `ANALYSIS_CODE_VERSION`; `test_stubs_docs_tierb.test_version` checks `__version__`.
 
 ## 12. AI-native step 1 (AN-1 to AN-10)
 

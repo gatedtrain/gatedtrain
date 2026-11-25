@@ -375,7 +375,7 @@ a side effect of `temperature: 0`:
   refuses the attempt (`AN-26`, counts only), settles it as not passed and costs its alpha, like a crash (AN-9): the
   comparison is one bit about the sealed items. A repeat under the same seed would not do, since seeded sampling
   repeats too.
-- A pack whose vLLM run is not repeatable fails closed. Making it so (a fixed batch order, no prefix caching, eager
+- A pack whose vLLM run is not repeatable fails closed (see the known limits in the [changelog](../CHANGELOG.md#changes-in-060): with default batching 54 to 56 % of the items differed for Qwen3.5-0.8B, `max_num_seqs=1` gave none). Making it so (a fixed batch order, no prefix caching, eager
   mode, one process) is the pack's job and is not checked beyond this comparison. The control pass runs in the same
   process, so cross-process differences are not seen.
 - The scenario pack's generator must accept `decoding` in its sampler (a script that refuses unknown sampler keys

@@ -1,6 +1,6 @@
 [project]
 name = "gatedtrain"
-version = "0.5.0"
+version = "0.6.0"
 description = "Composable post-training framework: launch, consumption ledger, paired gates and impact for external training runs (prototype)."
 readme = "README.md"
 license = "Apache-2.0"
