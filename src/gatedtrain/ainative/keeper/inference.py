@@ -135,11 +135,12 @@ class InferenceConfig:
         object.__setattr__(self, "nvidia_smi", _plain_abs(Path(self.nvidia_smi), "nvidia-smi"))
         w = self.gpu_wait_s
         try:
-            wait_ok = isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w) and w > 0
+            wait_ok = (isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w)
+                       and 0 < w <= protocol.MAX_GPU_WAIT_S)
         except OverflowError:
             wait_ok = False
         if not wait_ok:
-            raise ValueError(f"the GPU wait {w!r} is not a number of seconds above 0")
+            raise ValueError(f"the GPU wait {w!r} is not a number of seconds above 0 and at most {protocol.MAX_GPU_WAIT_S:g}")
         b = self.gpu_busy_mib
         if isinstance(b, bool) or not isinstance(b, int) or not 0 <= b <= MAX_GPU_BUSY_MIB:
             raise ValueError(f"the GPU busy threshold {b!r} is not a whole number of MiB from 0 to {MAX_GPU_BUSY_MIB}")

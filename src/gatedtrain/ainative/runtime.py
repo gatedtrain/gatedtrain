@@ -38,7 +38,8 @@ CLI_ENV_KEYS = ("PATH", "HOME", "XDG_RUNTIME_DIR")
 ROOTLESS_SECURITY_OPTION = "name=rootless"
 
 GPU_BUSY_MIB = 1024             # AN-23: GPU memory held by compute processes at most this counts as a free GPU
-MAX_GPU_BUSY_MIB = 1 << 20      # 1 TiB: above any GPU, so a busy threshold past it would switch the AN-23 check off
+MAX_GPU_BUSY_MIB = 1 << 20      # 1 TiB: a bound against absurd values (a threshold above a GPU's memory still turns the AN-23 check off; a
+                                # non-default value is therefore part of the signed environment record)
 GPU_WAIT_S = 900                # AN-23: the longest wait for a free GPU before a GPU container start is refused
 GPU_POLL_S = 10.0
 UNREADABLE_MIB = 2**31 - 1      # a probe line that is not a number: counted as busy (fail closed)
