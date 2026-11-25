@@ -11,7 +11,7 @@ Implements design revision 27 (tag `rev-27` of gatedtrain-design). Rules AN-27 t
 The AI-native path no longer needs sudo by default, and a result states the keeper mode that produced it (see [Keeper
 modes](docs/ai-native.md#keeper-modes) and the [quickstart without sudo](docs/sudo-free-quickstart.md)):
 
-- **Breaking-ish: `gatedtrain setup keeper` now prints a same-user setup by default.** The commands run without sudo:
+- **Behaviour change: `gatedtrain setup keeper` now prints a same-user setup by default.** The commands run without sudo:
   a keeper under your own OS user, a state directory under your XDG data directory (mode 0700), a systemd user unit and
   the socket under `$XDG_RUNTIME_DIR`. The old output (the keeper user, the root-owned environment, `sudo`) is
   `gatedtrain setup keeper --mode separate-user`, unchanged. `--user` and `--venv` are refused in same-user mode
