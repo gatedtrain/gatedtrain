@@ -61,7 +61,7 @@ from ..ext import launch
 from ..ext.launch import HostConfig
 from .keeper_trust import project_id
 from .project import Project, _refuse_links, _write_atomic, append_jsonl, read_jsonl
-from .runtime import (GPU_BUSY_MIB, GPU_WAIT_S, TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount,
+from .runtime import (GPU_BUSY_MIB, GPU_POLL_S, GPU_WAIT_S, TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount,
                       RunSpec, Runtime, RuntimeFailure, docker_run_argv, wait_for_gpu)
 
 JOB_SCHEMA = "gatedtrain.ainative.job"
@@ -91,6 +91,9 @@ LOCK, JOB_FILE, ATTEMPTS, OUTPUT_DIRS = "lock", "job.json", "attempts.jsonl", "o
 DIR_MODE = 0o755
 LABEL_PROJECT, LABEL_JOB = "gatedtrain.project", "gatedtrain.job"
 FIX = "fix the job and submit it again"
+DEFAULT_JOB_TIME_LIMIT_S = 6 * 3600      # a job's time limit unless its adapter sets one (6 h)
+DEFAULT_MAX_ATTEMPTS = 3                 # runs of a job that failed, was preempted or lost before it is final
+JOB_POLL_S = GPU_POLL_S                  # how often `wait` reads a job's state
 MAX_INPUT_ENTRIES = 100_000             # a read-only mount the job key fingerprints holds at most this many entries
 SMALL_FILE_BYTES = 1 << 20              # inputs up to this size are fingerprinted by content, larger ones by mtime
 
@@ -137,10 +140,10 @@ class Job:
     tmpfs: tuple[str, ...] = ()
     network: str = "none"
     gpu: bool = False
-    time_limit_s: int = 21600
+    time_limit_s: int = DEFAULT_JOB_TIME_LIMIT_S
     gpu_hours_est: float = 0.0
     training_seed: int = 0
-    max_attempts: int = 3
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
     profile: str = "full"
 
     def doc(self) -> dict[str, Any]:
@@ -1090,7 +1093,7 @@ class LocalBackend:
         with self._lock(self._rel(job_id, LOCK)):
             return self._advance(job_id, rec)
 
-    def wait(self, job_id: str, *, poll_s: float = 10.0) -> JobStatus:
+    def wait(self, job_id: str, *, poll_s: float = JOB_POLL_S) -> JobStatus:
         while True:
             s = self.status(job_id)
             if s.state in TERMINAL:
@@ -1357,7 +1360,7 @@ class StageBackend:
         self._no_side_effect("status")
         return self._backend.status(job_id)
 
-    def wait(self, job_id: str, *, poll_s: float = 10.0) -> JobStatus:
+    def wait(self, job_id: str, *, poll_s: float = JOB_POLL_S) -> JobStatus:
         self._no_side_effect("wait")
         return self._backend.wait(job_id, poll_s=poll_s)
 

@@ -35,6 +35,8 @@ empty keeper-owned output directory `/out`. Nothing about the items is passed in
 
 from __future__ import annotations
 
+import dataclasses
+import math
 import os
 import pwd
 import re
@@ -51,8 +53,9 @@ from ...canonical import canonical_json
 from ...errors import Problem, Refused
 from ...ext import launch
 from ..batch import (CONTAINER_ITEMS, CONTAINER_MODEL, CONTAINER_OUT, CONTAINER_SAMPLER, CONTAINER_SCRIPT_DIR,
-                     BatchGenerator, container_argv, read_predictions, sampler_doc, write_items)
-from ..runtime import (GPU_BUSY_MIB, GPU_WAIT_S, TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount,
+                     BatchGenerator, EVAL_SLACK_S, container_argv, evaluation_wait_bound, read_predictions, sampler_doc,
+                     write_items)
+from ..runtime import (GPU_BUSY_MIB, GPU_WAIT_S, MAX_GPU_BUSY_MIB, TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount,
                        NvidiaSmiProbe, RunSpec, Runtime, RuntimeFailure, wait_for_gpu)
 from . import envcheck, protocol
 
@@ -66,12 +69,11 @@ NAME_PREFIX = "gatedtrain-keeper-"
 RUN_DIR = "run"
 SUBID_FILES = ("/etc/subuid", "/etc/subgid")
 CONTAINER_USER = "0:0"           # the keeper uid on the host under the keeper's rootless daemon (05 §18.10)
-SHM_SIZE = "8g"
+SHM_SIZE = launch.SHM_SIZE_VALUE
 SOCKET_WAIT_S = 60.0
 SOCKET_POLL_S = 1.0
 POLL_S = 2.0                     # how often a running container is inspected
 STOP_TIMEOUT_S = 10
-EVAL_SLACK_S = 600               # GPU wait + 2 time limits + this must fit the client's wait
 DEFAULT_DOCKER = Path("/usr/bin/docker")
 DEFAULT_NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
 CRASH_FIX = ("check the keeper's inference image and the scenario pack's batch generator, then train a new candidate "
@@ -100,9 +102,14 @@ def _plain_abs(p: Path, what: str) -> Path:
 @dataclass(frozen=True)
 class InferenceConfig:
     """`keeper serve --inference-image ID [--inference-ref REF] [--eval-tree DIR]... [--docker-host URL] [--docker PATH]
-    [--nvidia-smi PATH]`: the image ID (`sha256:<64 hex>`) the keeper runs and refuses any other; the reference the
-    daemon knows it by (default: the ID); the eval trees (absolute directories, mounted read-only at their own paths);
-    the daemon; the Docker CLI and `nvidia-smi` the keeper calls by absolute path."""
+    [--nvidia-smi PATH] [--gpu-wait-s S] [--gpu-busy-mib MIB] [--eval-python PATH]`: the image ID (`sha256:<64 hex>`)
+    the keeper runs and refuses any other; the reference the daemon knows it by (default: the ID); the eval trees
+    (absolute directories, mounted read-only at their own paths); the daemon; the Docker CLI and `nvidia-smi` the keeper
+    calls by absolute path. The owner's, set where the keeper is started (its unit), never by a request: `gpu_wait_s`
+    and `gpu_busy_mib` are how long the keeper waits for a free GPU and how much memory still counts as free (AN-23;
+    a GPU shared with other work needs other values); `eval_python` replaces the interpreter an eval-tree generator
+    declares (a pack's default is the eval venv `setup host` builds). A value that differs from the default is part of
+    the signed environment record (`environment`)."""
 
     image_id: str
     docker_host: str
@@ -110,6 +117,9 @@ class InferenceConfig:
     image_ref: str | None = None
     docker: Path = DEFAULT_DOCKER
     nvidia_smi: Path = DEFAULT_NVIDIA_SMI
+    gpu_wait_s: float = GPU_WAIT_S
+    gpu_busy_mib: int = GPU_BUSY_MIB
+    eval_python: Path | None = None
 
     def __post_init__(self) -> None:
         if not (isinstance(self.image_id, str) and _IMAGE_ID.fullmatch(self.image_id)):
@@ -123,6 +133,18 @@ class InferenceConfig:
         object.__setattr__(self, "eval_trees", tuple(_plain_abs(Path(t), "eval tree") for t in self.eval_trees))
         object.__setattr__(self, "docker", _plain_abs(Path(self.docker), "Docker CLI"))
         object.__setattr__(self, "nvidia_smi", _plain_abs(Path(self.nvidia_smi), "nvidia-smi"))
+        w = self.gpu_wait_s
+        try:
+            wait_ok = isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w) and w > 0
+        except OverflowError:
+            wait_ok = False
+        if not wait_ok:
+            raise ValueError(f"the GPU wait {w!r} is not a number of seconds above 0")
+        b = self.gpu_busy_mib
+        if isinstance(b, bool) or not isinstance(b, int) or not 0 <= b <= MAX_GPU_BUSY_MIB:
+            raise ValueError(f"the GPU busy threshold {b!r} is not a whole number of MiB from 0 to {MAX_GPU_BUSY_MIB}")
+        if self.eval_python is not None:
+            object.__setattr__(self, "eval_python", _plain_abs(Path(self.eval_python), "eval interpreter"))
 
 
 def _seconds(st: ContainerState | None) -> int | None:
@@ -405,6 +427,11 @@ class KeeperInference:
             self._environment = {"image_id": self.config.image_id, "docker_host": self.config.docker_host,
                                  "eval_trees": [envcheck.eval_tree_record(t) for t in self.config.eval_trees],
                                  "docker_cli_sha256": cli}
+            c = self.config                  # the owner's settings, in the signed record only when they are not the defaults
+            if (c.gpu_wait_s, c.gpu_busy_mib) != (GPU_WAIT_S, GPU_BUSY_MIB):
+                self._environment["gpu"] = {"wait_s": c.gpu_wait_s, "busy_mib": c.gpu_busy_mib}
+            if c.eval_python is not None:
+                self._environment["eval_python"] = os.fspath(c.eval_python)
             self._distribution_files()
         return self._environment
 
@@ -427,15 +454,24 @@ class KeeperInference:
         except OSError:
             return False
 
+    def _resolve(self, gen: BatchGenerator) -> BatchGenerator:
+        """`gen` with the owner's eval interpreter in place of the one the pack declares, for a generator that runs from
+        the eval trees (the setting names the eval venv; an image generator keeps its own interpreter)."""
+        if self.config.eval_python is not None and gen.eval_trees:
+            return dataclasses.replace(gen, interpreter=os.fspath(self.config.eval_python))
+        return gen
+
     def ready(self, gen: BatchGenerator) -> None:
         """Refused (AN-25, AN-13) unless `gen` can run now; see the module docstring. Called before the grant."""
-        bound = GPU_WAIT_S + 2 * gen.time_limit_s + EVAL_SLACK_S
+        gen = self._resolve(gen)
+        gpu_wait_s = self.config.gpu_wait_s
+        bound = evaluation_wait_bound(gpu_wait_s, gen.time_limit_s)
         wait = protocol.LONG_OP_TIMEOUT_S
         if bound > wait:
-            most = int((wait - GPU_WAIT_S - EVAL_SLACK_S) // 2)
+            most = int((wait - gpu_wait_s - EVAL_SLACK_S) // 2)
             raise Refused([_problem(RULE_BATCH, "batch_generator.time_limit_s", f"the batch generator's time limit "
                                     f"of {gen.time_limit_s} s does not fit the driver's wait for an evaluation "
-                                    f"({GPU_WAIT_S} s GPU wait + 2 x {gen.time_limit_s} s + {EVAL_SLACK_S} s = "
+                                    f"({gpu_wait_s:g} s GPU wait + 2 x {gen.time_limit_s} s + {EVAL_SLACK_S} s = "
                                     f"{bound} s, more than {wait:g} s)",
                                     f"give the scenario pack's batch generator a time limit of at most {most} s")])
         if gen.eval_trees and not self.config.eval_trees:
@@ -462,9 +498,10 @@ class KeeperInference:
                                         "(nvidia-smi), so it does not start a GPU generator",
                                         "install the NVIDIA driver's nvidia-smi, or pass its absolute path to "
                                         "`keeper serve --nvidia-smi`")])
-            if not wait_for_gpu(self.probe, sleep=self.sleep, clock=self.clock):
+            if not wait_for_gpu(self.probe, busy_mib=self.config.gpu_busy_mib, timeout_s=gpu_wait_s, sleep=self.sleep,
+                                clock=self.clock):
                 raise Refused([_problem(RULE_BATCH, "gpu", f"the GPU is busy: other processes held more than "
-                                        f"{GPU_BUSY_MIB} MiB of GPU memory for {GPU_WAIT_S} s",
+                                        f"{self.config.gpu_busy_mib} MiB of GPU memory for {gpu_wait_s:g} s",
                                         "wait until the other GPU job ends, then evaluate again")])
 
     # ---- the container --------------------------------------------------------------------------------------------
@@ -525,6 +562,7 @@ class KeeperInference:
                   seeds: list) -> list[dict]:
         """One container for every item and seed of one arm; the predictions as `batch.read_predictions` returns
         them, or Refused (AN-9): a crash, or a daemon that changed since `ready` (the grant is already made)."""
+        gen = self._resolve(gen)
         self.last_run = None
         hexid = secrets.token_hex(8)
         name = NAME_PREFIX + hexid

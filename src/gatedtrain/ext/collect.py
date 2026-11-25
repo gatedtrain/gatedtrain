@@ -667,10 +667,18 @@ def collect(spec_path: Path, *, adapter: str, stage_out: Path, launch_record: Pa
         problems.append(Problem("EXT-SMOKE", "--smoke-record", f"cannot read {smoke_record}: {exc.__class__.__name__}",
                                 "pass the area's PASS smoke.json"))
     if smoke is not None:
+        try:
+            from .launch import owner_gpu_bounds
+
+            bounds = owner_gpu_bounds()
+        except Refused as exc:                           # a malformed host file is refused, never read as the defaults
+            problems.extend(exc.problems)
+            bounds = {}
         for msg in smoke_problems(smoke, adapter=adapter, score_range=row["score_range"], binary=row["binary"],
                                   direction=row.get("direction"),
                                   base_model_hash=base_model, item_set_hash=registered_items,
-                                  evaluators=[(ev, rows[ev]) for ev in evaluators] if multi else None):   # R18-8
+                                  evaluators=[(ev, rows[ev]) for ev in evaluators] if multi else None,   # R18-8
+                                  **bounds):
             problems.append(Problem("EXT-SMOKE", "--smoke-record", msg,
                                     "collect only after a PASS smoke run of this adapter, base and item set (MM-39)"))
 

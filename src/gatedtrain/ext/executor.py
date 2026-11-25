@@ -8,7 +8,8 @@ no core dumps) and only these environment names. A recipe's registry row names i
 from __future__ import annotations
 
 EXECUTOR_LIMITS = {"cpus": 8, "memory": "8g", "memory_swap": "8g", "pids": 256, "nofile": "1024:1024", "core": 0}
-EXECUTOR_LIMIT_OPTIONS = ("--cpus", "8", "--memory", "8g", "--memory-swap", "8g", "--pids-limit", "256",
-                          "--ulimit", "nofile=1024:1024", "--ulimit", "core=0")
+EXECUTOR_LIMIT_OPTIONS = ("--cpus", str(EXECUTOR_LIMITS["cpus"]), "--memory", EXECUTOR_LIMITS["memory"],
+                          "--memory-swap", EXECUTOR_LIMITS["memory_swap"], "--pids-limit", str(EXECUTOR_LIMITS["pids"]),
+                          "--ulimit", f"nofile={EXECUTOR_LIMITS['nofile']}", "--ulimit", f"core={EXECUTOR_LIMITS['core']}")
 EXECUTOR_TMPFS_OPTIONS = "rw,nosuid,nodev,noexec,size=4g"
 EXECUTOR_ENV = ("HOME", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED")

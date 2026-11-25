@@ -16,13 +16,38 @@ CONTAINER_PATHS = {"ro_identity": True, "ro_under": ("/inputs",), "rw": ("/out",
 
 # --- a recipe's runtime directory and its venv (rows that name no host path) ---
 
-def runtime_dir(env_var: str, anchor: str, parents: int = 2) -> str:
-    """The recipe's runtime directory: `env_var` when set, else `<repository>/runtime`, the repository being the
+_WARNED: set[str] = set()      # deprecated variables already named on stderr by this process
+
+def runtime_dir(env_var: str, anchor: str, parents: int = 2, *, pack: str | None = None) -> str:
+    """The recipe's runtime directory, by precedence: `env_var` when set (a deprecated workaround, named on stderr), the
+    host file's `[packs.<pack>] runtime_dir` when `pack` is given, else `<repository>/runtime`, the repository being the
     `parents`-th parent of `anchor` (the rows module's `__file__`; an editable or source checkout)."""
     import os
+    import sys
     from pathlib import Path
 
-    return os.environ.get(env_var) or str(Path(anchor).resolve().parents[parents] / "runtime")
+    from .launch import ENV_REMOVED_IN, pack_setting
+
+    from ..errors import Refused
+
+    from_env = os.environ.get(env_var)
+    if from_env:
+        if env_var not in _WARNED:                        # once per variable and process
+            _WARNED.add(env_var)
+            print(f"warning: {env_var} is deprecated: set `runtime_dir` in the host file's "
+                  f"[packs.{pack or '<pack name>'}] table instead; the variable is removed in {ENV_REMOVED_IN}",
+                  file=sys.stderr)
+        return from_env
+    default = str(Path(anchor).resolve().parents[parents] / "runtime")
+    try:
+        return (pack_setting(pack, "runtime_dir") if pack else None) or default
+    except Refused as exc:
+        # A pack is imported by every gatedtrain command, `--help` included: a malformed host file must not take them
+        # all down. The package's own runtime directory is used and the problem is named; a stage that needs the
+        # host file (the owner's bounds) refuses on its own.
+        print(f"warning: the host file is malformed, so {pack}'s runtime_dir is the package default: "
+              f"{exc.problems[0].line()}", file=sys.stderr)
+        return default
 
 
 def python_tree(runtime: str) -> str | None:

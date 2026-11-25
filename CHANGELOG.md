@@ -4,6 +4,45 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
+## Changes in 0.7.1 (Unreleased)
+
+Not released yet; on top of 0.7.0. Design revision 28.
+
+Owner-side settings (the audit's open items; defaults and every recorded hash unchanged):
+
+- **Host file keys.** `gpu_mem_limit_gb` and `gpu_cap_h` (numbers above 0), `input_roots`, `interpreter_trees`,
+  `interpreter`, `mirror_root`, and `[packs.<name>]` tables of absolute paths. `smoke_verdict` and `smoke_problems` take the
+  bounds as parameters; `ext-launch` and `ext-collect` pass the host's. The numbers and the pack tables enter
+  `host_config_sha256` only when set. The `GATEDTRAIN_EXT_*` layout variables are deprecated (a stderr line names the
+  file key) and removed in 0.9.0.
+- **Keeper options.** `keeper serve` and `setup keeper` take `--gpu-wait-s`, `--gpu-busy-mib` and `--eval-python`; a
+  non-default value is in the signed environment record. The three layout rows 0.7.0 reserved for them (`[gpu] wait_s`,
+  `[gpu] busy_mib`, `[inference] keeper_eval_python`) are supported in both `setup keeper` modes, validated like the flags
+  and printed into the unit; a flag beats the layout; they need `--inference-image`. `rowkit.runtime_dir(..., pack=)` reads the host file's
+  `[packs.<name>] runtime_dir` (the pack's runtime variable is deprecated). `launch.pack_setting` reads any pack setting.
+
+Constants that were copied or tied to one machine now have one name and one place ; nothing here changes a registration, a signature, a ledger or a report, except where marked as a change:
+
+- **One source for each shared constant.** The alpha-investing starting wealth and payout are computed from
+  `TARGET_ALPHA`, and the guarantee texts quote it; `PILOT_SIGMA` is the scorers' `PLANNING_SD_BOUND`; the keeper's long
+  operation timeout is the sum of `GPU_WAIT_S`, two generator time limits and `EVAL_SLACK_S`; the 64 MiB data limit, the
+  96 MiB request cap derived from it and the predictions cap live in `ainative/limits.py`; the container shared-memory
+  size, the GPU-hour ceiling, the NeMo Evaluator commit, the bootstrap variants, the metric directions, the prototype
+  tags and the default rows per shard are each defined once. `tests/test_single_source.py` pins the trust constants and
+  checks every one of these.
+- **Tier B launcher (`backends.nemo_rl.launch_spec`, prototype).** The docker launcher no longer defaults `work_dir` and
+  `hf_cache` to directories of one host: both are required and a call without them raises `ValueError`. The GPU
+  architecture list is no longer fixed at `8.9`: pass `cuda_arch` (for example `"8.9"`) to export `TORCH_CUDA_ARCH_LIST`
+  and `FLASHINFER_CUDA_ARCH_LIST`; without it the command has neither. `shm_size` is a parameter (default `32g`).
+  `DEFAULT_WORK_DIR` and `DEFAULT_HF_CACHE` are removed.
+- The NeMo RL commit is written once (`families.nemo_rl.NEMO_RL_COMMIT`; the short form, the image tag and the source
+  directory derive from it); the executor's option list is derived from its limit table; job defaults (`6 h`, 3 attempts,
+  poll interval) and the rootless socket address (`launch.rootless_docker_host`) have one name each; `PROJECT_FILE` names
+  `project.yaml`. The text of `gatedtrain setup host` is byte-identical to 0.7.0 apart from the version number it prints (checked for both
+  script variants).
+- `docs/configuration.md` lists the fixed trust values and why they are not settings.
+- `gatedtrain export-gsm8k` takes its default rows per shard from `tierb.DEFAULT_ROWS_PER_SHARD`; the value is unchanged.
+
 ## Changes in 0.7.0
 
 Implements design revision 27 (tag `rev-27` of gatedtrain-design). Rules AN-27 to AN-34 and IMG-1 to IMG-9.

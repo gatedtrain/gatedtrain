@@ -138,11 +138,12 @@ def _tierb_call(args, fn, warnings: list[str] | None = None) -> int:
 
 
 def cmd_export(args) -> int:
-    from .tierb import export_gsm8k
+    from .tierb import DEFAULT_ROWS_PER_SHARD, export_gsm8k
 
     def go():
         out = export_gsm8k(Path(args.out), source=Path(args.source) if args.source else None,
-                           revision=args.revision, rows_per_shard=args.rows_per_shard)
+                           revision=args.revision,
+                           rows_per_shard=DEFAULT_ROWS_PER_SHARD if args.rows_per_shard is None else args.rows_per_shard)
         return {"export": str(out)}, f"export: {out}\n"
     return _tierb_call(args, go)
 
@@ -769,10 +770,12 @@ def _inference_config(args):
     """AN-25: the keeper's inference options as an `InferenceConfig`, None without `--inference-image`; Refused
     (AN-13) for a malformed value or an inference option without the image."""
     from .ainative.keeper.inference import DEFAULT_DOCKER, DEFAULT_NVIDIA_SMI, InferenceConfig
+    from .ext.launch import rootless_docker_host
 
     given = [name for name, value in (("--inference-ref", args.inference_ref), ("--eval-tree", args.eval_tree),
                                       ("--docker-host", args.docker_host), ("--docker", args.docker),
-                                      ("--nvidia-smi", args.nvidia_smi))
+                                      ("--nvidia-smi", args.nvidia_smi), ("--gpu-wait-s", args.gpu_wait_s),
+                                      ("--gpu-busy-mib", args.gpu_busy_mib), ("--eval-python", args.eval_python))
              if value not in (None, [])]
     if args.inference_image is None:
         if given:
@@ -781,14 +784,27 @@ def _inference_config(args):
         return None
     try:
         return InferenceConfig(image_id=args.inference_image,
-                               docker_host=args.docker_host or f"unix:///run/user/{os.geteuid()}/docker.sock",
+                               docker_host=args.docker_host or rootless_docker_host(os.geteuid()),
                                eval_trees=tuple(Path(t) for t in args.eval_tree or ()), image_ref=args.inference_ref,
                                docker=Path(args.docker) if args.docker else DEFAULT_DOCKER,
-                               nvidia_smi=Path(args.nvidia_smi) if args.nvidia_smi else DEFAULT_NVIDIA_SMI)
+                               nvidia_smi=Path(args.nvidia_smi) if args.nvidia_smi else DEFAULT_NVIDIA_SMI,
+                               **{k: v for k, v in (("gpu_wait_s", args.gpu_wait_s), ("gpu_busy_mib", args.gpu_busy_mib),
+                                                    ("eval_python", Path(args.eval_python) if args.eval_python else None))
+                                  if v is not None})
     except ValueError as exc:
         raise Refused([Problem("AN-13", "inference_image", str(exc),
                                "pass --inference-image sha256:<64 hex>, absolute --eval-tree, --docker and "
                                "--nvidia-smi paths, and --inference-ref pinned by digest")]) from None
+
+
+def _add_keeper_gpu_options(c, where: str) -> None:
+    """The keeper's owner-side GPU and eval-interpreter options (AN-23, AN-25), on `keeper serve` and `setup keeper`."""
+    c.add_argument("--gpu-wait-s", type=float, metavar="S",
+                   help=f"how long to wait for a free GPU before a GPU generator is refused (default 900) {where}")
+    c.add_argument("--gpu-busy-mib", type=int, metavar="MIB",
+                   help=f"GPU memory in use that still counts as a free GPU (default 1024) {where}")
+    c.add_argument("--eval-python", metavar="PATH",
+                   help=f"the eval venv's python that replaces the one a pack declares for an eval-tree generator {where}")
 
 
 def cmd_keeper_serve(args) -> int:
@@ -887,7 +903,9 @@ def cmd_setup_keeper(args) -> int:
         out = setup_commands(user=lay.values["user"], state=lay.values["state"], socket=lay.values["socket"],
                              venv=lay.values["venv"], owner_uid=owner,
                              packages=args.packages, inference_image=args.inference_image,
-                             eval_trees=lay.values["eval_trees"], docker_host=args.docker_host)
+                             eval_trees=lay.values["eval_trees"], docker_host=args.docker_host,
+                             gpu_wait_s=lay.values["wait_s"], gpu_busy_mib=lay.values["busy_mib"],
+                             eval_python=lay.values["keeper_eval_python"])
     except Refused as exc:
         return _krefuse(args, exc.problems)
     out["commands"] = [*lay.header, *out["commands"]]
@@ -912,7 +930,9 @@ def _cmd_setup_keeper_same_user(args, owner: int, lay, warnings: list[str]) -> i
         out = setup_user.setup_commands_same_user(owner_uid=owner, state=lay.values["state"],
                                                   socket=lay.values["socket"], executable=lay.values["executable"],
                                                   inference_image=args.inference_image,
-                                                  eval_trees=lay.values["eval_trees"], docker_host=args.docker_host)
+                                                  eval_trees=lay.values["eval_trees"], docker_host=args.docker_host,
+                                                  gpu_wait_s=lay.values["wait_s"], gpu_busy_mib=lay.values["busy_mib"],
+                                                  eval_python=lay.values["keeper_eval_python"])
     except Refused as exc:
         return _krefuse(args, exc.problems)
     if args.packages is not None:
@@ -1062,6 +1082,7 @@ def _add_keeper(sub) -> None:
     c.add_argument("--docker", metavar="PATH", help="the Docker CLI's absolute path (default /usr/bin/docker)")
     c.add_argument("--nvidia-smi", metavar="PATH",
                    help="nvidia-smi's absolute path, for a GPU batch generator (default /usr/bin/nvidia-smi)")
+    _add_keeper_gpu_options(c, "(needs --inference-image)")
     c.set_defaults(func=cmd_keeper_serve)
 
     c = ks.add_parser("fingerprint", help="print the fingerprint of the key the keeper serves; keep it out of band")
@@ -1102,6 +1123,7 @@ def _add_keeper(sub) -> None:
                    help="a root-owned eval tree printed into ExecStart= (repeatable; needs --inference-image)")
     c.add_argument("--docker-host", metavar="URL",
                    help="the keeper's rootless daemon printed into ExecStart= (needs --inference-image)")
+    _add_keeper_gpu_options(c, "printed into ExecStart= (needs --inference-image)")
     c.set_defaults(func=cmd_setup_keeper)
 
     from .ainative import hostsetup
@@ -1182,6 +1204,9 @@ def _json_requested(argv: list[str]) -> tuple[bool, str]:
     return as_json, "gatedtrain"
 
 
+DEFAULT_RUNS_ROOT = "runs"          # where `run` writes its run directories and the other commands look
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = _Parser(prog="gatedtrain", description=f"walking-skeleton prototype {__version__} "
                                  f"(prototype, unpromotable; Tier A stand-ins are {STUB_MARK})")
@@ -1200,7 +1225,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="run the whole path and print the gate report")
     p.add_argument("spec")
-    p.add_argument("--runs-root", default="runs")
+    p.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("warmup", help="train the baseline checkpoint (skeleton-stub)")
@@ -1223,7 +1248,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source", help="local copy with train.jsonl and test.jsonl (openai/gsm8k main rows)")
     p.add_argument("--revision", help="Hugging Face dataset commit hash (required with --source; a download needs a full 40-hex commit "
                    "and defaults to tierb.DATASET_REVISION; G-17)")
-    p.add_argument("--rows-per-shard", type=int, default=500)
+    p.add_argument("--rows-per-shard", type=int, default=None, metavar="N",
+                   help="rows per shard (default: tierb.DEFAULT_ROWS_PER_SHARD)")
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("verify-export", help="Tier B: re-check an export's hashes (H-2)")
@@ -1251,7 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-candidate", required=True)
     p.add_argument("--image-id", required=True)
     p.add_argument("--nemo-rl-commit", required=True)
-    p.add_argument("--runs-root", default="runs")
+    p.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     # R10A-11: whether the NeMo RL image carries a local modification; absent is recorded as "unknown".
     p.add_argument("--nemo-rl-modified", choices=("yes", "no"),
                    help="the NeMo RL image carries a local modification (yes) or none (no); absent: unknown")
@@ -1271,7 +1297,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the baseline arm; with several clauses, once per clause in the gate's evaluator order")
     p.add_argument("--eval-candidate", required=True, action="append",
                    help="the candidate arm; with several clauses, once per clause in the gate's evaluator order")
-    p.add_argument("--runs-root", default="runs")
+    p.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     p.add_argument("--sources-root", help="the directory a merged arm's sources (merge.json) must lie under "
                    "(MM-5); default: the host's output root")
     p.set_defaults(func=cmd_ext_collect)

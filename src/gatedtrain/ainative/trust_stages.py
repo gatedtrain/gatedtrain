@@ -54,6 +54,7 @@ from .stage import Proposal, StageContext
 from .trust import NEW_TEST_FIX, SealedRef
 # The split, scoring, gate statistics and report pieces are shared with the keeper (`sealed_eval`); the step 1
 # names stay importable from here.
+from .limits import MAX_DATA_BYTES, MAX_DATA_TEXT
 from .sealed_eval import (DEFAULT_ALPHA, DEFAULT_MDE, DEFAULT_POWER, LIMIT_ALPHA_PER_PROJECT,  # noqa: F401
                           LIMIT_METRIC_CONFIRMATION, LIMIT_MODEL_REFERENCE, MAX_SEALED_FRACTION, PILOT_SIGMA,
                           PILOT_SOURCE, _num, display_block, known_limits)
@@ -77,7 +78,6 @@ SCHEMA_SEALED_RECORDS = "gatedtrain.ainative.sealed_records"
 SCHEMA_GATE_RESULT = "gatedtrain.ainative.gate_result"
 SCHEMA_REPORT = "gatedtrain.ainative.report"
 
-MAX_DATA_BYTES = 64 * 1024 * 1024
 SEALED_TEST_USED = "this project's sealed test is used; testing another candidate needs new sealed data"
 
 
@@ -105,14 +105,14 @@ def _read_data(project: Project) -> tuple[bytes, str]:
     try:
         size = path.stat().st_size
         if size > MAX_DATA_BYTES:
-            raise _refuse("AN-6", "data", f"the data file is {size} bytes; the limit is 64 MiB ({MAX_DATA_BYTES} bytes)",
+            raise _refuse("AN-6", "data", f"the data file is {size} bytes; the limit is {MAX_DATA_TEXT} ({MAX_DATA_BYTES} bytes)",
                           "split the data or use a smaller sample")
         raw = path.read_bytes()
     except OSError as exc:
         raise _refuse("AN-6", "data", f"cannot read the data file ({type(exc).__name__})",
                       "check the file permissions") from None
     if len(raw) > MAX_DATA_BYTES:
-        raise _refuse("AN-6", "data", "the data file is larger than 64 MiB", "split the data or use a smaller sample")
+        raise _refuse("AN-6", "data", f"the data file is larger than {MAX_DATA_TEXT}", "split the data or use a smaller sample")
     digest = sha256_bytes(raw)
     if digest != project.data.get("sha256"):
         raise _refuse("AN-6", "data", "the data file changed after the project was created",

@@ -15,6 +15,7 @@
   "image": "nemo-rl:4f39fd8",
   "work_dir": "/data/gatedtrain-tierb",
   "hf_cache": "/data/hf-cache",
+  "cuda_arch": "8.9",
   "base_model": "/work/tierb/base-model"
  },
  "common_overrides": [

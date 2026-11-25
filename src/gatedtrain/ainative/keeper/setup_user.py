@@ -34,7 +34,8 @@ from pathlib import Path, PurePosixPath
 
 from ...errors import Problem, Refused, printable
 from . import protocol
-from .setup import _UNIT_UNSAFE, KEEP_FINGERPRINT, UNIT_NAME, _absolute, _inference_options, plain_absolute
+from .setup import (_UNIT_UNSAFE, KEEP_FINGERPRINT, UNIT_NAME, _absolute, _gpu_options, _inference_options,
+                    plain_absolute)
 
 RULE = "AN-31"                   # the same-user commands
 MODE_RULE = "AN-30"              # an option that belongs to the other mode
@@ -206,7 +207,9 @@ def _unit(serve: list[str], runtime_dir: str | None) -> str:
 
 def setup_commands_same_user(*, owner_uid: int, state: str | None = None, socket: str | None = None,
                              inference_image: str | None = None, eval_trees: list[str] | None = None,
-                             docker_host: str | None = None, env: Mapping[str, str] | None = None,
+                             docker_host: str | None = None, gpu_wait_s: float | None = None,
+                             gpu_busy_mib: int | None = None, eval_python: str | None = None,
+                             env: Mapping[str, str] | None = None,
                              home: str | None = None, executable: str | None = None,
                              lstat: Callable[[str], os.stat_result] = os.lstat) -> dict:
     """`{commands, unit, mode}` for a keeper under the owner's own user (AN-31). Refused (AN-31) on a path that is
@@ -230,6 +233,7 @@ def setup_commands_same_user(*, owner_uid: int, state: str | None = None, socket
                       "pass a shorter --socket")
     try:
         image, trees, host = _inference_options(inference_image, eval_trees, docker_host)
+        _gpu_options(gpu_wait_s, gpu_busy_mib, eval_python, inference_image)
     except Refused as exc:                                  # the same checks, reported under this mode's rule
         raise Refused([Problem(RULE, p.field, p.message, p.fix) for p in exc.problems]) from None
     exe = executable if executable is not None else keeper_executable()
@@ -244,6 +248,9 @@ def setup_commands_same_user(*, owner_uid: int, state: str | None = None, socket
         serve += ["--eval-tree", tree]
     if host is not None:
         serve += ["--docker-host", host]
+    for flag, value in (("--gpu-wait-s", gpu_wait_s), ("--gpu-busy-mib", gpu_busy_mib), ("--eval-python", eval_python)):
+        if value is not None:
+            serve += [flag, f"{value:g}" if flag == "--gpu-wait-s" else str(value)]
     sock_dir = socket_p.parent
     runtime_base = PurePosixPath(paths["runtime"])
     for field, directory in (("--state", state_p), ("--socket", sock_dir)):

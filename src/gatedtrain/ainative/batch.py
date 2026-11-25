@@ -30,6 +30,7 @@ from typing import Any, Protocol
 
 from ..canonical import canonical_json
 from ..errors import Problem, Refused
+from .limits import MAX_PREDICTIONS_BYTES
 
 RULE = "AN-25"
 CONTAINER_ITEMS = "/in/items.jsonl"
@@ -38,12 +39,19 @@ CONTAINER_MODEL = "/in/model"
 CONTAINER_SCRIPT_DIR = "/gen"
 CONTAINER_OUT = "/out"
 PREDICTIONS = "predictions.jsonl"
-MAX_PREDICTIONS_BYTES = 256 * 1024 * 1024
-DEFAULT_TIME_LIMIT_S = 1200            # design 05 §18.10 (AN-25)
+MAX_GENERATOR_TIME_LIMIT_S = 1200     # design 05 §18.10 (AN-25): the longest time limit a batch generator may declare
+DEFAULT_TIME_LIMIT_S = 1200            # the limit a generator gets that declares none; own number: moving it moves no cap
+EVAL_SLACK_S = 600                     # the keeper's allowance on top of the GPU wait and two time limits (AN-25)
 
 _PREDICTION_KEYS = frozenset({"item_id", "seed", "prediction"})
 CRASH = "the inference output is not one prediction per item and seed (crash)"
 CRASH_FIX = "fix the scenario pack's batch generator so it writes only /out/predictions.jsonl, one line per item and seed"
+
+
+def evaluation_wait_bound(gpu_wait_s: float, time_limit_s: float) -> float:
+    """The longest a sealed evaluation of a batch generator takes (AN-25): the wait for the GPU, one container per arm
+    (two arms) of at most `time_limit_s`, and the keeper's slack. The client's deadline must cover it."""
+    return gpu_wait_s + 2 * time_limit_s + EVAL_SLACK_S
 
 
 @dataclass(frozen=True)

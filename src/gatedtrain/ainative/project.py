@@ -26,6 +26,7 @@ import yaml
 from ..canonical import canonical_json, file_sha256, manifest_hash, sha256_bytes
 from ..errors import Problem, Refused
 
+PROJECT_FILE = "project.yaml"            # the file that makes a directory an AI-native project
 PROJECT_SCHEMA = "gatedtrain.ainative.project"
 ATTEMPT_SCHEMA = "gatedtrain.ainative.attempt"
 SCHEMA_VERSION = 1
@@ -96,8 +97,8 @@ class Project:
 
     @classmethod
     def load(cls, root: Path) -> "Project":
-        path = Path(root) / "project.yaml"
-        _refuse_links(Path(root), "project.yaml")
+        path = Path(root) / PROJECT_FILE
+        _refuse_links(Path(root), PROJECT_FILE)
         try:
             doc = yaml.safe_load(path.read_bytes().decode("utf-8"))
         except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
@@ -233,5 +234,5 @@ def create_project(root: Path, *, goal: str, data: Path, pipeline: str, budget: 
     if pipeline_bytes is not None:
         _write_atomic(root / PIPELINE_COPY, pipeline_bytes)
         doc["pipeline"], doc["pipeline_sha256"] = PIPELINE_COPY, sha256_bytes(pipeline_bytes)
-    _write_atomic(root / "project.yaml", yaml.safe_dump(doc, sort_keys=False).encode("utf-8"))
+    _write_atomic(root / PROJECT_FILE, yaml.safe_dump(doc, sort_keys=False).encode("utf-8"))
     return Project(root, doc)

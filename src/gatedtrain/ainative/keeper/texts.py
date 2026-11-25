@@ -10,6 +10,7 @@ access was checked: no keeper states it any more, and `verify` exits 1 on a repo
 from __future__ import annotations
 
 from .modes import SAME_USER, SEPARATE_USER
+from ..alpha_investing import TARGET_ALPHA
 
 KEEPER_GUARANTEE_V1 = ("the sealed items, registrations, claims, ledger and per-item records are held by a separate OS "
                        "user running code the user's account cannot change, and every record is signed; the candidate "
@@ -112,9 +113,9 @@ LIMIT_KEEPER_MODEL_REFERENCE = ("a model reference must content-address its weig
 
 LIMIT_ALPHA_RULE = ("the test level of each attempt is set by alpha-investing (Foster-Stine) over every sealed "
                     "evaluation on this sealed set, from every project that uses it; the guarantee is the marginal "
-                    "false discovery rate (mFDR) at level 0.05 over those attempts, not an error rate per attempt, "
-                    "assuming each test is valid given the earlier outcomes; the sealed items are reused across "
-                    "attempts and only each attempt's status is revealed")
+                    f"false discovery rate (mFDR) at level {TARGET_ALPHA:g} over those attempts, not an error rate "
+                    "per attempt, assuming each test is valid given the earlier outcomes; the sealed items are reused "
+                    "across attempts and only each attempt's status is revealed")
 
 LIMIT_ORACLES = ("the keeper answers some requests about sealed data with counts, and does not limit how often they are "
                  "asked: opening a project is free and a refused intake stores nothing, so anything running as the "

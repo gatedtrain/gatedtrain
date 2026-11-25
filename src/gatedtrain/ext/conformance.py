@@ -22,6 +22,8 @@ import unittest
 from pathlib import PurePosixPath
 from typing import Any
 
+from ..items import DIRECTIONS
+
 # Training row keys every adapter's row carries (MULTIMODAL-SPEC section 6, EXT-79 to EXT-114); the optional ones
 # (`image_interpreters`, `sidecar`, `run_options`, `interpreter_flags`, `b18`, `envs`, `nemo_rl_commit`) are the
 # adapters' that need them.
@@ -33,7 +35,6 @@ EVALUATOR_ROW_KEYS = ("binary", "direction", "env_version", "error_classes", "fr
 SCORER_KEYS = ("name", "version", "weights_sha256", "code_sha256")
 CONSUMPTION_TARGETS = ("row", "iteration", "stage")              # MM-23
 TIERS = ("T0", "T1", "T2", "T3")                                  # 05 section 6.1
-DIRECTIONS = ("higher_is_better", "lower_is_better")
 CONTAINER_PATH_KEYS = ("ro_identity", "ro_under", "rw", "tmpfs")
 COMPLETENESS_KEYS = ("library", "rule", "complete_dir_pattern", "sources", "verified")     # MM-20
 # Attributes and methods ext-launch, ext-arm-fill and ext-collect use without a `hasattr` guard (MM-12).

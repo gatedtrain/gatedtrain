@@ -371,7 +371,7 @@ Log the GPU time.
 Print the exact command (H-5), on the host:
 
 ```sh
-PYTHONPATH=<repo>/src <HOST_VENV>/bin/python -c "import shlex; from gatedtrain.backends.nemo_rl import launch_spec; s = launch_spec({'id': 'rl'}, nemo_rl_dir='/opt/nemo-rl', launcher='docker', out_dir='/work/out/smoke/rl', export_dir='/work/tierb/export', profile='smoke', image='nemo-rl:4f39fd8', work_dir='<HOST_WORK>', hf_cache='<HF_CACHE>', base_model='/work/tierb/base-model'); print(shlex.join(s['argv'])); print('samples_per_position', s['samples_per_position'])"
+PYTHONPATH=<repo>/src <HOST_VENV>/bin/python -c "import shlex; from gatedtrain.backends.nemo_rl import launch_spec; s = launch_spec({'id': 'rl'}, nemo_rl_dir='/opt/nemo-rl', launcher='docker', out_dir='/work/out/smoke/rl', export_dir='/work/tierb/export', profile='smoke', image='nemo-rl:4f39fd8', work_dir='<HOST_WORK>', hf_cache='<HF_CACHE>', cuda_arch='8.9', base_model='/work/tierb/base-model'); print(shlex.join(s['argv'])); print('samples_per_position', s['samples_per_position'])"
 ```
 
 It prints this command and `samples_per_position 4`.

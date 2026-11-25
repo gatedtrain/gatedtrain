@@ -28,16 +28,18 @@ from .. import gates
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
 from ..registration import is_greedy, max_unpaired, min_paired
+from .alpha_investing import TARGET_ALPHA
+from .scorers import PLANNING_SD_BOUND
 from .batch import CRASH, CRASH_FIX, BatchGenerator, BatchRunner, generate_batch
 
 DEFAULT_MDE = 0.10
-DEFAULT_ALPHA = 0.05
+DEFAULT_ALPHA = TARGET_ALPHA        # the test level a sealed evaluation is planned at (one source: alpha_investing)
 DEFAULT_POWER = 0.8
 # Planning SD of the paired per-item difference (candidate minus base) of two 0/1 scores: the bound when the two
 # scores are independent and each has the largest SD of a 0/1 score, 0.5, so sqrt(0.5^2 * 2) (design 05 §18.4;
 # user decision, 2026-11-20). Positively correlated arms have a smaller SD, so the plan does not under-size the
 # sealed part for them.
-PILOT_SIGMA = math.sqrt(0.5)
+PILOT_SIGMA = PLANNING_SD_BOUND       # one source: the library scorers' planning SD, sqrt(0.5)
 PILOT_SOURCE = ("the independence bound for the SD of the paired difference of two 0/1 scores (exact match): "
                 "sqrt(0.5^2 * 2)")
 MAX_SEALED_FRACTION = 0.5

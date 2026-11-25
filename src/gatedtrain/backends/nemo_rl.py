@@ -41,7 +41,7 @@ Launchers:
   recipe has relative paths (grpo_math_1B.yaml:632);
 - `docker`: `docker run` with the documented flags
   (docs/about/installation.md:21-37), `nofile=65535` for Ray (ray.sub:161-182),
-  `TORCH_CUDA_ARCH_LIST=8.9` and `FLASHINFER_CUDA_ARCH_LIST=8.9` because the
+  `TORCH_CUDA_ARCH_LIST` and `FLASHINFER_CUDA_ARCH_LIST` (the caller's `cuda_arch`) because the
   image targets 9.0 and 10.0 (Dockerfile:231), the image's own source at
   `/opt/nemo-rl` with no checkout mounted over it (the fingerprint check,
   nemo_rl/__init__.py:105), and `-w /opt/nemo-rl`;
@@ -61,18 +61,20 @@ from pathlib import Path
 
 import yaml
 
-NEMO_RL_COMMIT = "4f39fd8"
+from ..families.nemo_rl import NEMO_RL_COMMIT_SHORT, NEMO_RL_SRC
+from .. import TAGS  # noqa: F401  (re-exported: the tags of every prototype backend)
+
+NEMO_RL_COMMIT = NEMO_RL_COMMIT_SHORT
 RECIPE = "examples/configs/grpo_smoke.yaml"
 LAUNCH_SCRIPT = "examples/run_grpo.py"
-CONTAINER_SRC = "/opt/nemo-rl"
-TAGS = ("prototype", "unpromotable")
+CONTAINER_SRC = NEMO_RL_SRC
 LAUNCHERS = ("local", "docker", "sbatch")
 
 # Documented defaults for the keywords added in TIER-B-SPEC H-5.
 DEFAULT_PROFILE = "smoke"
-DEFAULT_IMAGE = "nemo-rl:4f39fd8"
-DEFAULT_WORK_DIR = "/data/gatedtrain-tierb"       # host directory mounted at /work by the docker launcher
-DEFAULT_HF_CACHE = "/data/hf-cache"        # host Hugging Face cache mounted at /hf_home
+DEFAULT_IMAGE = f"nemo-rl:{NEMO_RL_COMMIT_SHORT}"
+# No default names a host directory or a GPU: the docker launcher takes `work_dir` and `hf_cache` from the caller, and
+# `cuda_arch` is left out of the command unless given (the toolchain then reads the architecture from the GPU).
 DEFAULT_SHM_SIZE = "32g"                   # keep at or below host RAM (docs/about/installation.md:25 uses 64g)
 
 COMMON_OVERRIDES = (
@@ -120,12 +122,16 @@ def overrides(*, out_dir: str, export_dir: str, profile: str, base_model: str | 
 
 def launch_spec(stage: dict, *, nemo_rl_dir: str, launcher: str, out_dir: str | None = None,
                 export_dir: str = "/work/export", profile: str = DEFAULT_PROFILE, image: str = DEFAULT_IMAGE,
-                work_dir: str = DEFAULT_WORK_DIR, hf_cache: str = DEFAULT_HF_CACHE, base_model: str | None = None,
+                work_dir: str | None = None, hf_cache: str | None = None, base_model: str | None = None,
+                shm_size: str = DEFAULT_SHM_SIZE, cuda_arch: str | None = None,
                 account: str = "<account>", partition: str = "<partition>", time_limit: str = "01:00:00") -> dict:
     """{"argv", "cwd", "samples_per_position"} for one Tier B stage. Never executed by gatedtrain.
 
     `out_dir` defaults to `<nemo_rl_dir>/results/gatedtrain/<stage id>`. For the docker launcher,
-    `out_dir`, `export_dir` and `base_model` are paths inside the container (under /work).
+    `out_dir`, `export_dir` and `base_model` are paths inside the container (under /work); `work_dir` (the host
+    directory mounted at /work) and `hf_cache` (the host Hugging Face cache mounted at /hf_home) are required, since
+    no default can name a directory of the host that runs it; `shm_size` is the container's shared memory and
+    `cuda_arch` the GPU architecture list (for example `8.9`) exported to the build tools, left out when None.
     `base_model` is the spec's `base` directory as the trainer sees it; it becomes
     `policy.model_name` (F-17). Pass it for every gated run. `None`, the default kept for older
     callers, leaves the recipe's `Qwen/Qwen3-0.6B`, and the gate's baseline then is not the
@@ -141,12 +147,17 @@ def launch_spec(stage: dict, *, nemo_rl_dir: str, launcher: str, out_dir: str | 
     if launcher == "local":
         return {"argv": local, "cwd": nemo_rl_dir, "samples_per_position": spp}
     if launcher == "docker":
+        missing = [name for name, value in (("work_dir", work_dir), ("hf_cache", hf_cache)) if not value]
+        if missing:
+            raise ValueError(f"the docker launcher needs {' and '.join(missing)}: the host directories it mounts "
+                             "(a default would name a directory of one particular host)")
         # HF_HUB_OFFLINE=1 (F-22, interim rule G-20): after F-17 the base model (policy.model_name) and the
         # data (export/) are local, so the training container needs no Hub access and must not use it.
         flags = [
-            "--rm", "--runtime=nvidia", "--gpus", "all", f"--shm-size={DEFAULT_SHM_SIZE}",
+            "--rm", "--runtime=nvidia", "--gpus", "all", f"--shm-size={shm_size}",
             "--ulimit", "memlock=-1", "--ulimit", "nofile=65535:65535",
-            "-e", "TORCH_CUDA_ARCH_LIST=8.9", "-e", "FLASHINFER_CUDA_ARCH_LIST=8.9",
+            *(["-e", f"TORCH_CUDA_ARCH_LIST={cuda_arch}", "-e", f"FLASHINFER_CUDA_ARCH_LIST={cuda_arch}"]
+              if cuda_arch else []),
             "-e", "HF_HOME=/hf_home", "-e", "HF_HUB_OFFLINE=1", "-v", f"{hf_cache}:/hf_home", "-v", f"{work_dir}:/work",
             "-w", CONTAINER_SRC,
         ]

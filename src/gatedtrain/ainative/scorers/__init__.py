@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from ...canonical import canonical_json, file_sha256, sha256_bytes
 from ...errors import Problem, Refused
+from ...items import DIRECTIONS
 from . import exact, normalised, numeric, sets
 from .exact import exact_match
 
@@ -36,7 +37,6 @@ __all__ = ["DIRECTION", "EVALUATOR_ID", "PLANNING_SD_BOUND", "ScorerSpec", "bind
 
 EVALUATOR_ID = "exact_match.ainative@0.1"
 DIRECTION = "higher_is_better"
-DIRECTIONS = ("higher_is_better", "lower_is_better")
 PLANNING_SD_BOUND = math.sqrt(0.5)
 LIBRARY_SOURCE = "library"
 PACK_KEYS = frozenset({"id", "fn", "code_sha256", "planning_sd", "direction", "range", "what", "unit"})
