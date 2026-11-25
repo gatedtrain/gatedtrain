@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+# The revision of the design set the tests read (GATEDTRAIN_DESIGN_DIR).
+env:
+  DESIGN_REVISION: rev-28
+
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -24,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
       # The design revision this version implements (docs/development.md "Design references"), outside the checkout.
-      - run: git clone --quiet --depth 1 --branch rev-27 https://github.com/gatedtrain/gatedtrain-design "$RUNNER_TEMP/gatedtrain-design"
+      - run: git clone --quiet --depth 1 --branch "$DESIGN_REVISION" https://github.com/gatedtrain/gatedtrain-design "$RUNNER_TEMP/gatedtrain-design"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}

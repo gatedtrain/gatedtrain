@@ -122,6 +122,18 @@ def _same_user_executable(value: str, scope: str) -> None:
     setup_user._executable_path(value)
 
 
+def _keeper_eval_python(value: str, scope: str) -> None:
+    setup.check_eval_python(value, "keeper_eval_python")
+
+
+def _gpu_wait(value: Any, scope: str) -> None:
+    setup.check_gpu_wait(value, "wait_s")
+
+
+def _gpu_busy(value: Any, scope: str) -> None:
+    setup.check_gpu_busy(value, "busy_mib")
+
+
 def _image(value: str, scope: str) -> None:
     hostsetup.check_inference_ref(value)
 
@@ -185,13 +197,13 @@ LAYOUT_KEYS: tuple[Key, ...] = (
     Key("inference", "eval_trees", "list", _tree, {SEPARATE: "--eval-tree", SAME: "--eval-tree"},
         "root-owned eval trees printed into ExecStart= (the flag needs --inference-image)",
         placeholder='["DIR"]'),
-    Key("inference", "keeper_eval_python", "str", None, {SEPARATE: "--eval-python", SAME: "--eval-python"},
-        "the eval venv's python that replaces the one a pack declares (keeper serve option)", placeholder='"PATH"',
-        supported=False),
-    Key("gpu", "wait_s", "number", None, {SEPARATE: "--gpu-wait-s", SAME: "--gpu-wait-s"},
-        "seconds to wait for a free GPU before a GPU generator is refused", placeholder="N", supported=False),
-    Key("gpu", "busy_mib", "int", None, {SEPARATE: "--gpu-busy-mib", SAME: "--gpu-busy-mib"},
-        "GPU memory in use (MiB) that still counts as a free GPU", placeholder="N", supported=False),
+    Key("inference", "keeper_eval_python", "str", _keeper_eval_python, {SEPARATE: "--eval-python", SAME: "--eval-python"},
+        "the eval venv's python that replaces the one a pack declares (keeper serve option; needs image)",
+        placeholder='"PATH"'),
+    Key("gpu", "wait_s", "number", _gpu_wait, {SEPARATE: "--gpu-wait-s", SAME: "--gpu-wait-s"},
+        "seconds to wait for a free GPU before a GPU generator is refused (needs image)", placeholder="N"),
+    Key("gpu", "busy_mib", "int", _gpu_busy, {SEPARATE: "--gpu-busy-mib", SAME: "--gpu-busy-mib"},
+        "GPU memory in use (MiB) that still counts as a free GPU (needs image)", placeholder="N"),
 )
 
 

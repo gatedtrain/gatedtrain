@@ -279,13 +279,13 @@ class TestImplementationEmitsPinnedKeys(unittest.TestCase):
         for profile in ("smoke", "long"):
             argv = launch_spec(stage, nemo_rl_dir=a["nemo_rl_dir"], launcher="local", out_dir=a["out_dir"],
                                export_dir=a["export_dir"], profile=profile, image=a["image"], work_dir=a["work_dir"],
-                               hf_cache=a["hf_cache"], base_model=a["base_model"])["argv"]
+                               hf_cache=a["hf_cache"], cuda_arch=a["cuda_arch"], base_model=a["base_model"])["argv"]
             overrides = [x for x in argv if "=" in x and not x.startswith("-")]
             self.assertTrue(overrides)
             check_overrides(self, overrides)
         docker = launch_spec(stage, nemo_rl_dir=a["nemo_rl_dir"], launcher="docker", out_dir=a["out_dir"],
                              export_dir=a["export_dir"], profile="smoke", image=a["image"], work_dir=a["work_dir"],
-                             hf_cache=a["hf_cache"], base_model=a["base_model"])["argv"]
+                             hf_cache=a["hf_cache"], cuda_arch=a["cuda_arch"], base_model=a["base_model"])["argv"]
         check_docker(self, docker[:docker.index(a["image"])])
 
     def test_nel_config_keys(self):

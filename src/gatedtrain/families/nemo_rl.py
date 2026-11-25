@@ -41,12 +41,14 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+NEMO_RL_COMMIT_SHORT = NEMO_RL_COMMIT[:7]                     # how tags and records name it
+NEMO_RL_SRC = "/opt/nemo-rl"                                  # NeMo RL's source tree inside its image (the cwd)
 NEMO_RL_PYTHON = "/opt/nemo_rl_venv/bin/python"               # nemo-rl docker/Dockerfile:227, :621
 VLLM_WORKER_PYTHON = "/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker/bin/python"
 # NeMo RL in the Tier B image (docs/tier-b-runbook.md step 6): Ray's object store needs a larger /dev/shm than the
 # default 8g, NeMo RL's locked memory and open files, its source tree as cwd.
 NEMO_RL_RUN_OPTIONS = ("--shm-size=16g", "--ulimit", "memlock=-1", "--ulimit", "nofile=65535:65535", "-w",
-                       "/opt/nemo-rl")
+                       NEMO_RL_SRC)
 
 # Output layout: the recipes' cut writers publish cuts/checkpoint-<N>/ (cut.json last) after NeMo RL saves step_<N>;
 # NeMo RL's own logs lie under nemo/logs/exp_<n>/ with one train_data_step<N>.jsonl per step.

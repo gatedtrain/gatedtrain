@@ -37,6 +37,7 @@ from ..ext import launch
 from .keeper import protocol, setup
 
 RULE = "AN-20"
+RUN = launch.RUN_USER_DIR           # the owners' and the keeper's runtime directories: `<RUN>/<uid>`
 DEFAULT_HANDOFF = "/srv/gatedtrain/out"
 DEFAULT_OWNER_DATA_ROOT = "/srv/gatedtrain/docker"
 DEFAULT_KEEPER_HOME = "/var/lib/gatedtrain-keeper-home"
@@ -183,8 +184,8 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
     p = {k: str(v) for k, v in paths.items()}
     khome, kroot, oroot, handoff, venv = (p["--keeper-home"], p["--keeper-data-root"], p["--owner-data-root"],
                                           p["--handoff"], p["--eval-venv"])
-    owner_sock = f"unix:///run/user/{owner_uid}/docker.sock"
-    keeper_sock = "unix:///run/user/$KUID/docker.sock"
+    owner_sock = launch.rootless_docker_host(owner_uid)
+    keeper_sock = launch.rootless_docker_host("$KUID")
     handoff_parent = str(PurePosixPath(handoff).parent)
     parents = [str(PurePosixPath(p[f]).parent) for f in ("--keeper-home", "--keeper-data-root", "--owner-data-root",
                                                           "--handoff")]
@@ -362,10 +363,10 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "fi",
         'loginctl enable-linger "$OWNER" "$KEEPER"',
         'systemctl start "user@$OWNER_UID.service" "user@$KUID.service"',
-        'as_owner() { runuser -u "$OWNER" -- env HOME="$OWNER_HOME" XDG_RUNTIME_DIR=/run/user/$OWNER_UID '
-        'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$OWNER_UID/bus "$@"; }',
-        f'as_keeper() {{ runuser -u "$KEEPER" -- env HOME={q(khome)} XDG_RUNTIME_DIR=/run/user/$KUID '
-        'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$KUID/bus "$@"; }',
+        'as_owner() { runuser -u "$OWNER" -- env HOME="$OWNER_HOME" '
+        f'XDG_RUNTIME_DIR={RUN}/$OWNER_UID DBUS_SESSION_BUS_ADDRESS=unix:path={RUN}/$OWNER_UID/bus "$@"; }}',
+        f'as_keeper() {{ runuser -u "$KEEPER" -- env HOME={q(khome)} XDG_RUNTIME_DIR={RUN}/$KUID '
+        f'DBUS_SESSION_BUS_ADDRESS=unix:path={RUN}/$KUID/bus "$@"; }}',
     ]
     for who, home, root in (("owner", '"$OWNER_HOME"', oroot), ("keeper", q(khome), kroot)):
         cfg = f"{home}/.config/docker"
@@ -412,7 +413,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
     if inference_ref is not None:
         serve = setup.serve_argv(PurePosixPath(p["--venv"]), PurePosixPath(p["--state"]),
                                  PurePosixPath(p["--socket"]), owner_uid, inference_image="${IMG}",
-                                 eval_trees=trees, docker_host="unix:///run/user/${KUID}/docker.sock")
+                                 eval_trees=trees, docker_host=launch.rootless_docker_host("${KUID}"))
         L += [
             "# the keeper's daemon pulls the inference image; the keeper runs only its ID",
             f"as_keeper env DOCKER_HOST={keeper_sock} docker pull {q(inference_ref)}",

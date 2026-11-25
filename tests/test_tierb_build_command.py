@@ -39,7 +39,7 @@ def spec(launcher: str, profile: str) -> dict:
 
     return launch_spec(STAGE, nemo_rl_dir=ARGS["nemo_rl_dir"], launcher=launcher, out_dir=ARGS["out_dir"],
                        export_dir=ARGS["export_dir"], profile=profile, image=ARGS["image"],
-                       work_dir=ARGS["work_dir"], hf_cache=ARGS["hf_cache"], base_model=ARGS["base_model"])
+                       work_dir=ARGS["work_dir"], hf_cache=ARGS["hf_cache"], cuda_arch=ARGS["cuda_arch"], base_model=ARGS["base_model"])
 
 
 def split_program(argv: list[str], program_head: list[str]) -> tuple[list[str], list[str], list[str]]:
@@ -68,7 +68,7 @@ class TestLocalLauncher(unittest.TestCase):
 
         argv = build_command(STAGE, nemo_rl_dir=ARGS["nemo_rl_dir"], launcher="local", out_dir=ARGS["out_dir"],
                              export_dir=ARGS["export_dir"], profile="long", image=ARGS["image"],
-                             work_dir=ARGS["work_dir"], hf_cache=ARGS["hf_cache"], base_model=ARGS["base_model"])
+                             work_dir=ARGS["work_dir"], hf_cache=ARGS["hf_cache"], cuda_arch=ARGS["cuda_arch"], base_model=ARGS["base_model"])
         self.assertEqual(argv, spec("local", "long")["argv"])
 
 
@@ -141,7 +141,7 @@ class TestBaseModelPassThrough(unittest.TestCase):
                         s = launch_spec(STAGE, nemo_rl_dir=ARGS["nemo_rl_dir"], launcher=launcher,
                                         out_dir=ARGS["out_dir"], export_dir=ARGS["export_dir"], profile=profile,
                                         image=ARGS["image"], work_dir=ARGS["work_dir"], hf_cache=ARGS["hf_cache"],
-                                        base_model=path)
+                                        cuda_arch=ARGS["cuda_arch"], base_model=path)
                         argv = s["argv"]
                         if launcher == "sbatch":
                             export = [a for a in argv if a.startswith("--export=")][0]

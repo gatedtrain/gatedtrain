@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as _dt
 import fnmatch
 import json
+import math
 import os
 import posixpath
 import re
@@ -101,6 +102,20 @@ HOST_FILE_LIST_KEYS = ("extra_daemon_configs", "extra_daemon_sockets")
 # Optional host file booleans: `rootless` (EXT-263), the launch rules of a host whose containers run on the owner's
 # rootless Docker daemon. No environment variable overrides it.
 HOST_FILE_BOOL_KEYS = ("rootless",)
+# Optional host file numbers, above zero and finite, owner-side: the smoke GPU-memory bound in GB (10^9 bytes) and the
+# GPU-hour ceiling passed to gpu-step.sh. Unset, the defaults below apply. No environment variable sets them; a value
+# enters `host_config_sha256` (so the launch record binds it) only when the file sets it.
+HOST_FILE_NUMBER_KEYS = ("gpu_mem_limit_gb", "gpu_cap_h")
+GPU_MEM_LIMIT_GB = 22.5          # the smoke bound for a 24 GB card (EXT-29); the host file's `gpu_mem_limit_gb` replaces it
+# Optional host file paths and path lists that used to be settable only by `GATEDTRAIN_EXT_*` variables: the layout the
+# launch rules check against (EXT-79, EXT-112, EXT-113).
+HOST_FILE_PATH_KEYS = ("interpreter", "mirror_root")
+HOST_FILE_PATHLIST_KEYS = ("input_roots", "interpreter_trees")
+# Optional host file table `[packs.<pack name>]`: the settings a scenario pack asks the owner for, each an absolute path
+# (for example `runtime_dir`). A pack names its own settings; the host file only validates their shape.
+HOST_FILE_PACKS_KEY = "packs"
+_PACK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_PACK_KEY = re.compile(r"[a-z][a-z0-9_]*")
 OUTPUT_ROOT_TOKEN = "{output_root}"      # a registry row's prefix for a directory under the output root
 # The adapter supplies input roots unless GATEDTRAIN_EXT_INPUT_ROOTS is set (EXT-79).
 ENV_PREFIX = "GATEDTRAIN_EXT_"
@@ -111,6 +126,12 @@ ENV_INPUT_ROOTS = "GATEDTRAIN_EXT_INPUT_ROOTS"         # os.pathsep-separated
 ENV_MIRROR_ROOT = "GATEDTRAIN_EXT_MIRROR_ROOT"
 ENV_INTERPRETER = "GATEDTRAIN_EXT_INTERPRETER"
 ENV_INTERPRETER_TREES = "GATEDTRAIN_EXT_INTERPRETER_TREES"   # os.pathsep-separated
+# The variables above are a temporary workaround, not the design: each has a host file key (below), and a variable that
+# is set prints a deprecation line naming it. They go away in `ENV_REMOVED_IN`; set the file key instead.
+ENV_REMOVED_IN = "0.9.0"
+ENV_TO_FILE_KEY = {ENV_HOST_WORK: "host_work", ENV_OUTPUT_ROOT: "output_root", ENV_INPUT_ROOTS: "input_roots",
+                   ENV_INTERPRETER_TREES: "interpreter_trees", ENV_INTERPRETER: "interpreter",
+                   ENV_MIRROR_ROOT: "mirror_root"}
 # Protect system directories from mounts that would shadow the image's files.
 # A read-only identity mount under a configured input root can preserve its host path (EXT-112).
 SYSTEM_CONTAINER_DIRS = ("/etc", "/usr", "/bin", "/sbin", "/opt", "/proc", "/sys", "/dev", "/run", "/var", "/root",
@@ -132,7 +153,8 @@ ROOTLESS_USER = "0:0"
 # The owner's runtime directories; a rootless daemon's socket is `<RUN_USER_DIR>/<uid>/docker.sock` (EXT-263).
 RUN_USER_DIR = "/run/user"
 ROOTLESS_SOCKET = "docker.sock"
-SHM_SIZE = "--shm-size=8g"            # must stay at or below host RAM
+SHM_SIZE_VALUE = "8g"               # the shared memory of a container; must stay at or below host RAM
+SHM_SIZE = f"--shm-size={SHM_SIZE_VALUE}"
 TMPFS_OPTIONS = "rw,exec,nosuid,nodev,size=8g"   # MM-34: Triton and torch.compile load compiled objects from /tmp
                                                  # (Docker's default is noexec); TRL recipe README
 # Scan read-only inputs by NFKC-normalized, case-folded name (EXT-80, EXT-93).
@@ -206,6 +228,20 @@ class HostConfig:
     # EXT-263: the host file's `rootless`; the owner whose rootless daemon runs the containers (None: this process's uid).
     rootless: bool = False
     owner_uid: int | None = None
+    # The host file's owner-side numbers (None: the defaults GPU_MEM_LIMIT_GB and GPU_CAP_H) and pack settings.
+    gpu_mem_limit_gb: float | None = None
+    gpu_cap_h: float | None = None
+    packs: Mapping[str, Mapping[str, str]] | None = None
+
+
+def gpu_mem_limit_gb(cfg: HostConfig) -> float:
+    """The smoke GPU-memory bound of this host: its file's `gpu_mem_limit_gb`, else `GPU_MEM_LIMIT_GB`."""
+    return GPU_MEM_LIMIT_GB if cfg.gpu_mem_limit_gb is None else cfg.gpu_mem_limit_gb
+
+
+def gpu_cap_h(cfg: HostConfig) -> float:
+    """The GPU-hour ceiling of this host: its file's `gpu_cap_h`, else `GPU_CAP_H`."""
+    return GPU_CAP_H if cfg.gpu_cap_h is None else cfg.gpu_cap_h
 
 
 def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -224,12 +260,19 @@ def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         doc = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise Refused([Problem("EXT-HOST", str(path), f"does not parse ({exc.__class__.__name__})", fix)])
-    known = HOST_FILE_KEYS + HOST_FILE_LIST_KEYS + HOST_FILE_BOOL_KEYS
+    known = (HOST_FILE_KEYS + HOST_FILE_LIST_KEYS + HOST_FILE_BOOL_KEYS + HOST_FILE_NUMBER_KEYS + HOST_FILE_PATH_KEYS
+             + HOST_FILE_PATHLIST_KEYS + (HOST_FILE_PACKS_KEY,))
     bad = sorted(set(doc) - set(known))
     if bad:
         raise Refused([Problem("EXT-HOST", str(path), f"has keys {bad} besides {list(known)}", fix)])
     for k, v in doc.items():
-        if k in HOST_FILE_LIST_KEYS:
+        if k in HOST_FILE_NUMBER_KEYS:
+            if not _positive_number(v):
+                raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not a number above 0",
+                                       f"write `{k}` in {path} as a TOML number above zero, for example `{k} = 22.5`")])
+        elif k == HOST_FILE_PACKS_KEY:
+            _check_packs(v, path)
+        elif k in HOST_FILE_LIST_KEYS or k in HOST_FILE_PATHLIST_KEYS:
             if not (isinstance(v, list) and all(isinstance(x, str) and PurePosixPath(x).is_absolute() for x in v)):
                 raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not a list of absolute paths",
                                        f"write `{k}` in {path} as a TOML array of absolute paths")])
@@ -242,6 +285,51 @@ def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     return dict(doc)
 
 
+def _positive_number(v: Any) -> bool:
+    """A finite number above 0 (not a bool; an integer too large for a float is not finite enough)."""
+    try:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+    except OverflowError:
+        return False
+
+
+def _check_packs(value: Any, path: Path) -> None:
+    """The `[packs.<name>]` tables: names and keys of plain words, values absolute paths; Refused (EXT-HOST) otherwise."""
+    fix = f"write `[packs.<pack name>]` tables in {path} whose values are absolute paths"
+    if not isinstance(value, dict):
+        raise Refused([Problem("EXT-HOST", f"{path}.packs", f"{value!r} is not a table of pack tables", fix)])
+    for name, table in value.items():
+        if not (_PACK_NAME.fullmatch(name) and isinstance(table, dict)):
+            raise Refused([Problem("EXT-HOST", f"{path}.packs.{name}", "is not a table named by a plain pack name", fix)])
+        for key, v in table.items():
+            if not (_PACK_KEY.fullmatch(key) and isinstance(v, str) and PurePosixPath(v).is_absolute()):
+                raise Refused([Problem("EXT-HOST", f"{path}.packs.{name}.{key}",
+                                       f"{v!r} is not an absolute path under a plain key", fix)])
+
+
+def owner_gpu_mem_limit_gb(environ: Mapping[str, str] | None = None) -> float:
+    """The smoke GPU-memory bound the owner's host file sets (`gpu_mem_limit_gb`), else `GPU_MEM_LIMIT_GB`; it needs no
+    host layout, so a stage can ask for it where no launch is configured. A scenario pack takes this as the ceiling of
+    any bound a pipeline asks for. Refused (EXT-HOST) when the file is malformed."""
+    value = host_file(environ).get("gpu_mem_limit_gb")
+    return GPU_MEM_LIMIT_GB if value is None else value
+
+
+def owner_gpu_bounds(environ: Mapping[str, str] | None = None) -> dict[str, float]:
+    """The smoke bounds the owner's host file sets, as `smoke_problems` keywords (`gpu_mem_limit_gb`, `gpu_cap_h`; each
+    the default when the file does not set it). They need no host layout. Refused (EXT-HOST) when the file is malformed:
+    a bad file is never read as the defaults."""
+    doc = host_file(environ)
+    return {"gpu_mem_limit_gb": doc.get("gpu_mem_limit_gb", GPU_MEM_LIMIT_GB), "gpu_cap_h": doc.get("gpu_cap_h", GPU_CAP_H)}
+
+
+def pack_setting(pack: str, key: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """The owner's setting `key` of the scenario pack `pack` from the host file's `[packs.<pack>]` table (an absolute
+    path), or None when the file, the table or the key is missing. Refused (EXT-HOST) when the file is malformed."""
+    table = (host_file(environ).get(HOST_FILE_PACKS_KEY) or {}).get(pack) or {}
+    return table.get(key)
+
+
 def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
     """The host file's layout, or the `GATEDTRAIN_EXT_HOST_WORK`, `GATEDTRAIN_EXT_OUTPUT_ROOT` and
     `GATEDTRAIN_EXT_INPUT_ROOTS` overrides (tests; another host). Without the input-roots override the adapter's roots
@@ -249,9 +337,10 @@ def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
     daemon lists apply under the overrides too: they only add refusals. `rootless` comes from the host file only
     (EXT-263)."""
     env = os.environ if environ is None else environ
-    roots = tuple(r for r in env.get(ENV_INPUT_ROOTS, "").split(os.pathsep) if r)
-    trees = tuple(r for r in env.get(ENV_INTERPRETER_TREES, "").split(os.pathsep) if r)      # EXT-113
     file = host_file(env)
+    roots = tuple(r for r in env.get(ENV_INPUT_ROOTS, "").split(os.pathsep) if r) or tuple(file.get("input_roots", ()))
+    trees = (tuple(r for r in env.get(ENV_INTERPRETER_TREES, "").split(os.pathsep) if r)
+             or tuple(file.get("interpreter_trees", ())))                                    # EXT-113
     layout = {"host_work": env.get(ENV_HOST_WORK) or file.get("host_work"),
               "output_root": env.get(ENV_OUTPUT_ROOT) or file.get("output_root")}
     missing = [k for k, v in layout.items() if not v]
@@ -262,10 +351,12 @@ def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
                        for k in missing])
     return HostConfig(host_work=layout["host_work"], output_root=layout["output_root"],
                       input_roots=roots or None, interpreter_trees=trees or None,
-                      interpreter=env.get(ENV_INTERPRETER) or None, mirror_root=env.get(ENV_MIRROR_ROOT) or None,
+                      interpreter=env.get(ENV_INTERPRETER) or file.get("interpreter"),
+                      mirror_root=env.get(ENV_MIRROR_ROOT) or file.get("mirror_root"),
                       extra_daemon_configs=tuple(file.get("extra_daemon_configs", ())),
                       extra_daemon_sockets=tuple(file.get("extra_daemon_sockets", ())),
-                      rootless=file.get("rootless", False))
+                      rootless=file.get("rootless", False), gpu_mem_limit_gb=file.get("gpu_mem_limit_gb"),
+                      gpu_cap_h=file.get("gpu_cap_h"), packs=file.get(HOST_FILE_PACKS_KEY))
 
 
 def adapter_config(cfg: HostConfig, adapter: str) -> HostConfig:
@@ -309,6 +400,11 @@ def host_config_sha256(cfg: HostConfig) -> str:
             doc[k] = list(getattr(cfg, k))
     if cfg.rootless:
         doc["rootless"] = True
+    for k in HOST_FILE_NUMBER_KEYS:                       # owner-side numbers: bound only when the file sets them
+        if getattr(cfg, k) is not None:
+            doc[k] = getattr(cfg, k)
+    if cfg.packs:
+        doc["packs"] = {name: dict(table) for name, table in sorted(cfg.packs.items())}
     return sha256_bytes(canonical_json(doc))
 
 
@@ -316,8 +412,15 @@ def override_warnings(environ: Mapping[str, str] | None = None) -> list[str]:
     """EXT-85: one stderr line per `GATEDTRAIN_EXT_*` variable set: each loosens or moves the host layout the
     rules check against."""
     env = os.environ if environ is None else environ
-    return [f"warning: {name} overrides the host layout ({env[name]}); the launch record's host_config_sha256 "
-            "binds the layout it was written under (EXT-85)" for name in sorted(env) if name.startswith(ENV_PREFIX)]
+    def line(name: str) -> str:
+        text = (f"warning: {name} overrides the host layout ({env[name]}); the launch record's host_config_sha256 "
+                "binds the layout it was written under (EXT-85)")
+        if name in ENV_TO_FILE_KEY:
+            text += (f". The variable is deprecated: set `{ENV_TO_FILE_KEY[name]}` in the host file instead; it is "
+                     f"removed in {ENV_REMOVED_IN}")
+        return text
+
+    return [line(name) for name in sorted(env) if name.startswith(ENV_PREFIX)]
 
 
 def passwd_gid(uid: int) -> int | None:
@@ -437,6 +540,13 @@ def container_user(cfg: HostConfig) -> str:
     if gid is None:
         raise ValueError(f"uid {uid} is not a user of this host")
     return f"{uid}:{gid}"
+
+
+def rootless_docker_host(uid: int | str, *, run_user_dir: str | None = None) -> str:
+    """The `unix://` address of the rootless Docker daemon of `uid` (a number, or the shell variable a generated script
+    names it by): `<run_user_dir>/<uid>/docker.sock`. Only a number or a literal shell variable belongs here: the value is
+    not quoted."""
+    return "unix://" + posixpath.join(RUN_USER_DIR if run_user_dir is None else run_user_dir, str(uid), ROOTLESS_SOCKET)
 
 
 def rootless_socket(cfg: HostConfig, *, run_user_dir: str | None = None) -> str:
@@ -1833,7 +1943,7 @@ def _g(x: float) -> str:
     return "%g" % x
 
 
-def build_command(record: dict, env: dict[str, str], *, est_h: float) -> str:
+def build_command(record: dict, env: dict[str, str], *, est_h: float, gpu_cap_h: float = GPU_CAP_H) -> str:
     """The gpu-step.sh command (EXT-24): tokens shell-quoted, env sorted by name, mounts in record order;
     `--runtime=nvidia` before `--gpus all`, `--shm-size=8g` after the security options, and each tmpfs path
     mounted with TMPFS_OPTIONS.
@@ -1854,7 +1964,7 @@ def build_command(record: dict, env: dict[str, str], *, est_h: float) -> str:
               if len(record["argv"]) > 1 else "")
     b18 = registry.b18(adapter)
     if b18 and script in b18["scripts"]:                                      # EXT-199: run-executor.sh's layout
-        tok = [f"GATEDTRAIN_GPU_CAP_H={_g(GPU_CAP_H)}", f"GATEDTRAIN_GPU_USED_H={_g(record['gpu_used_h'])}",
+        tok = [f"GATEDTRAIN_GPU_CAP_H={_g(gpu_cap_h)}", f"GATEDTRAIN_GPU_USED_H={_g(record['gpu_used_h'])}",
                f"GATEDTRAIN_GPU_STEP_EST_H={_g(est_h)}", f"{record['host_work'].rstrip('/')}/bin/gpu-step.sh",
                value(record["label"]), "--rm", "--network", value(record["network"]), "--user", value(record["user"]),
                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only"]
@@ -1870,7 +1980,7 @@ def build_command(record: dict, env: dict[str, str], *, est_h: float) -> str:
         return " ".join(shlex.quote(t) for t in tok)
     options, tmpfs_options = registry.run_options(adapter, script)
     shm = [o for o in options if o.startswith("--shm-size=")]
-    tok = [f"GATEDTRAIN_GPU_CAP_H={_g(GPU_CAP_H)}", f"GATEDTRAIN_GPU_USED_H={_g(record['gpu_used_h'])}",
+    tok = [f"GATEDTRAIN_GPU_CAP_H={_g(gpu_cap_h)}", f"GATEDTRAIN_GPU_USED_H={_g(record['gpu_used_h'])}",
            f"GATEDTRAIN_GPU_STEP_EST_H={_g(est_h)}", f"{record['host_work'].rstrip('/')}/bin/gpu-step.sh",
            value(record["label"]), "--rm"]
     if record["gpus"]:
@@ -2065,7 +2175,8 @@ def ext_launch(*, adapter: str, profile: str, request: Path, gpu_log: Path, out_
             row = registry.EVALUATOR_ROWS[ad.evaluator_ids[0]]
             why = smoke_problems(smoke, adapter=adapter, score_range=row["score_range"], binary=row["binary"],
                                  direction=row.get("direction"),
-                                 evaluators=_clause_evaluators(spec) if spec is not None else None)
+                                 evaluators=_clause_evaluators(spec) if spec is not None else None,
+                                 gpu_mem_limit_gb=gpu_mem_limit_gb(cfg), gpu_cap_h=gpu_cap_h(cfg))
             for msg in why:
                 problems.append(Problem("EXT-SMOKE", "--smoke-record", msg,
                                         "fix the cause and repeat the smoke run; a FAIL stops the area (MM-39)"))
@@ -2117,7 +2228,7 @@ def ext_launch(*, adapter: str, profile: str, request: Path, gpu_log: Path, out_
     if cfg.rootless:                                     # EXT-263: only on a rootless host (rootful records unchanged)
         record["rootless"] = True
     record["label"] = launch_label(record)               # EXT-46: one label per launch record
-    command = build_command(record, req["env"], est_h=est)
+    command = build_command(record, req["env"], est_h=est, gpu_cap_h=gpu_cap_h(cfg))
     if side is not None:                                 # EXT-190: sidecar first, trainer, then stop the sidecar
         start, stop = sidecar_commands(record["sidecar"], side["env"], cfg.sidecar, sidecar_name(record, cfg.sidecar))
         command = "\n".join((start, command, stop))

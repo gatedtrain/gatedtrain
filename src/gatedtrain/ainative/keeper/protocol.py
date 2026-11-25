@@ -9,10 +9,11 @@ and ledger envelopes in `result` alongside `ok: false`; the client raises `Refus
 holding them, so the driver logs the spend.
 
 Client deadlines: the keeper serves one connection at a time, and a client's deadline starts before it connects. The
-ops that split, score or gate (`LONG_OPS`: intake of up to 64 MiB, evaluate, gate, report) get `LONG_OP_TIMEOUT_S`,
-3900 s: a sealed evaluation of a batch generator waits for the GPU (at most 900 s) and runs one container per arm (at
-most the generator's time limit each), and the keeper refuses before the grant a generator whose time limit would not
-fit (900 s + 2 time limits + 600 s); every other op keeps `SOCKET_TIMEOUT_S`. A client that
+ops that split, score or gate (`LONG_OPS`: intake of a data file of up to `limits.MAX_DATA_BYTES`, evaluate, gate,
+report) get `LONG_OP_TIMEOUT_S`: a sealed evaluation of a batch generator waits for the GPU (at most `GPU_WAIT_S`) and
+runs one container per arm (at most the generator's time limit each), and the keeper refuses before the grant a
+generator whose time limit would not fit (`GPU_WAIT_S` + 2 time limits + `EVAL_SLACK_S`); every other op keeps
+`SOCKET_TIMEOUT_S`. A client that
 gives up while its request waits behind another is not served: the keeper drops a request whose peer has already
 closed. A client that gives up during its own evaluation can send the identical request again and gets the stored
 claim.
@@ -32,12 +33,15 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ...errors import Problem, Refused
+from ..batch import MAX_GENERATOR_TIME_LIMIT_S, evaluation_wait_bound
+from ..limits import MAX_DATA_TEXT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES
+from ..runtime import GPU_WAIT_S
 
-MAX_REQUEST_BYTES = 96 * 1024 * 1024          # a 64 MiB data file in base64 plus the envelope
-MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 SOCKET_TIMEOUT_S = 60.0
 LONG_OPS = frozenset({"intake", "evaluate", "gate", "report"})
-LONG_OP_TIMEOUT_S = 3900.0      # >= a batch evaluation: GPU wait 900 s + 2 x 1200 s time limits + 600 s (AN-25)
+# A batch evaluation (AN-25): the wait for the GPU, one container per arm for at most the generator's time limit each, and
+# the slack the keeper adds; 3900 s with the current limits (pinned by tests/test_single_source.py).
+LONG_OP_TIMEOUT_S = float(evaluation_wait_bound(GPU_WAIT_S, MAX_GENERATOR_TIME_LIMIT_S))
 MAX_SOCKET_PATH = 107                         # sun_path is 108 bytes including the terminating NUL
 
 RULE = "AN-12"
@@ -79,7 +83,7 @@ def read_line(sock: socket.socket, cap: int, *, deadline: float | None = None) -
         buf += chunk if nl < 0 else chunk[:nl]
         if len(buf) > cap:
             raise refused("request", f"the line is longer than the cap of {cap} bytes",
-                          "send a smaller request (a data file of at most 64 MiB)")
+                          f"send a smaller request (a data file of at most {MAX_DATA_TEXT})")
         if nl >= 0:
             return bytes(buf)
 
@@ -214,7 +218,7 @@ class KeeperClient:
         line = encode_request(op, project, args)
         if len(line) - 1 > MAX_REQUEST_BYTES:
             raise refused("request", f"the request is longer than the cap of {MAX_REQUEST_BYTES} bytes",
-                          "send a smaller request (a data file of at most 64 MiB)")
+                          f"send a smaller request (a data file of at most {MAX_DATA_TEXT})")
         timeout = self.timeout_for(op)
         deadline = time.monotonic() + timeout
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

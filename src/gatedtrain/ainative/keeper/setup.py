@@ -17,12 +17,15 @@ unit's `ExecStart=` would not pass it through unchanged.
 from __future__ import annotations
 
 import importlib.metadata
+import math
 import re
 import shlex
 from pathlib import PurePosixPath
+from typing import Any
 
 from ... import __version__
 from ...errors import Problem, Refused
+from ..runtime import MAX_GPU_BUSY_MIB
 from . import protocol
 
 RULE = "AN-19"
@@ -88,9 +91,11 @@ def _absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
 
 def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath, owner_uid: int, *,
                inference_image: str | None = None, eval_trees: list[str] | tuple[str, ...] = (),
-               docker_host: str | None = None) -> list[str]:
+               docker_host: str | None = None, gpu_wait_s: float | None = None, gpu_busy_mib: int | None = None,
+               eval_python: str | None = None) -> list[str]:
     """The keeper's `serve` command as argv, the one source of the unit's `ExecStart=` (here) and of the inference
-    drop-in `gatedtrain setup host` prints. The caller has validated every value."""
+    drop-in `gatedtrain setup host` prints. The caller has validated every value. The GPU and eval-interpreter options
+    (AN-23, AN-25) are printed only when given."""
     argv = [str(venv / "bin" / "gatedtrain"), "keeper", "serve", "--state", str(state), "--socket", str(socket),
             "--owner-uid", str(owner_uid)]
     if inference_image is not None:
@@ -99,6 +104,12 @@ def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath,
         argv += ["--eval-tree", str(tree)]
     if docker_host is not None:
         argv += ["--docker-host", docker_host]
+    if gpu_wait_s is not None:
+        argv += ["--gpu-wait-s", f"{gpu_wait_s:g}"]
+    if gpu_busy_mib is not None:
+        argv += ["--gpu-busy-mib", str(gpu_busy_mib)]
+    if eval_python is not None:
+        argv += ["--eval-python", eval_python]
     return argv
 
 
@@ -156,10 +167,57 @@ def _inference_options(inference_image: str | None, eval_trees: list[str] | None
     return inference_image, trees, docker_host
 
 
+def check_gpu_wait(value: Any, field: str = "--gpu-wait-s") -> None:
+    """Refused (AN-19) unless `value` is a finite number of seconds above 0."""
+    try:
+        bad = isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+    except OverflowError:                                  # an integer too large for a float
+        bad = True
+    if bad:
+        raise _refuse(field, "the GPU wait is not a number of seconds above 0", "pass seconds, such as 900")
+
+
+def check_gpu_busy(value: Any, field: str = "--gpu-busy-mib") -> None:
+    """Refused (AN-19) unless `value` is a whole number of MiB from 0 to `MAX_GPU_BUSY_MIB`."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_GPU_BUSY_MIB:
+        raise _refuse(field, f"the busy threshold is not a whole number of MiB from 0 to {MAX_GPU_BUSY_MIB}",
+                      "pass MiB, such as 1024")
+
+
+def check_eval_python(value: Any, field: str = "--eval-python") -> None:
+    """Refused (AN-19) unless `value` is an absolute path a unit can carry (no space, `:`, `,` or systemd character)."""
+    if not isinstance(value, str):
+        raise _refuse(field, "the interpreter path is not a string", "pass an absolute path")
+    _absolute(field, value)
+    if any(c in value for c in ":, ") or _UNIT_UNSAFE.search(value):
+        raise _refuse(field, "the interpreter path holds a space, `:`, `,` or a character systemd rewrites",
+                      "pass a path of letters, digits, `/`, `.`, `_` and `-`")
+
+
+def _gpu_options(gpu_wait_s: float | None, gpu_busy_mib: int | None, eval_python: str | None,
+                 inference_image: str | None) -> None:
+    """The keeper's GPU and eval-interpreter options checked for the unit's `ExecStart=` (the checks `InferenceConfig`
+    makes); Refused (AN-19) for a bad value, or an option without `--inference-image`."""
+    if inference_image is None:
+        for field, given in (("--gpu-wait-s", gpu_wait_s), ("--gpu-busy-mib", gpu_busy_mib),
+                             ("--eval-python", eval_python)):
+            if given is not None:
+                raise _refuse(field, f"{field} needs --inference-image",
+                              "pass the inference image ID (sha256:<64 hex>) the keeper's daemon holds")
+        return
+    if gpu_wait_s is not None:
+        check_gpu_wait(gpu_wait_s)
+    if gpu_busy_mib is not None:
+        check_gpu_busy(gpu_busy_mib)
+    if eval_python is not None:
+        check_eval_python(eval_python)
+
+
 def setup_commands(*, user: str = DEFAULT_USER, state: str = DEFAULT_STATE, socket: str = DEFAULT_SOCKET,
                    venv: str = DEFAULT_VENV, owner_uid: int, packages: list[str] | None = None,
                    inference_image: str | None = None, eval_trees: list[str] | None = None,
-                   docker_host: str | None = None) -> dict:
+                   docker_host: str | None = None, gpu_wait_s: float | None = None, gpu_busy_mib: int | None = None,
+                   eval_python: str | None = None) -> dict:
     """`{commands: [str], unit: str}` for installing the keeper (AN-19). Refused (AN-19) on a user name, path or
     package spec that is not safe to print as a command: an unpinned package would let the keeper run whatever
     version is current when the user runs the command. The inference options (AN-25) go into `ExecStart=`."""
@@ -174,6 +232,7 @@ def setup_commands(*, user: str = DEFAULT_USER, state: str = DEFAULT_STATE, sock
         raise _refuse("--socket", f"the socket path is longer than {protocol.MAX_SOCKET_PATH} bytes",
                       "use a shorter path, such as the default")
     image, trees, host = _inference_options(inference_image, eval_trees, docker_host)
+    _gpu_options(gpu_wait_s, gpu_busy_mib, eval_python, inference_image)
     pins = installed_packs() if packages is None else list(packages)
     for spec in pins:
         if not _PINNED.fullmatch(spec):
@@ -183,7 +242,8 @@ def setup_commands(*, user: str = DEFAULT_USER, state: str = DEFAULT_STATE, sock
     sock_dir = socket_p.parent
     runtime_dir = sock_dir.name if sock_dir.parent == PurePosixPath("/run") else None
     unit = _unit(user, serve_argv(venv_p, state_p, socket_p, owner_uid, inference_image=image, eval_trees=trees,
-                                  docker_host=host), runtime_dir)
+                                  docker_host=host, gpu_wait_s=gpu_wait_s, gpu_busy_mib=gpu_busy_mib,
+                                  eval_python=eval_python), runtime_dir)
     commands = [
         f"sudo useradd --system --user-group --home-dir {q(str(state_p))} --no-create-home "
         f"--shell /usr/sbin/nologin {q(user)}",

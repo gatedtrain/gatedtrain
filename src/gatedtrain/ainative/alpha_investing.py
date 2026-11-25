@@ -14,14 +14,16 @@ from __future__ import annotations
 
 from ..errors import Problem, Refused
 
+# Trust invariants (design 05 AN-15): fixed in code, never a parameter, a setting or an argument; each value is pinned by
+# tests/test_single_source.py. The level, the starting wealth and the payout all follow from one number, TARGET_ALPHA.
 TARGET_ALPHA = 0.05
-INITIAL_WEALTH = 0.05 * (1 - 0.05)
-PAYOUT = 0.05
+INITIAL_WEALTH = TARGET_ALPHA * (1 - TARGET_ALPHA)
+PAYOUT = TARGET_ALPHA
 MIN_BID = 0.005
 PLANNING_ALPHA = INITIAL_WEALTH / 2
 RULE = "foster-stine"
 GUARANTEE = ("alpha-investing (Foster-Stine) over the gate attempts on this sealed set controls the marginal false "
-             "discovery rate (mFDR) at level 0.05")
+             f"discovery rate (mFDR) at level {TARGET_ALPHA:g}")
 
 
 def bid(wealth: float) -> float:

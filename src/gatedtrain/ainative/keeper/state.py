@@ -97,6 +97,7 @@ from .. import alpha_investing as ai, image_provenance, scorers, sealed_eval, si
 from ..batch import BatchGenerator, BatchRunner
 from ..alpha_investing import PLANNING_ALPHA
 from ..project import _utc_now, _write_atomic
+from ..limits import MAX_DATA_TEXT
 from ..trust_stages import (MAX_DATA_BYTES, MAX_MARGIN, SCHEMA_POWER, SCHEMA_REPORT, SCHEMA_SEALED_SUMMARY,
                             registered_base, registered_generator, scenario_batch_generators, scenario_generators,
                             scenario_pack_of)
@@ -429,7 +430,7 @@ class KeeperState:
                                "send true or false, or leave it out")
             _check_sha(data_sha256, "data_sha256", "AN-16")
             if not isinstance(raw, bytes) or len(raw) > MAX_DATA_BYTES:
-                raise _problem("AN-6", "data", f"the data file is larger than 64 MiB ({MAX_DATA_BYTES} bytes)",
+                raise _problem("AN-6", "data", f"the data file is larger than {MAX_DATA_TEXT} ({MAX_DATA_BYTES} bytes)",
                                "split the data or use a smaller sample")
             if sha256_bytes(raw) != data_sha256:
                 raise _problem("AN-16", "data_sha256", "the data received do not have the sha256 that was sent",

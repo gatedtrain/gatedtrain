@@ -21,6 +21,7 @@ from typing import Any, Callable, Protocol
 
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
+from .alpha_investing import TARGET_ALPHA
 from .project import Project, _refuse_links, _write_atomic
 
 UNSEALED_GUARANTEE = ("unsealed (step 1): the operator process can read the sealed items, and every stage can read "
@@ -226,7 +227,7 @@ class FixedAlphaLedger:
     REL = "trust/ledger.jsonl"
     CLAIM = "trust/spent"
 
-    def __init__(self, project: Project, alpha: float = 0.05) -> None:
+    def __init__(self, project: Project, alpha: float = TARGET_ALPHA) -> None:
         self.project = project
         self.alpha = alpha
 

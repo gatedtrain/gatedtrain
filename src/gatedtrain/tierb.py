@@ -42,6 +42,8 @@ from typing import Any
 import yaml
 
 from . import ANALYSIS_CODE_VERSION, TAGS
+from .backends.nemo_evaluator import NEMO_EVALUATOR_COMMIT
+from .families.nemo_rl import NEMO_RL_COMMIT_SHORT
 from .canonical import (canonical_json, entries_hash, file_sha256, manifest_document, manifest_entries,
                         manifest_hash, sha256_bytes, text_lines, write_canonical)
 from .errors import Problem, Refused
@@ -60,7 +62,6 @@ DATASET_PARQUET_SHA256 = {
     },
 }
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
-NEMO_EVALUATOR_COMMIT = "ea35ba3"
 EVALUATOR_ID = "gsm8k.nemo_evaluator@0.1"
 TRAINER_ID = "rl.nemo_rl@0.1"
 DEFAULT_ROWS_PER_SHARD = 500
@@ -93,7 +94,7 @@ NUMERIC_MATCH_NOTE = ("The gate reads NeMo Evaluator's numeric_match scorer (G-2
 # so only `step_N` directories are cuts (ledger.CKPT_DIR_RE); a `tmp_step_N` directory is an interrupted
 # write and gets no lineage row and no manifest.
 CHECKPOINT_COMPLETENESS = {
-    "nemo_rl_commit": "4f39fd8",
+    "nemo_rl_commit": NEMO_RL_COMMIT_SHORT,
     "rule": "a checkpoint is complete when its directory is named step_<N>; NeMo RL writes into tmp_step_<N> "
             "and renames it to step_<N> after the write (checkpoint_storage.py:47, :69-:98; checkpoint.py:379-392, "
             ":423-434), so a tmp_step_<N> directory is an interrupted write and never a cut",

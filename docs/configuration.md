@@ -14,7 +14,36 @@ host_work = "/srv/gatedtrain/work"        # holds bin/gpu-step.sh (the operator'
 output_root = "/srv/gatedtrain/out"       # launches write strictly under this directory
 ```
 
-`GATEDTRAIN_EXT_HOST_WORK`, `GATEDTRAIN_EXT_OUTPUT_ROOT` and `GATEDTRAIN_EXT_INPUT_ROOTS` override it.
+The host file is the channel for every host setting. Besides `host_work` and `output_root` it takes these optional keys
+(each validated; a malformed file is refused, never partly applied):
+
+| Key | Value | Effect |
+|---|---|---|
+| `input_roots`, `interpreter_trees` | arrays of absolute paths | the launch rules' input roots and interpreter trees (EXT-79, EXT-113) |
+| `interpreter`, `mirror_root` | absolute paths | the pinned interpreter and the identity-mount root (EXT-112, EXT-113) |
+| `gpu_mem_limit_gb` | number above 0 | the smoke GPU-memory bound in GB; default 22.5, a 24 GB card's |
+| `gpu_cap_h` | number above 0 | the GPU-hour ceiling passed to `gpu-step.sh`; default 1000 |
+| `[packs.<pack name>]` | table of absolute paths | a scenario pack's owner-side settings, for example `runtime_dir` |
+
+`gpu_mem_limit_gb`, `gpu_cap_h` and the `[packs]` tables enter `host_config_sha256` only when the file sets them, so the
+launch record binds them (`ext-collect` refuses a record whose host hash is not this host's, so a bound changed after the
+launch is refused) and the hash of a host that sets none is unchanged. No gatedtrain environment variable sets them
+(`GATEDTRAIN_GPU_CAP_H` is the wrapper's own variable, which `gpu_cap_h` is printed into).
+
+**Deprecated environment variables.** `GATEDTRAIN_EXT_HOST_WORK`, `_OUTPUT_ROOT`, `_INPUT_ROOTS`, `_INTERPRETER_TREES`,
+`_INTERPRETER` and `_MIRROR_ROOT` still override the file, because tests and some hosts rely on them, and each one that is
+set prints a deprecation line on stderr naming the file key that replaces it. They are removed in 0.9.0. A pack's own
+runtime variable (for example `GATEDTRAIN_PACK_TEXT_GSM8K_RUNTIME`) is the same kind of workaround for the
+`[packs.<name>] runtime_dir` key.
+
+**A pack in the keeper's process.** A pack's rows module reads the host file when it is imported (`runtime_dir`). In the
+keeper's process that is the keeper user's own home, not yours, and a malformed file there degrades to the package default
+with a named warning instead of failing every command.
+
+**The same-user caveat.** The host file is written by the owner, outside the project directory an agent works in, but a
+process running as the owner's own OS user can edit it like any other file of that user. What the file binds is
+recorded (the launch record's host hash); what it does not do is sealed from the owner's account. The sealed-data
+guarantee comes from the keeper, which reads its own configuration, not this file.
 
 **Rootless hosts.** A host whose containers run on the owner's rootless Docker daemon (the context `gatedtrain` pointing
 at `unix:///run/user/<owner uid>/docker.sock`) says so in the host file. The launch rules then require the container
@@ -94,10 +123,11 @@ same-user ones come from your XDG directories).
 | `[inference]` | `image` | `--inference-image` | host | none; a reference pinned by digest (`name@sha256:...`) |
 | `[inference]` | `eval_requirements`, `eval_python` | the flag of the same name | host | none; `eval_requirements` is an absolute path |
 | `[inference]` | `eval_trees` (list) | `--eval-tree` | separate-user, same-user | none |
-| `[gpu]` | `wait_s`, `busy_mib` | `--gpu-wait-s`, `--gpu-busy-mib` | reserved | not supported by this version |
-| `[inference]` | `keeper_eval_python` | `--eval-python` of `setup keeper` | reserved | not supported by this version |
+| `[gpu]` | `wait_s`, `busy_mib` | `--gpu-wait-s`, `--gpu-busy-mib` | separate-user, same-user | none (the keeper's 900 s and 1024 MiB); they need the inference image, as the flags do |
+| `[inference]` | `keeper_eval_python` | `--eval-python` of `setup keeper` | separate-user, same-user | none; an absolute path of the eval venv's python |
 
-A reserved key is refused with "not supported by this version (the keeper has no such option yet)". Flags that name
+A key whose option the keeper does not have yet is *reserved* and refused with "not supported by this version (the keeper has
+no such option yet)"; none is reserved now. Flags that name
 who runs the setup or a switch for one run (`--owner`, `--owner-uid`, `--packages`, `--inference-image` of `setup
 keeper`, `--docker-host`, `--confirm-group-removal`, `--mode`) have no layout key. Rule: AN-34.
 
@@ -121,6 +151,41 @@ Fixed defaults in `gatedtrain.ext.launch` that a host may need to know about:
   ```
 - `GPU_CAP_H = 1000`: the GPU-hour budget ceiling passed to `gpu-step.sh` (`GATEDTRAIN_GPU_CAP_H`), high enough not to
   limit runs; hours are still logged in `gpu-log.md` and every full run is preceded by a smoke.
+
+## The keeper's owner-side options
+
+`gatedtrain keeper serve` (and the unit `gatedtrain setup keeper` prints) takes three options for the keeper's inference
+container, all optional, all set by the person who starts the keeper and never by a request:
+
+- `--gpu-wait-s S` and `--gpu-busy-mib MIB`: how long to wait for a free GPU before a GPU generator is refused (default
+  900 s) and how much GPU memory still counts as free (default 1024 MiB). A GPU that other work shares needs other values.
+  The keeper's check that a generator's time limit fits the client's wait (AN-25) uses the configured wait, and refuses
+  before the grant when it does not fit.
+- `--eval-python PATH`: the eval venv's python that replaces the interpreter an eval-tree generator declares, so a pack's
+  `GATEDTRAIN_PACK_*_EVAL_PYTHON` variable is not needed. The keeper still runs it only when it is a regular file inside
+  a configured eval tree.
+
+`--gpu-busy-mib` is bounded (0 to 1 TiB) so that it cannot switch the busy check off; `--gpu-wait-s` is bounded by the
+fit check, which refuses every generator, GPU or not, when the wait plus two time limits and the slack exceed the client's
+timeout. A value that differs from the default is part of the keeper's signed environment record (`inference.gpu`,
+`inference.eval_python`), and the report names that record's hash; with the defaults the record is byte-identical to
+before. They need `--inference-image`.
+
+## Fixed values
+
+Some constants are trust invariants and are deliberately not settings: no file, flag or environment variable changes
+them, and a test (`tests/test_single_source.py`) pins each value.
+
+- Alpha-investing (`ainative/alpha_investing.py`): the target level 0.05, the starting wealth, the payout and the minimum
+  bid. The guarantee a report states is these numbers.
+- Sealed-set planning (`ainative/sealed_eval.py`): the minimum detectable effect, the power, the planning SD of the paired
+  difference and the largest sealed fraction.
+- Protocol limits (`ainative/limits.py`): the largest data file (64 MiB), the keeper's request and response caps derived
+  from it, and the largest predictions file.
+- The executor's isolation limits (`ext/executor.py`) and the registration's refusal rules and numerical limits.
+
+Everything else about a host is configuration: the host file above, the options of `gatedtrain setup host` and
+`gatedtrain keeper serve`, and the parameters of a scenario pack's stages.
 
 ## The GPU wrapper script
 

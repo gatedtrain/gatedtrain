@@ -5,7 +5,7 @@ recomputed here, never trusted: PASS only when no reason below holds.
 
 - `gpu_memory`: peak GPU memory above 22.5 GB (of 24.5 GB);
 - `budget`: projected GPU-hours plus the GPU log's running total above the GPU-hour budget ceiling
-  (launch.GPU_CAP_H, 1000: high enough not to limit runs; hours are still logged);
+  (`launch.GPU_CAP_H`, high enough not to limit runs; hours are still logged);
 - `evaluator_errors`: any evaluator error;
 - `degenerate_mean`: a non-binary metric with both bounds finite whose baseline mean lies outside
   [lo + 5 % w, hi - 5 % w] (the boundary is allowed); a binary metric (registry `binary: true`) whose mean
@@ -33,13 +33,12 @@ from collections import Counter
 from typing import Any
 
 from ..renamed import old_schema_note
+from .launch import GPU_CAP_H, GPU_MEM_LIMIT_GB
 
 SMOKE_SCHEMA = "gatedtrain.smoke_record"
 SMOKE_KEYS = ("schema", "adapter", "area", "base_model_hash", "item_set_hash", "peak_gpu_mem_gb", "host_ram_peak_gb",
               "swap_peak_gb", "seconds_per_step", "projected_gpu_h", "gpu_log_total_h", "baseline_scores",
               "error_count", "verdict", "reasons")
-GPU_MEM_LIMIT_GB = 22.5
-GPU_CAP_H = 1000            # the budget ceiling passed to gpu-step.sh (launch.GPU_CAP_H)
 MEAN_MARGIN = 0.05
 MODE_SHARE = 0.5
 OFF_BOUND_SHARE = 0.25      # R18-8: the least share of baseline scores off the declared bounds
@@ -51,9 +50,11 @@ def _num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
-def smoke_verdict(record: dict, *, score_range, binary: bool, direction: str | None = None) -> dict[str, Any]:
+def smoke_verdict(record: dict, *, score_range, binary: bool, direction: str | None = None,
+                  gpu_mem_limit_gb: float = GPU_MEM_LIMIT_GB, gpu_cap_h: float = GPU_CAP_H) -> dict[str, Any]:
     """{verdict: PASS | FAIL, reasons} recomputed from the record's measurements (EXT-29). Raises ValueError
-    when a measurement is missing or not a finite number."""
+    when a measurement is missing or not a finite number. `gpu_mem_limit_gb` and `gpu_cap_h` are the host's bounds (its
+    host file's keys; the defaults when it sets none)."""
     for key in ("peak_gpu_mem_gb", "projected_gpu_h", "gpu_log_total_h"):
         if not _num(record.get(key)):
             raise ValueError(f"`{key}` is {record.get(key)!r}, not a finite number")
@@ -64,9 +65,9 @@ def smoke_verdict(record: dict, *, score_range, binary: bool, direction: str | N
     if not (isinstance(scores, list) and all(_num(s) for s in scores)):
         raise ValueError("`baseline_scores` is not a list of finite numbers")
     reasons: list[str] = []
-    if record["peak_gpu_mem_gb"] > GPU_MEM_LIMIT_GB:
+    if record["peak_gpu_mem_gb"] > gpu_mem_limit_gb:
         reasons.append("gpu_memory")
-    if record["projected_gpu_h"] + record["gpu_log_total_h"] > GPU_CAP_H + _EPS:
+    if record["projected_gpu_h"] + record["gpu_log_total_h"] > gpu_cap_h + _EPS:
         reasons.append("budget")
     if errors > 0:
         reasons.append("evaluator_errors")
@@ -102,7 +103,8 @@ def smoke_verdict(record: dict, *, score_range, binary: bool, direction: str | N
 
 def smoke_problems(record: Any, *, adapter: str, score_range, binary: bool,
                    base_model_hash: str | None = None, item_set_hash: str | None = None,
-                   evaluators: list[tuple[str, dict]] | None = None, direction: str | None = None) -> list[str]:
+                   evaluators: list[tuple[str, dict]] | None = None, direction: str | None = None,
+                   gpu_mem_limit_gb: float = GPU_MEM_LIMIT_GB, gpu_cap_h: float = GPU_CAP_H) -> list[str]:
     """Why a smoke record does not allow a full run or a collect (MM-39, EXT-30): empty when it does.
 
     `evaluators` (R18-8): with several clauses, (evaluator id, registry row) per clause in clause order; each clause
@@ -121,10 +123,11 @@ def smoke_problems(record: Any, *, adapter: str, score_range, binary: bool,
     if record.get("verdict") != "PASS":
         out.append(f"the record claims verdict {record.get('verdict')!r}, not PASS")
     if evaluators:
-        out += _per_evaluator_problems(record, evaluators)
+        out += _per_evaluator_problems(record, evaluators, gpu_mem_limit_gb, gpu_cap_h)
     else:
         try:
-            v = smoke_verdict(record, score_range=score_range, binary=binary, direction=direction)
+            v = smoke_verdict(record, score_range=score_range, binary=binary, direction=direction,
+                              gpu_mem_limit_gb=gpu_mem_limit_gb, gpu_cap_h=gpu_cap_h)
             if v["verdict"] != "PASS":
                 out.append(f"the recomputed verdict is FAIL: {', '.join(v['reasons'])}")
         except ValueError as exc:
@@ -136,7 +139,8 @@ def smoke_problems(record: Any, *, adapter: str, score_range, binary: bool,
     return out
 
 
-def _per_evaluator_problems(record: dict, evaluators: list[tuple[str, dict]]) -> list[str]:
+def _per_evaluator_problems(record: dict, evaluators: list[tuple[str, dict]], gpu_mem_limit_gb: float = GPU_MEM_LIMIT_GB,
+                            gpu_cap_h: float = GPU_CAP_H) -> list[str]:
     """R18-8: every clause evaluator's smoke baseline, each with its own row."""
     by = record.get("baseline_scores_by_evaluator")
     if not isinstance(by, dict):
@@ -152,7 +156,8 @@ def _per_evaluator_problems(record: dict, evaluators: list[tuple[str, dict]]) ->
             continue
         try:
             v = smoke_verdict({**record, "baseline_scores": by[ev]}, score_range=row["score_range"],
-                              binary=row["binary"], direction=row.get("direction"))
+                              binary=row["binary"], direction=row.get("direction"),
+                              gpu_mem_limit_gb=gpu_mem_limit_gb, gpu_cap_h=gpu_cap_h)
             if v["verdict"] != "PASS":
                 out.append(f"the recomputed verdict of evaluator {ev} is FAIL: {', '.join(v['reasons'])}")
         except ValueError as exc:

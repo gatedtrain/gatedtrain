@@ -67,7 +67,7 @@ import yaml
 from . import ANALYSIS_CODE_VERSION
 from .canonical import canonical_json, sha256_bytes
 from .errors import Problem
-from .gates import planning_distance, planning_sigma
+from .gates import BOOTSTRAP_VARIANTS, planning_distance, planning_sigma
 from .renamed import (PRE_RENAME_VERSIONS, REGISTRATION_AMENDMENT, VERSION_ONLY_FIELDS, apply_name_map,
                       is_old_analysis_code_version)
 from .items import DIRECTIONS, ESTIMATORS, EVALUATORS
@@ -87,7 +87,6 @@ MULTI_CLAUSE_FIELDS = ("name", "evaluator")
 MULTI_OPTIONAL_CLAUSE_FIELDS = ("estimator", "cluster_key", "bootstrap_variant")
 MULTI_PLAN = "all_clauses_must_pass"                                 # R18-2
 CLAUSE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-BOOTSTRAP_VARIANTS = ("bca", "percentile")                           # R18-4
 # Legacy (revision 10) clause key -> revision 11 key (R11A-2).
 LEGACY_CLAUSE_KEYS = {"samples_per_prompt": "samples_per_item"}
 # 05 section 3.7 registration contents (05:166), keyed as in tests/README.md section 4.2; `eval_distribution`

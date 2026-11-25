@@ -241,13 +241,27 @@ class ModeTest(Base):                                                   # AN-34
         self.assertTrue(any("eval_trees" in x and "does not apply" in x for x in
                             self.refused("[inference]\neval_trees = ['/a']\n", layout.HOST)))
 
-    def test_the_gpu_keys_are_reserved_and_refused(self):
+    def test_the_gpu_keys_are_supported_and_validated(self):
+        """0.7.1: `keeper serve` has the options, so the three rows are no longer reserved."""
+        good = "[gpu]\nwait_s = 60\nbusy_mib = 1024\n[inference]\nkeeper_eval_python = '/p/bin/python'\n"
         for scope in (layout.SEPARATE, layout.SAME):
-            lines = self.refused("[gpu]\nwait_s = 60\nbusy_mib = 1024\n[inference]\nkeeper_eval_python = '/p'\n",
-                                 scope)
-            self.assertEqual(len(lines), 3, lines)
-            for line in lines:
-                self.assertIn("not supported by this version (the keeper has no such option yet)", line)
+            values = layout.parse((VERSION + good).encode(), "L", scope)
+            self.assertEqual(values, {("gpu", "wait_s"): 60, ("gpu", "busy_mib"): 1024,
+                                      ("inference", "keeper_eval_python"): "/p/bin/python"})
+            for bad, word in (("[gpu]\nwait_s = 0\n", "wait"), ("[gpu]\nwait_s = -1\n", "wait"),
+                              ("[gpu]\nwait_s = true\n", "number"), ("[gpu]\nbusy_mib = 1.5\n", "whole"),
+                              ("[gpu]\nbusy_mib = -1\n", "MiB"), ("[gpu]\nbusy_mib = 99999999999\n", "MiB"),
+                              ("[inference]\nkeeper_eval_python = 'rel/python'\n", "absolute"),
+                              ("[inference]\nkeeper_eval_python = '/a b/python'\n", "space")):
+                with self.subTest(scope=scope, bad=bad):
+                    lines = self.refused(bad, scope)
+                    self.assertTrue(any(word in x for x in lines), lines)
+        self.assertTrue(any("[gpu]" in x and "does not apply" in x for x in self.refused(good, layout.HOST)))
+        for scope in layout.SCOPES:
+            if scope != layout.HOST:
+                text = layout.render(scope, env={"HOME": str(self.tmp / "h")}, uid=4321)
+                self.assertNotIn("reserved", text)
+                self.assertIn("# wait_s = N", text)
 
 
 class PrintedDefaultsTest(Base):                                        # AN-34
@@ -372,6 +386,44 @@ class CommandTest(Base):                                                # AN-34
         self.assertEqual(data["layout"]["keys"]["keeper.user"], "layout")
         self.assertNotIn("layout:", data["unit"])                                  # the unit text is unchanged
 
+    def test_the_gpu_options_reach_both_units_from_a_layout_and_a_flag_wins(self):
+        gpu = ("[gpu]\nwait_s = 300\nbusy_mib = 2048\n[inference]\neval_trees = ['/e']\n"
+               "keeper_eval_python = '/e/bin/python'\n")
+        image = "sha256:" + "a" * 64
+        for mode, extra, own in (("separate-user", ["--packages", "p==1"], f"[keeper]\nstate = '{self.tmp}/st'\n"),
+                                 ("same-user", [], f"[same_user]\nstate = '{self.tmp}/st'\n")):
+            path = self.write(VERSION + gpu + own, f"{mode}.toml")
+            base = ["setup", "keeper", "--layout", path, "--inference-image", image, "--docker-host",
+                    "unix:///x/d.sock"]
+            with self.subTest(mode=mode), no_processes():
+                code, doc = run([*base, "--mode", mode, *extra])
+                self.assertEqual(code, 0, doc)
+                self.assertIn("--gpu-wait-s 300 --gpu-busy-mib 2048 --eval-python /e/bin/python", doc["data"]["unit"])
+                keys = doc["data"]["layout"]["keys"]
+                self.assertEqual((keys["gpu.wait_s"], keys["gpu.busy_mib"], keys["inference.keeper_eval_python"]),
+                                 ("layout", "layout", "layout"))
+                code, doc = run([*base, "--mode", mode, *extra, "--gpu-wait-s", "120"])
+                self.assertEqual(code, 0, doc)
+                self.assertIn("--gpu-wait-s 120 ", doc["data"]["unit"])
+                self.assertEqual(doc["data"]["layout"]["keys"]["gpu.wait_s"], "flag")
+        path = self.write(VERSION + "[gpu]\nwait_s = 300\n", "noimage.toml")
+        with no_processes():                       # the options need the inference image, as the flags do
+            code, doc = run(["setup", "keeper", "--layout", path, "--mode", "same-user"])
+        self.assertNotEqual(code, 0)
+        self.assertTrue(any("--inference-image" in p["message"] for p in doc["problems"]), doc["problems"])
+
+    def test_the_default_units_are_unchanged_without_the_gpu_options(self):
+        image = "sha256:" + "a" * 64
+        for mode in ("separate-user", "same-user"):
+            with no_processes():
+                code, doc = run(["setup", "keeper", "--mode", mode, "--inference-image", image, "--docker-host",
+                                 "unix:///x/d.sock", "--packages", "p==1"] if mode == "separate-user" else
+                                ["setup", "keeper", "--mode", mode, "--inference-image", image, "--docker-host",
+                                 "unix:///x/d.sock"])
+            self.assertEqual(code, 0, doc)
+            self.assertNotIn("--gpu-", doc["data"]["unit"])
+            self.assertNotIn("--eval-python", doc["data"]["unit"])
+
     def test_same_user_keeper_follows_the_layout_with_changed_home_and_xdg(self):
         path = self.write(VERSION + f"[same_user]\nstate = '{self.tmp}/st'\n[inference]\neval_trees = ['/e']\n")
         env = {"HOME": str(self.tmp / "other-home"), "XDG_DATA_HOME": str(self.tmp / "xdg"),
@@ -386,7 +438,9 @@ class CommandTest(Base):                                                # AN-34
         self.assertIn(f"--state {self.tmp}/st --socket /rt/xrun/", doc["data"]["unit"])
         self.assertEqual(doc["data"]["layout"]["keys"], {"same_user.state": "layout", "same_user.socket": "default",
                                                          "same_user.executable": "default",
-                                                         "inference.eval_trees": "default"})
+                                                         "inference.eval_trees": "default",
+                                                         "inference.keeper_eval_python": "default",
+                                                         "gpu.wait_s": "default", "gpu.busy_mib": "default"})
         self.assertTrue(doc["data"]["commands"][0].startswith("# layout: "))
 
     def test_a_mode_inapplicable_table_is_refused_through_the_command(self):
