@@ -9,12 +9,14 @@ with an owner uid other than the test user's, so the separate-user texts are the
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 import shutil
 import socket
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,14 +28,15 @@ from test_an_keeper_cli import CliProject, run
 from test_an_keeper_intake import confirm_args, jsonl, project_id
 
 from gatedtrain.ainative import signing
-from gatedtrain.ainative.keeper import rootful, server, texts
+from gatedtrain.ainative.keeper import modes, protocol, rootful, server, texts
 from gatedtrain.ainative.keeper.protocol import KeeperClient
 from gatedtrain.ainative.keeper.rootful import HostView, owner_root_docker
 from gatedtrain.ainative.keeper.state import KeeperState
 from gatedtrain.ainative.keeper_trust import RECEIPTS
 from gatedtrain.ainative.trust_stages import render_markdown
-from gatedtrain.ainative.verify import (OFFLINE_LIMIT, ROOT_DOCKER_KEEPER, ROOT_DOCKER_REPORT, SAME_USER_REPORT,
-                                        UNCHECKED_GUARANTEE_REPORT, UNKNOWN_GUARANTEE_REPORT, report_warnings)
+from gatedtrain.ainative.verify import (OFFLINE_LIMIT, OWNER_RUN_REPORT, ROOT_DOCKER_KEEPER, ROOT_DOCKER_REPORT,
+                                        SAME_USER_RECORDS, SAME_USER_REPORT, UNCHECKED_GUARANTEE_REPORT,
+                                        UNKNOWN_GUARANTEE_REPORT, report_warnings)
 from gatedtrain.canonical import sha256_bytes
 
 UID = os.getuid()
@@ -292,8 +295,8 @@ class DetectionTest(Tree):
 class GuaranteeTest(unittest.TestCase):
     def test_guarantee_precedence(self):
         g = texts.sealed_guarantee
-        self.assertEqual(g(5, 5), texts.KEEPER_SAME_USER_GUARANTEE)
-        self.assertEqual(g(5, 5, root_docker=True), texts.KEEPER_SAME_USER_GUARANTEE)
+        self.assertEqual(g(5, 5), texts.KEEPER_OWNER_RUN_GUARANTEE)
+        self.assertEqual(g(5, 5, root_docker=True), texts.KEEPER_OWNER_RUN_GUARANTEE)
         self.assertEqual(g(5, 6), texts.KEEPER_GUARANTEE)
         self.assertEqual(g(5, 6, root_docker=True), texts.KEEPER_ROOT_DOCKER_GUARANTEE)
         self.assertTrue(texts.KEEPER_ROOT_DOCKER_GUARANTEE.startswith("the keeper runs as a separate OS user, but "))
@@ -312,7 +315,7 @@ class HelloTest(Tree):
             code, doc = run(["keeper", "fingerprint", "--socket", str(kp.socket)])
         self.assertIs(hello["owner_has_root_docker"], True)
         self.assertEqual(hello["root_docker_reasons"], [f"uid {UID} is in gid 998 (group docker) by /etc/group"])
-        self.assertEqual(hello["sealed_guarantee"], texts.KEEPER_SAME_USER_GUARANTEE)   # same user wins
+        self.assertEqual(hello["sealed_guarantee"], texts.KEEPER_OWNER_RUN_GUARANTEE)   # same user wins
         self.assertEqual(code, 0, doc)
         self.assertIs(doc["data"]["owner_has_root_docker"], True)
         self.assertEqual(doc["data"]["root_docker_reasons"], hello["root_docker_reasons"])
@@ -323,6 +326,8 @@ class HelloTest(Tree):
     def test_hello_separate_user(self):                # a keeper under its own uid
         keeper = server.Keeper(self.root, UID, host_view=self.view())
         keeper.keeper_uid = UID + 1
+        keeper.observe_mode = lambda peer=None: modes.observe(           # the keeper's own uid and a 0700 state dir
+            UID + 1, UID, types.SimpleNamespace(st_uid=UID + 1, st_mode=0o40700), peer)
         self.docker_tree()
         hello = keeper.handle(b'{"op":"hello","project":null,"args":{}}', UID)["result"]
         self.assertEqual((hello["owner_has_root_docker"], hello["sealed_guarantee"]),
@@ -366,7 +371,7 @@ class StickyTest(unittest.TestCase):
         return st
 
     def handle(self, keeper, op: str, project: str | None) -> dict:
-        resp = keeper.handle(json.dumps({"op": op, "project": project, "args": {}}).encode(), UID)
+        resp = keeper.handle(json.dumps({"op": op, "project": project, "args": {}}).encode(), self.OWNER)
         self.assertIs(resp["ok"], True, resp)
         return resp["result"]
 
@@ -488,11 +493,15 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
             out = real(client, op, project, args)
             if op != "hello":
                 return out
-            out = {**out, "same_user": False, **fields}
+            out = {**out, "same_user": False, "keeper_mode": modes.SEPARATE_USER, **fields}
             if fields.get("owner_has_root_docker") is None:
                 out.pop("owner_has_root_docker")
             return out
-        return mock.patch.object(KeeperClient, "call", call)
+        # a keeper under its own OS user: it claims separate-user mode and the kernel names another listener uid
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(KeeperClient, "call", call))
+        stack.enter_context(mock.patch.object(protocol, "attested_listener_uid", lambda sock: os.getuid() + 1))
+        return stack
 
     def test_verify_exit_1_on_root_docker(self):
         proj = self.create()
@@ -501,19 +510,22 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
         with self.patched_hello(owner_has_root_docker=True, root_docker_reasons=["uid 1 is in gid 998"]):
             code, doc = run(["verify", root, "--keeper", sock])
         self.assertEqual((code, doc["ok"], doc["data"]["root_docker"], doc["warnings"]),
-                         (1, False, True, [ROOT_DOCKER_KEEPER, SAME_USER_REPORT]), doc)
+                         (1, False, True, [ROOT_DOCKER_KEEPER, OWNER_RUN_REPORT]), doc)
         with self.patched_hello(owner_has_root_docker=None):              # a hello without the field
             code, doc = run(["verify", root, "--keeper", sock])
-        self.assertEqual((code, doc["warnings"]), (1, [ROOT_DOCKER_KEEPER, SAME_USER_REPORT]), doc)
+        self.assertEqual((code, doc["warnings"]), (1, [ROOT_DOCKER_KEEPER, OWNER_RUN_REPORT]), doc)
         with self.patched_hello(owner_has_root_docker=False):             # the key anchors; the report's text not
             code, doc = run(["verify", root, "--keeper", sock])
-        self.assertEqual((code, doc["data"]["root_docker"], doc["warnings"]), (1, False, [SAME_USER_REPORT]), doc)
+        self.assertEqual((code, doc["data"]["root_docker"], doc["warnings"]), (1, False, [OWNER_RUN_REPORT]), doc)
 
     def resign_report(self, proj, guarantee: str) -> None:
         key = signing.load_private_key(self.kp.state / "keeper.key")
         rel = proj.root / "stages" / "report"
         doc = json.loads((rel / "report.json").read_text())
         doc["sealed_guarantee"] = guarantee
+        doc["keeper_mode"] = modes.mode_of_text(guarantee) or doc["keeper_mode"]      # AN-27: the mode its text states
+        doc["attempts"] = [{**a, "keeper_mode": doc["keeper_mode"]} for a in doc["attempts"]]
+        doc["modes_seen"] = [{**m, "mode": doc["keeper_mode"]} for m in doc["modes_seen"]]
         doc["known_limits"][0]["text"] = guarantee
         env = signing.sign(key, "report", doc)
         lines = [json.loads(x) for x in (proj.root / RECEIPTS).read_bytes().splitlines() if x]
@@ -525,7 +537,8 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
     def test_verify_exit_1_on_downgraded_report(self):
         proj = self.create()
         self.to_report(proj)
-        self.resign_report(proj, texts.KEEPER_GUARANTEE)    # the test keeper runs as the owner: state the real text
+        self.restamp(proj, "separate_user")    # the test keeper runs as the owner: its records state the strong mode
+        self.resign_report(proj, texts.KEEPER_GUARANTEE)
         fp = signing.fingerprint(self.public())
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
         self.assertEqual(code, 0, doc)
@@ -542,10 +555,15 @@ class VerifyRootDockerTest(CliProject, unittest.TestCase):
         for text, warning in ((texts.KEEPER_SAME_USER_GUARANTEE, SAME_USER_REPORT),
                               ("a guarantee no version states", UNKNOWN_GUARANTEE_REPORT)):
             with self.subTest(text):
+                self.restamp(proj, "same_user")                       # the records of a same-user keeper
                 self.resign_report(proj, text)
                 code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
                 self.assertEqual((code, doc["problems"]), (1, []), doc)
-                self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, warning])
+                same_user_text = text == texts.KEEPER_SAME_USER_GUARANTEE           # else the records say it too
+                self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, warning] + ([] if same_user_text
+                                                                              else [SAME_USER_RECORDS])
+                                 + [texts.MODE_STATED_NOTE])
+        self.restamp(proj, "separate_user")
         self.resign_report(proj, texts.KEEPER_GUARANTEE)
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
         self.assertEqual(code, 0, doc)

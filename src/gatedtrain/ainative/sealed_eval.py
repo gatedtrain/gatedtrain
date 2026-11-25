@@ -42,6 +42,13 @@ PILOT_SOURCE = ("the independence bound for the SD of the paired difference of t
                 "sqrt(0.5^2 * 2)")
 MAX_SEALED_FRACTION = 0.5
 
+# Schema versions of the keeper's records, named once: the keeper writes REPORT_SCHEMA_VERSION; the driver and `verify`
+# accept it and the legacy one (a version 2 report predates the keeper mode and states it only in its guarantee text).
+KEEPER_SCHEMA_VERSION = 2          # the keeper-mode records (registration, gate result, ...) of the step 1 schema ids
+LEGACY_REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3          # adds the observed keeper mode (AN-27) and the registered policy (AN-28)
+REPORT_SCHEMA_VERSIONS = (LEGACY_REPORT_SCHEMA_VERSION, REPORT_SCHEMA_VERSION)
+
 
 def _refuse(rule: str, field: str, message: str, fix: str) -> Refused:
     return Refused([Problem(rule, field, message, fix)])

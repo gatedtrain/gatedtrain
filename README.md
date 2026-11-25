@@ -67,13 +67,28 @@ gatedtrain impact demo/data/train/shard-00003.jsonl --runs-root demo/runs   # wh
 [CPU quickstart](https://github.com/gatedtrain/gatedtrain/blob/main/docs/quickstart.md) explains each line of the
 report and shows control runs that FAIL or come out INCONCLUSIVE on purpose.
 
+## No sudo
+
+The AI-native keeper runs without sudo by default: `gatedtrain setup keeper` prints user-level commands for a keeper
+under your own OS user (same-user mode), and `gatedtrain setup check` names the outside prerequisites, such as rootless
+Docker, and changes nothing. Same-user mode follows the procedure but does not seal the data from your account, and
+every result says so on its first line:
+
+```text
+keeper mode: same-user (NOT sealed from the user's account: the procedure is followed, the sealed data is not protected from anything running as the user; to harden: gatedtrain setup keeper --mode separate-user)
+```
+
+To harden, run the keeper under its own OS user (`gatedtrain setup keeper --mode separate-user`, one sudo). See the
+[quickstart without sudo](https://github.com/gatedtrain/gatedtrain/blob/main/docs/sudo-free-quickstart.md) and
+[Keeper modes](https://github.com/gatedtrain/gatedtrain/blob/main/docs/ai-native.md#keeper-modes).
+
 ## Three ways to use it
 
 | Way | What it is | Read |
 |---|---|---|
 | The CPU demo | A small model on two-digit addition, trained and gated on a laptop. The quickest way to see a gate report. | [Quickstart](https://github.com/gatedtrain/gatedtrain/blob/main/docs/quickstart.md) |
 | External training runs | You train with your own framework (for example TRL or NeMo RL) on your GPU. A recipe repository's adapter reads the run's outputs, and `ext-collect` gates them. gatedtrain does not start the training itself. | [External runs](https://github.com/gatedtrain/gatedtrain/blob/main/docs/external-runs.md) |
-| AI-native projects (preview) | `gatedtrain project` runs one goal through fixed stages and seals part of your data for the test itself. On Linux, a keeper (a service under its own OS user) can hold the sealed data and sign every record. | [AI-native projects](https://github.com/gatedtrain/gatedtrain/blob/main/docs/ai-native.md) |
+| AI-native projects (preview) | `gatedtrain project` runs one goal through fixed stages and seals part of your data for the test itself. On Linux, a keeper (a service) signs every record. By default it runs under your own OS user: it follows the procedure, but nothing is sealed from your account. Under its own OS user (hardened) it also holds the sealed data out of your account's reach. | [AI-native projects](https://github.com/gatedtrain/gatedtrain/blob/main/docs/ai-native.md) |
 
 ## Learn more
 
@@ -84,8 +99,12 @@ The guides below are also published as a website: <https://gatedtrain.github.io/
 - [Commands](https://github.com/gatedtrain/gatedtrain/blob/main/docs/commands.md): every subcommand
 - [External runs](https://github.com/gatedtrain/gatedtrain/blob/main/docs/external-runs.md): adapter plugins and
   recipe repositories
-- [AI-native projects](https://github.com/gatedtrain/gatedtrain/blob/main/docs/ai-native.md): the keeper, rootless
-  containers and scenario packs, with their guarantees and limits
+- [AI-native projects](https://github.com/gatedtrain/gatedtrain/blob/main/docs/ai-native.md): the keeper and its two
+  modes, rootless containers and scenario packs, with their guarantees and limits
+- [Quickstart without sudo](https://github.com/gatedtrain/gatedtrain/blob/main/docs/sudo-free-quickstart.md): the
+  prerequisites, `setup check`, the same-user keeper and how to harden it
+- [NeMo RL on a rootless host](https://github.com/gatedtrain/gatedtrain/blob/main/docs/rootless-nemo-rl.md): lessons
+  from the first runs
 - [Configuration](https://github.com/gatedtrain/gatedtrain/blob/main/docs/configuration.md): the host file and
   environment variables
 - [Development](https://github.com/gatedtrain/gatedtrain/blob/main/docs/development.md): tests and design references

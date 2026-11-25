@@ -70,7 +70,8 @@ How strongly the separation is enforced depends on how you use gatedtrain:
 - **AI-native projects.** gatedtrain makes the split itself. The first stage, `intake_seal`, removes duplicate inputs,
   seals a part of the data for evaluation and passes on only the training part, the sealed part's hash and size, and
   a few summary numbers. Without a keeper the sealed items still sit in plain files that your own account can read;
-  the report says so. With a keeper they are held by a separate OS user. The exact guarantees and limits are in
+  the report says so. With a keeper under your own OS user (the default) the procedure is followed but nothing is
+  sealed from your account; with a keeper under a separate OS user they are held out of your account's reach. The exact guarantees and limits are in
   [AI-native projects](ai-native.md).
 
 ## Gate results
@@ -144,7 +145,7 @@ say "possibly consumed". `--runs-root` searches every run under a directory. Mor
 - **Recipe repository.** A separate repository for one training task (for example TRL GRPO on GSM8K). It holds the
   adapter, a small plugin that reads that trainer's outputs, and the instructions to run it. See
   [External runs](external-runs.md#recipe-repositories).
-- **Keeper.** A service under its own OS user (Linux only) that holds the sealed items, the registrations and the
+- **Keeper.** A service (Linux only), by default under your own OS user and hardened under its own, that holds the sealed items, the registrations and the
   alpha budget of AI-native projects, and signs every record it returns. See
   [AI-native projects](ai-native.md#the-keeper-step-2).
 - **Scenario pack.** A Python package that adds the stages, scorers and generators of one kind of AI-native project.

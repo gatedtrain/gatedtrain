@@ -300,10 +300,11 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
         env = self.call("report", p1)["report"]
         hello = self.call("hello", None)
         report = signing.verify(env, self.public(), kind="report")
-        self.assertEqual((report["schema"], report["schema_version"]), ("gatedtrain.ainative.report", 2))
+        self.assertEqual((report["schema"], report["schema_version"]), ("gatedtrain.ainative.report", 3))
         self.assertEqual(set(report), {"schema", "schema_version", "status", "metric", "n_sealed", "registration",
                                        "power", "gate_result", "display", "ledger", "attempts", "sealed_guarantee",
-                                       "known_limits", "alpha_rule", "keeper", "compute"})
+                                       "known_limits", "alpha_rule", "keeper", "compute",
+                                       "keeper_mode", "modes_seen", "require_keeper_mode"})      # AN-27, AN-28
         self.assertEqual(report["status"], "PASS")               # the PASS attempt is the headline
         gate = report["gate_result"]
         self.assertEqual((gate["attempt_id"], gate["alpha"], gate["status"]), (a2["attempt_id"], a2["alpha"], "PASS"))
@@ -321,7 +322,7 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
         self.assertEqual([(a["attempt_id"], a["status"]) for a in report["attempts"]],
                          [(a1["attempt_id"], "FAIL"), (a2["attempt_id"], "PASS")])
         self.assertEqual(set(report["attempts"][0]), {"attempt_id", "j", "candidate_model_sha256", "alpha", "status",
-                                                      "utc"})
+                                                      "utc", "keeper_mode"})
         self.assertEqual([x["id"] for x in report["known_limits"]],
                          ["sealed_guarantee", "original_data", "oracles", "metric_confirmation", "model_reference",
                           "alpha_rule", "sealed_evaluations"])
@@ -329,7 +330,7 @@ class KeeperAttemptsTest(Attempts, unittest.TestCase):
         self.assertEqual(limits["oracles"], texts.LIMIT_ORACLES)
         self.assertEqual(limits["alpha_rule"], texts.LIMIT_ALPHA_RULE)
         self.assertIn("valid given the earlier outcomes", texts.LIMIT_ALPHA_RULE)   # final review 6e
-        self.assertEqual(report["known_limits"][0]["text"], texts.KEEPER_SAME_USER_GUARANTEE)
+        self.assertEqual(report["known_limits"][0]["text"], texts.KEEPER_OWNER_RUN_GUARANTEE)
         self.assertEqual(report["known_limits"][-1]["attempts"], 3)
         self.assertEqual(report["alpha_rule"], {"rule": "foster-stine", "initial_wealth": ai.INITIAL_WEALTH,
                                                 "payout": 0.05, "min_bid": 0.005, "planning_alpha": 0.02375,

@@ -4,6 +4,171 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
+## Changes in 0.7.0 (Unreleased)
+
+Not released yet. Design revision 27. Rules AN-27 to AN-34 and IMG-1 to IMG-9.
+
+The AI-native path no longer needs sudo by default, and a result states the keeper mode that produced it (see [Keeper
+modes](docs/ai-native.md#keeper-modes) and the [quickstart without sudo](docs/sudo-free-quickstart.md)):
+
+- **Breaking-ish: `gatedtrain setup keeper` now prints a same-user setup by default.** The commands run without sudo:
+  a keeper under your own OS user, a state directory under your XDG data directory (mode 0700), a systemd user unit and
+  the socket under `$XDG_RUNTIME_DIR`. The old output (the keeper user, the root-owned environment, `sudo`) is
+  `gatedtrain setup keeper --mode separate-user`, unchanged. `--user` and `--venv` are refused in same-user mode
+  (AN-30), `--packages` is ignored there with a warning (the keeper runs from the current environment). Scripts that
+  parsed the old default output must pass `--mode separate-user`; without `--mode` the command adds one warning saying
+  so (JSON `warnings`, stderr in text mode), and an explicit `--mode` has none. The printed same-user block is one
+  script: its first line is `set -e` and every check exits non-zero, so a state directory that is shared or not yours
+  stops it before the unit is written and `systemctl --user enable --now` runs (run it with `sh FILE`, or paste it
+  whole). The `gatedtrain` command the unit runs is the one next to the Python that ran the setup (the PATH is not
+  searched, another environment's command could be there); `--executable PATH` (layout: `[same_user] executable`)
+  names another one, for example a link at a plain path when the venv's path holds a space, `%` or `$`. Only the
+  paths that reach `ExecStart=` must be plain: a home or `XDG_CONFIG_HOME` with a space no longer blocks the unit
+  directory. A path or Docker host with a non-printable character (escape, NUL, a line or bidi separator) is refused in
+  both setup commands and the layout file, and the printed commands escape any that remains.
+- **The keeper mode is an observed fact, signed and sticky.** The keeper derives `separate_user` or `same_user` from
+  its uids, its state directory and the uid of each peer, never from an option (AN-27); the mode is in `hello`
+  (`keeper_mode`, `mode_facts`, `modes_seen`; `same_user` stays), in the signed environment record and in every
+  registration, claim and report. A sealed set only ever gets weaker: once served in same-user mode it stays so, and a
+  set served in both modes says so. The client reads the kernel's credentials of the listener on the socket
+  (`SO_PEERCRED`) and a claim of separate-user mode never upgrades a result without it; a keeper that claims another uid
+  while the kernel names the client's own is refused (AN-29).
+- **New guarantee text, legacy text still recognised.** A same-user keeper states "the keeper ran under the same OS user
+  as the owner (same-user mode). It followed the procedure: ... these records show that the procedure was followed, not
+  that the sealed data stayed unseen. ..." instead of "(a test or development setup)". Reports with the old text still
+  verify and still warn. Every surface prints a mode line (`keeper fingerprint`, `project create --keeper`, `project
+  plan`, every stage of `project run`, `project status`, `keeper confirm`, `report.md`, `project report`, `verify`) and,
+  in the JSON envelope, `data.keeper_mode`; in same-user mode `project run`, `project status`, `project report`,
+  `project plan` and `project create` also add the mode line to `warnings`, and a same-user PASS (a gate line or a
+  report headline) carries the qualifier. The intake plan no longer says the data "will be sealed" without it.
+- **`--layout FILE` for `setup host` and `setup keeper` (AN-34).** One TOML file replaces the path flags (`gatedtrain
+  setup layout` prints a complete, commented one with the effective defaults). A flag beats the file, the file beats the
+  default; the printed commands start with the file's path and SHA-256 and the source of each non-default value, and
+  `data.layout` records the same. `schema_version = 1` is required; the file is read without following symlinks, has a
+  size cap, and is only printed, never read by the keeper. The `[gpu]` table (`wait_s`, `busy_mib`) and
+  `[inference] keeper_eval_python` are reserved: a layout that sets them is refused until the keeper has those options.
+  `[host] eval_python_root` is new (layout only). `setup host`'s flags no longer show their defaults as argparse
+  defaults; the output is unchanged.
+- **Report `schema_version` 3.** It adds `keeper_mode`, `modes_seen`, a `keeper_mode` per attempt and
+  `require_keeper_mode`. Version 2 reports are still verified, their mode read from the signed guarantee text; a
+  version 3 report whose mode contradicts its text is refused (AN-14).
+- **`project create --require-keeper-mode separate-user`** (default `any`) fixes, in the registration, that the project
+  accepts a separate-user keeper only. It is refused up front on a same-user keeper, enforced by the keeper at
+  `evaluate_sealed`, `gate` and `register`, and by `verify` (exit 3), also under `--accept-mode` (AN-28).
+- **`gatedtrain verify --accept-mode same-user`.** Exit 0 stays reserved for a separate-user result. A same-user result
+  still exits 1; with the option, exactly that result (not a rootful-access, revision 23 or unknown text) exits 0 and
+  ends with `ACCEPTED WEAKER MODE: same-user (...)` and keeps the consistency warnings of the strict path (an anchor
+  that is not the keeper still warns that deleted records cannot be seen); the JSON data has `accepted_weaker_mode`,
+  `keeper_mode` (the effective mode, never the keeper's unverified claim), `effective_mode`, `mode_basis` and `mode_sources`
+  (`keeper_claim`, `kernel_attestation`, `report`, `receipts`). The effective mode is the weakest of all of them: the
+  `keeper_mode` of every signed registration and claim receipt counts too, a report stronger than the receipts it
+  covers or with contradicting `modes_seen` or attempts is refused (AN-14), and a project with keeper receipts but no
+  stated mode says "mode unknown" and exits 1. The project commands print the weaker of the keeper's statement and
+  this client's check; the keeper's set mode also reads the `keeper_mode` of its signed claims and
+  registrations (so deleting `mode_seen.json` cannot make a set stronger) and `intake` enforces `--require-keeper-mode`.
+- **`gatedtrain setup check`** names the outside prerequisites (rootless Docker, `uidmap`, subordinate ids, user
+  namespaces, rootless networking, the NVIDIA driver and CDI spec, the systemd user session, lingering, the memlock
+  limit, `ptrace_scope`), says which ones an administrator has to provide, reads the host only and exits 1 when a
+  required one is missing or unknown (AN-32, AN-33).
+- **The image lock replaces hard-coded image IDs.** Code names logical images (`nemo-rl/tierb`,
+  `nemo-rl/tierb-uid1000`, `nemo-rl/tierb-rootless`); the accepted IDs live in `data/image-lock.json`, shipped with the
+  release, plus your own `$XDG_CONFIG_HOME/gatedtrain/images.json` that can only add user-built images; no environment
+  variable, flag or project file supplies an accepted ID, and the config cannot name an ID the lock lists (IMG-1 to
+  IMG-4). The module attributes the published packs import
+  (`NEMO_RL_IMAGE`, `NEMO_RL_IMAGES`, `NEMO_RL_UID1000_IMAGE`) are kept, computed from the lock; `accepted_images(logical)`
+  also reads your config. Registrations that name the two earlier IDs keep verifying.
+- **`gatedtrain --json image list` prints the sha256 of the lock it read** (`lock_sha256`), informational until
+  release hashes are published to compare it with. (`--json` is a top-level option: `image list --json` is a usage
+  error; the image READMEs and the build script's usage said so wrongly and are corrected, and a test now parses every
+  documented `gatedtrain` command line with the real parser.) The `nemo-rl/tierb-uid1000` lock entry records no
+  Containerfile hash: the maintainer image was built from the file before it took `BASE` as an argument (same chown
+  list), so the shipped file's hash would claim a build that did not happen. `containers/nemo-rl-tierb/build.sh` prints
+  the `image add` command for a tag that already existed WITHOUT `--recipe-commit` and `--containerfile-sha256`
+  (nothing in that run vouches for the image), so `image add` refuses it until you supply the true provenance.
+- **Report requests degrade one thing at a time.** A project directory under `jobs/` without its `job.json` (a submit
+  cut short) is no job and no longer fails the image list; when only the trainer images cannot be read the job totals
+  are still sent, with a warning; the retry without `images` happens only for an older keeper's exact `compute`
+  refusal (a keeper that predates `images`), never for another AN-10 refusal. Warnings raised below a command are
+  queued in `output.notice_scope()` (entered by `cli.main`) and carried by `emit`; a library caller outside a scope gets
+  them on stderr at once, or reads them with `output.drain_notices()` inside its own scope.
+- **`gatedtrain image list|check|add`** (IMG-5, IMG-6). `image add` records an image you built, at a terminal or with
+  `--yes`, and only adds. It is recorded for provenance only: packs adopt `accepted_images(logical)` in a later release,
+  so for now it changes nothing for gating.
+- **Image provenance in the report.** The driver declares each trainer image of the project's jobs, the keeper checks it
+  against its own copy of the maintainer lock and signs both, `report.md` has a line per image, and `verify` warns about
+  a user-added image or for jobs without a declared image block; `--require-maintainer-images` makes either exit 1, and
+  also exits 1 for a report that lists no image at all (no backend totals, zero jobs, an empty list). The keeper signs
+  no row that contradicts itself (an unlisted ID is never `maintainer-built` or `source: lock`; a repeated ID is
+  refused), `verify` refuses a malformed image entry (AN-14) instead of crashing, and the report carries the sha256 of
+  the keeper's shipped lock, the hash of the very bytes it checked, which `verify` prints with the note that in
+  same-user mode the file is writable by you and no release hash list is published yet (IMG-7 to IMG-9).
+- **Build recipes** in `containers/`: `nemo-rl-tierb` (a script and notes to build the Tier B image), `nemo-rl-rootless`
+  (the derived image for rootless Docker) and the updated `nemo-rl-uid1000`. New pages: [Quickstart without
+  sudo](docs/sudo-free-quickstart.md) and [NeMo RL on a rootless host](docs/rootless-nemo-rl.md).
+
+Known limits (read before relying on a same-user result):
+
+- **Same-user mode is meaningfully weaker.** Against an agent with a shell, it does not protect the sealed items, the
+  labels, the alpha ledger or the signing key; it shows that the procedure was followed, not that the data stayed
+  unseen. The reports and every surface say so; harden with `--mode separate-user` and new data.
+- **The kernel check (AN-29) holds for the reader's own account and the account that owns the project files.** It
+  compares the listener's uid with the verifier's own and with the uid that owns the project directory and
+  `trust/keeper.json` (the account that wrote the records): a keeper of either uid that claims separate-user mode is
+  refused. A reader under a third account (an admin, CI) must anchor with a fingerprint taken from the real keeper.
+- **Offline, `separate_user` means "stated by the key holder".** With `--fingerprint` or no anchor, the mode is what the
+  signed records say; on a same-user keeper the key holder is the user's own account, so the statement can be forged by
+  the account it is meant to guard against, and a fingerprint kept away from the agent does not prevent it (the key is
+  readable by the user). Such a result exits 0 with the warning "the mode is as stated by the holder of the key", the
+  line `mode as stated in the signed records: separate_user` and `data.mode_basis` (`kernel_attestation`,
+  `signed_records` or `report_text`). `keeper fingerprint` prints this limit. Use `--keeper` against a separate-user
+  keeper.
+- **Kernel attestation is Linux-only.** Where the kernel's answer about the listener is unavailable, a keeper's claim of
+  separate-user mode never upgrades the result: it counts as same-user, noted as unavailable.
+- **Image provenance is the driver's declaration, checked only against the keeper's own lock.** The keeper recognises
+  an image ID (it is in its lock or it is not); it never saw which image ran, and the job records are the driver's.
+  `report.md` and `verify` say "not observed: job records are the driver's". The lock's sha256 that `verify` and
+  `image list` print is informational until release hashes are published.
+- **The owner image config is not a security boundary against an agent running as the owner.** `HOME` and
+  `XDG_CONFIG_HOME` locate it, so a same-user agent can run `image add --yes` or write it. The reliable signal is the
+  keeper's `user_added` flag in the signed report (with the lock's sha256), which holds when the keeper's code is outside
+  the agent's reach (a separate-user keeper). `--require-maintainer-images` is the strict reading.
+- **A report without an image block is only a warning unless `--require-maintainer-images` is given.** The warning is
+  for a report that counts jobs but lists no image; a report that ran no jobs is silent without the flag (a warning on
+  every such report would carry no information) and fails with it. The job records are in the agent-writable project;
+  the image block is the driver's declaration, not proof of what ran. A project with no report at all fails
+  `--require-maintainer-images` ("no report states any trainer image").
+- **The build recipes need a source checkout.** `containers/` is not shipped in the wheel or sdist (only the lock is).
+- **A source build of the trainer image is not bit-reproducible.** Base images are pulled by tag, so its ID is host and
+  time specific; the recipe provenance, not the ID, is the audit trail.
+- **`NoNewPrivileges=yes` in the same-user keeper unit is unverified against rootless Docker** (no Docker was available
+  to try it); drop the line if the keeper cannot start its inference containers.
+- **The packs are not migrated yet.** The published scenario packs keep their own image lists (and the environment
+  variable one of them reads) until they adopt the lock's accepted-images call.
+- **The `gatedtrain-agent` MCP server and operator skill text are not updated.** They do not yet tell the agent to quote
+  the keeper mode, and still say that setup needs sudo.
+- **The separate-user path could not be tested with a real second OS user in CI.** The tests run the keeper as the test
+  user and inject the kernel's answer; the separate-user property is checked by hand on a host with a real keeper user.
+- **What the same-user guarantee covers about the model under test.** A batch generator's model runs in a container
+  without network access that is given the inputs only, never the labels. A per-item generator runs inside the keeper
+  process, without that confinement; the signed text says so. Both are inside the user's account in same-user mode.
+- **Batch packs need `--inference-image` in same-user mode too.** Without `setup keeper --inference-image sha256:...`
+  (and a rootless Docker for the user) the keeper refuses a batch generator with AN-8; per-item packs run without it.
+- **Version skew.** A 0.6.0 driver refuses a version 3 keeper report (AN-10), and a 0.6.0 `verify` fails with INTERNAL
+  on a project made by this release: upgrade the clients (the driver, `verify`) before or together with the keeper. A
+  new driver binds to a 0.6.0 keeper (the default requirement sends no argument), but `--require-keeper-mode
+  separate-user` is refused against it ("keeper predates AN-28; upgrade it").
+- **Upgrading an existing keeper needs a new setup.** A separate-user keeper's virtual environment is root-owned, so
+  `gatedtrain setup keeper --mode separate-user` has to be run again for the new code; nothing upgrades it in place.
+- **Unfinished legacy projects.** A project whose receipts state no keeper mode (made before this release) and that has
+  no report now exits 1 with "mode unknown" on an offline `verify --fingerprint`; verify it with `--keeper` against the
+  keeper, or finish it so that a report states the mode.
+- **Legacy sealed sets take the current observation.** A set made before this release has no `mode_seen.json`, so its
+  mode starts from what the keeper observes now. Do not move a same-user legacy state to a separate-user keeper: the
+  set would be called separate-user though it was held by a keeper the user's account could read. Make a new project
+  and take the data in again.
+
+Rules: AN-27 to AN-33, AN-14 (extended), AN-12 (extended), IMG-1 to IMG-9.
+
 ## Changes in 0.6.0
 
 The analysis code version stays `gatedtrain 0.3.0`: `gates.py` did not change, and the one change in `registration.py`

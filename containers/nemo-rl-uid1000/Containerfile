@@ -1,15 +1,15 @@
-# Area "CAD" GRPO trainer image: the Tier B NeMo RL image (nemo-rl:4f39fd8) with the vLLM files NeMo RL patches at
-# start-up (nemo_rl/models/generation/vllm/patches.py, _apply_vllm_patches) made writable by uid 1000. NeMo RL
-# rewrites those files and creates `<file>.patch_lock` beside them in the VllmGenerationWorker venv, which belongs to
-# nemo-runtime (uid 65532); the trainer runs as 1000:1000 (MM-34 refuses root), so the first GRPO smoke failed with
-# PermissionError on ray_executor.py.patch_lock. Only those ten files and their eight directories change owner;
-# nothing is added or upgraded. Build: docker [--context <context>] build -t gatedtrain-a6-nemo-rl:1 <this directory>
-# nemo-rl:4f39fd8 = a local tag of the image built from NeMo RL's own docker/Dockerfile at commit
-# 4f39fd86289a2ffd5aaf5d202702f7fd7185c924 (see README.md); the reference build had image ID
-# sha256:8cd5b714ea91ec7ea9a976c75b0ae6f6932140cf7a8aea803100de6331a2113a (checked after the build).
-# The final `USER root` is kept on purpose: it is part of the image configuration behind the pinned image ID, and the
+# NeMo RL trainer image for a trainer running as uid 1000: the Tier B image plus the ten vLLM files NeMo RL patches at
+# start-up (nemo_rl/models/generation/vllm/patches.py, _apply_vllm_patches), and their eight directories, owned by uid
+# 1000. NeMo RL rewrites those files and creates `<file>.patch_lock` beside them in the VllmGenerationWorker venv, which
+# belongs to nemo-runtime (uid 65532); the trainer runs as 1000:1000 (MM-34 refuses root), so without this layer the
+# first GRPO smoke fails with PermissionError on ray_executor.py.patch_lock. Nothing is added or upgraded.
+# Build (see README.md): docker [--context <context>] build --build-arg BASE=<the Tier B image> -t <tag> <this directory>
+# BASE is required: it names the Tier B image on that daemon. The image IDs gatedtrain accepts are data, in the image
+# lock (`gatedtrain image list`); `gatedtrain image check nemo-rl/tierb-uid1000 --ref <tag>` checks a build.
+# The final `USER root` is kept on purpose: it is part of the image configuration behind the accepted image ID, and the
 # launcher always runs the container with an explicit `--user` (1000:1000), so the image's default user is not used.
-FROM nemo-rl:4f39fd8
+ARG BASE
+FROM ${BASE}
 USER root
 RUN set -eu; \
     V=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker/lib/python3.13/site-packages/vllm; \

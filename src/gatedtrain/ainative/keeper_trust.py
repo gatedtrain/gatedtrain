@@ -28,20 +28,22 @@ from __future__ import annotations
 import base64
 import json
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
-from . import signing
+from ..output import notice
+from . import sealed_eval, signing
 from .alpha_investing import PLANNING_ALPHA
-from .keeper import protocol
+from .keeper import modes, protocol
 from .keeper.protocol import KeeperClient, RefusedAfterSpend
 from .project import Project, _refuse_links, _write_atomic
 from .trust import SealedRef
 
+# Keeper-mode records are `schema_version` KEEPER_SCHEMA_VERSION; the keeper's report is REPORT_SCHEMA_VERSION since AN-27.
+KEEPER_RECORD_VERSIONS = (sealed_eval.KEEPER_SCHEMA_VERSION, sealed_eval.REPORT_SCHEMA_VERSION)
 KEEPER_BINDING = "trust/keeper.json"
 KEEPER_PUB = "trust/keeper.pub"
 RECEIPTS = "trust/keeper/records.jsonl"
@@ -62,6 +64,20 @@ def _anchor(field: str, message: str, fix: str = "check the keeper; a project st
     return _refuse("AN-14", field, message, fix)
 
 
+# The message of a keeper that predates `images`: its exact-key check of `compute` (state._backend_compute).
+OLD_KEEPER_COMPUTE_MESSAGE = "compute is not {jobs, seconds, gpu_seconds}, each a whole number >= 0"
+
+
+def _older_keeper_refusal(exc: Refused, compute: dict) -> bool:
+    """True only for the refusal a keeper without `images` gives a `compute` that carries it: AN-10 on the field
+    `compute` with that keeper's exact-key message, while the totals sent are themselves whole numbers >= 0 (so the
+    extra key is the only possible cause). Any other refusal is the keeper's real answer."""
+    totals = [v for k, v in compute.items() if k != "images"]
+    ok_totals = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in totals)
+    return ok_totals and any(p.rule == "AN-10" and p.field == "compute" and p.message == OLD_KEEPER_COMPUTE_MESSAGE
+                             for p in exc.problems)
+
+
 def project_id(project: Project) -> str:
     """The id the keeper knows the project by: the sha256 of the canonical JSON of the project document (goal, data,
     pipeline, budget, creation time), so a copy of the binding in another project does not match."""
@@ -70,12 +86,24 @@ def project_id(project: Project) -> str:
 
 def backend_compute(project: Project) -> dict:
     """AN-10, AN-22: the project's job totals `{jobs, seconds, gpu_seconds}` from its local backend's records
-    (`LocalBackend.jobs`, which reads records only: no runtime, no host file); zeros for a project without jobs. The
-    keeper states them in the report as the driver's (cooperative, not checked by the keeper)."""
+    (`LocalBackend.jobs`, which reads records only: no runtime, no host file); zeros for a project without jobs, plus
+    `images`, the driver's declaration of the trainer images. The keeper states them in the report as the driver's
+    (cooperative, not checked by the keeper). A keeper that predates `images` refuses the extra key (AN-10): `report`
+    then sends the totals alone and warns."""
+    from . import image_provenance
     from .backend import LocalBackend          # backend imports this module (project_id)
 
     jobs = LocalBackend(project).jobs()
-    return {"jobs": len(jobs), "seconds": sum(j.seconds for j in jobs), "gpu_seconds": sum(j.gpu_seconds for j in jobs)}
+    out = {"jobs": len(jobs), "seconds": sum(j.seconds for j in jobs), "gpu_seconds": sum(j.gpu_seconds for j in jobs)}
+    # `images` (IMG-7, IMG-8): the trainer images of the job records with what the lock files say about each; the
+    # keeper re-derives `in_maintainer_lock` itself. They never cost the job totals: when only they fail, the report
+    # carries the totals without images (and `verify` then says the images are not declared).
+    try:
+        out["images"] = image_provenance.driver_images(project)
+    except Exception as exc:                     # the class only; the totals above stand
+        notice(f"warning: the project's trainer images cannot be read ({type(exc).__name__}); the report states the "
+               "job totals without trainer images")
+    return out
 
 
 @dataclass(frozen=True)
@@ -94,6 +122,21 @@ def _read(project: Project, rel: str) -> bytes | None:
     except OSError as exc:
         raise _anchor(rel, f"cannot read the keeper record ({type(exc).__name__})",
                       "check the file permissions") from None
+
+
+def project_account_uids(root: Path) -> frozenset[int]:
+    """AN-29: the uids of the accounts that wrote the project: the owner of its root directory and of the keeper binding
+    (`trust/keeper.json`), each read with `lstat` (a link is the link's own owner, never its target's). A listener of
+    one of these uids that claims separate-user mode is not separate from whoever wrote the records, so a reader
+    under a third account must not take the kernel's "another uid than mine" for a separate user. A path that cannot
+    be read adds no uid."""
+    uids = set()
+    for path in (Path(root), Path(root) / KEEPER_BINDING):
+        try:
+            uids.add(os.lstat(path).st_uid)
+        except OSError:
+            continue
+    return frozenset(uids)
 
 
 def load_binding(project: Project) -> KeeperBinding | None:
@@ -125,7 +168,7 @@ def _hello_key(hello: Any) -> tuple[str, bytes]:
     return fp, pem.encode("ascii")
 
 
-def bind_project(project: Project, socket: Path) -> KeeperBinding:
+def bind_project(project: Project, socket: Path, require_keeper_mode: str | None = None) -> KeeperBinding:
     """Bind the project to the keeper at `socket`: ask its key (`hello`), open the project in the keeper, then write
     `trust/keeper.pub` and `trust/keeper.json`. Binding again to the same key is a no-op; a binding to another key is
     refused (AN-14), since the project's signed records name the first one.
@@ -141,7 +184,10 @@ def bind_project(project: Project, socket: Path) -> KeeperBinding:
     if existing is not None and (existing.fingerprint != fp or existing.project_id != pid):
         raise _anchor(KEEPER_BINDING, "the project is already bound to a keeper with another key",
                       "a project stays with the keeper it was bound to; create a new project for another keeper")
-    client.call("open_project", pid, {})
+    # AN-28: the project's policy is fixed by this first open, in the keeper. The default (`any`, or None) sends nothing:
+    # it is the keeper's own default, and a keeper that predates AN-28 refuses the argument (AN-12).
+    args = {} if require_keeper_mode in (None, modes.REQUIRE_ANY) else {"require_keeper_mode": require_keeper_mode}
+    client.call("open_project", pid, args)
     for rel, data in ((KEEPER_PUB, pem), (KEEPER_BINDING, canonical_json({
             "schema": BINDING_SCHEMA, "schema_version": BINDING_SCHEMA_VERSION, "socket": str(socket),
             "fingerprint": fp, "project_id": pid}))):
@@ -167,7 +213,7 @@ def keeper_records(project: Project) -> bool:
             doc = json.loads(path.read_bytes().decode("utf-8"))
         except (OSError, UnicodeDecodeError, ValueError):
             continue
-        if isinstance(doc, dict) and doc.get("schema_version") == 2 and \
+        if isinstance(doc, dict) and doc.get("schema_version") in KEEPER_RECORD_VERSIONS and \
                 str(doc.get("schema", "")).startswith("gatedtrain.ainative."):
             return True
     return False
@@ -200,6 +246,7 @@ class KeeperTrust:
         self.binding = binding
         self.client = client if client is not None else KeeperClient(Path(binding.socket))
         self._guarantee: str | None = None
+        self._keeper_mode: str | None = None
 
     # ---- transport ------------------------------------------------------------------------------------------------
 
@@ -213,7 +260,8 @@ class KeeperTrust:
         waits with the long-op deadline (`protocol.LONG_OP_TIMEOUT_S`, read at call time) unless the client has an
         explicit timeout. A keeper that is not running still fails at once (the connect is refused, AN-12)."""
         timeout = self.client.timeout if self.client.timeout is not None else protocol.LONG_OP_TIMEOUT_S
-        hello = KeeperClient(self.client.socket_path, timeout=timeout).call("hello", self.binding.project_id, {})
+        asking = KeeperClient(self.client.socket_path, timeout=timeout)
+        hello = asking.call("hello", self.binding.project_id, {})
         fp, _ = _hello_key(hello)
         if fp != self.binding.fingerprint:
             raise _anchor("keeper", "the keeper at the socket serves another key than the one this project was bound "
@@ -222,11 +270,23 @@ class KeeperTrust:
         if not isinstance(hello.get("sealed_guarantee"), str):
             raise _anchor("hello", "the keeper states no guarantee", "check that the socket is a gatedtrain keeper's")
         self._guarantee = hello["sealed_guarantee"]
-        return hello
+        # AN-29: the keeper's claim is weakened by what the kernel says about the process that listens; a claim of
+        # separate-user mode from a listener with this process's own uid is refused
+        mode, note = modes.effective_client_mode(modes.claimed_mode(hello), asking.last_attested_uid, os.geteuid(),
+                                                 project_account_uids(self.project.root))
+        self._keeper_mode = mode
+        return {**hello, "effective_mode": mode, "mode_note": note}
 
     def _call(self, op: str, args: dict | None = None) -> Any:
         self.check()
         return self.client.call(op, self.binding.project_id, args or {})
+
+    @property
+    def keeper_mode(self) -> str:
+        """The effective mode (AN-29) at the last `check`: the keeper's claim weakened by the kernel's answer."""
+        if self._keeper_mode is None:
+            self.check()
+        return self._keeper_mode
 
     @property
     def sealed_guarantee(self) -> str:
@@ -429,14 +489,26 @@ class KeeperTrust:
         the project holds every envelope the report rests on. When the project's backend recorded at least one job,
         the request carries its job totals (`backend_compute`), which the report states as the driver's (AN-10); a
         project without jobs sends none, so a keeper that does not know `compute` still reports it. Job records that
-        cannot be read never block the report: no totals are sent and a warning goes to stderr."""
+        cannot be read never block the report: no totals are sent and a notice goes out. Notices are `output.notice`
+        calls: inside `output.notice_scope()` (which `cli.main` enters) they are queued for the command's `emit`, so
+        `--json` carries them in its warnings; a library caller can read them with `output.drain_notices()` inside its
+        own `output.notice_scope()`, and outside any scope they are printed to stderr at once."""
         try:
             compute = backend_compute(self.project)
         except Exception as exc:                 # the class only: the report does not rest on the driver's totals
             compute = None
-            print(f"warning: the project's job records cannot be read ({type(exc).__name__}); the keeper's report "
-                  "states no job totals of the driver", file=sys.stderr)
-        out = self._call("report", {"compute": compute} if compute and compute["jobs"] > 0 else None)
+            notice(f"warning: the project's job records cannot be read ({type(exc).__name__}); the keeper's report "
+                   "states no job totals of the driver")
+        send = {"compute": compute} if compute and compute["jobs"] > 0 else None
+        try:
+            out = self._call("report", send)
+        except Refused as exc:
+            if not (send and "images" in compute and _older_keeper_refusal(exc, compute)):
+                raise
+            # A keeper that predates `images` refuses the unknown key before it changes any state: retry once with
+            # the totals alone, and say that the report will carry no trainer image provenance once that worked.
+            out = self._call("report", {"compute": {k: v for k, v in compute.items() if k != "images"}})
+            notice("warning: the keeper does not know trainer image provenance; the report states no trainer images")
         record = self._keep(out.get("report") if isinstance(out, dict) else None, "report")
         self.sync()
         return record

@@ -38,6 +38,7 @@ import stat
 import sys
 import threading
 import time
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -46,7 +47,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ... import __version__
 from ...errors import Problem, Refused
 from .. import signing
-from . import envcheck, protocol, rootful, texts
+from . import envcheck, modes, protocol, rootful, texts
 from .protocol import RefusedAfterSpend
 from ..runtime import DockerCLIRuntime, Runtime
 from .inference import InferenceConfig, KeeperInference
@@ -67,6 +68,16 @@ class Keeper:
         self.environment = environment       # the signed environment envelope (kind `environment`)
         self.state = state
         self.host_view = rootful.HostView() if host_view is None else host_view
+
+    def observe_mode(self, peer_uid: int | None = None) -> dict:
+        """AN-27: `modes.observe` of this keeper for `peer_uid`; a state directory that cannot be read counts as
+        same-user (fail toward the weaker mode)."""
+        try:
+            return modes.observe(self.keeper_uid, self.owner_uid, os.stat(self.state_dir), peer_uid)
+        except OSError:
+            seen = modes.observe(self.keeper_uid, self.owner_uid, types.SimpleNamespace(st_uid=-1, st_mode=0), peer_uid)
+            return {"mode": modes.SAME_USER, "facts": {**seen["facts"], "reasons": [
+                *seen["facts"]["reasons"], "the state directory cannot be read"]}}
 
     def handle(self, line: bytes, peer: int) -> dict:
         """The response to one request line. Never raises: an unexpected exception becomes a problem with rule
@@ -98,13 +109,22 @@ def _hello(keeper: Keeper, project: str | None, args: dict, peer: int) -> dict:
         keeper.state.record_root_docker(reasons)      # a host-level fact: every open set
         if project is not None:
             root_docker, reasons = keeper.state.root_docker_for(project, reasons)
+    observed = keeper.observe_mode(peer)
+    seen = []
+    if keeper.state is not None and project is not None:
+        seen = keeper.state.project_modes(project)
+    keeper_mode = modes.weakest(observed["mode"], *seen)
     return {
         "keeper_version": __version__,
         "fingerprint": signing.fingerprint(key) if key is not None else None,
         "public_pem": signing.public_pem(key).decode("ascii") if key is not None else None,
-        "sealed_guarantee": texts.sealed_guarantee(keeper.keeper_uid, keeper.owner_uid, root_docker=root_docker),
+        "sealed_guarantee": texts.sealed_guarantee(keeper.keeper_uid, keeper.owner_uid, root_docker=root_docker,
+                                                   mode=keeper_mode),
         "environment_sha256": envcheck.environment_sha256(env["record"]) if env is not None else None,
-        "same_user": keeper.keeper_uid == keeper.owner_uid,
+        "same_user": keeper_mode == modes.SAME_USER,
+        "keeper_mode": keeper_mode,
+        "mode_facts": observed["facts"],
+        "modes_seen": seen,
         "owner_has_root_docker": root_docker,
         "root_docker_reasons": reasons,
     }
@@ -142,7 +162,8 @@ def _intake(state: KeeperState, project: str, args: dict, peer: int) -> dict:
     except (ValueError, binascii.Error, UnicodeEncodeError):
         raise protocol.refused("args.data_b64", "the data are not standard base64 text",
                                "send the data file's bytes in standard base64") from None
-    return state.intake(project, raw, args["data_sha256"], accept_inconclusive=args.get("accept_inconclusive", False))
+    return state.intake(project, raw, args["data_sha256"], accept_inconclusive=args.get("accept_inconclusive", False),
+                        peer_uid=peer)
 
 
 def _confirm(state: KeeperState, project: str, args: dict, peer: int) -> dict:
@@ -152,21 +173,22 @@ def _confirm(state: KeeperState, project: str, args: dict, peer: int) -> dict:
 
 OPS: dict[str, Callable[[Keeper, str | None, dict, int], object]] = {
     "hello": _hello,
-    "open_project": _state_op(lambda st, pr, a, peer: st.open_project(pr)),
+    "open_project": _state_op(lambda st, pr, a, peer: st.open_project(pr, a.get("require_keeper_mode"), peer), (),
+                              ("require_keeper_mode",)),
     "intake": _state_op(_intake, ("data_b64", "data_sha256"), ("accept_inconclusive",)),
-    "sealed_summary": _state_op(lambda st, pr, a, peer: st.sealed_summary(pr)),
+    "sealed_summary": _state_op(lambda st, pr, a, peer: st.sealed_summary(pr, peer)),
     "confirm_metric": _state_op(_confirm, ("scorer", "direction", "margin", "sentence"), ("scorer_params",)),
-    "register": _state_op(lambda st, pr, a, peer: st.register(pr, a["registration"]), ("registration",)),
+    "register": _state_op(lambda st, pr, a, peer: st.register(pr, a["registration"], peer), ("registration",)),
     "registration": _state_op(lambda st, pr, a, peer: st.registration(pr, a["hash"]), ("hash",)),
     "latest_registration": _state_op(lambda st, pr, a, peer: st.latest_registration(pr)),
     "records": _state_op(lambda st, pr, a, peer: st.records(pr)),
     "has_record": _state_op(lambda st, pr, a, peer: st.has_record(a["sha256"]), ("sha256",)),
     "alpha": _state_op(lambda st, pr, a, peer: st.alpha(pr)),
     "evaluate": _state_op(lambda st, pr, a, peer: st.evaluate(pr, a["registration_hash"], a["baseline"],
-                                                               a["candidate"]),
+                                                               a["candidate"], peer),
                           ("registration_hash", "baseline", "candidate")),
-    "gate": _state_op(lambda st, pr, a, peer: st.gate(pr, a["attempt_id"]), ("attempt_id",)),
-    "report": _state_op(lambda st, pr, a, peer: st.report(pr, a.get("compute")), (), ("compute",)),
+    "gate": _state_op(lambda st, pr, a, peer: st.gate(pr, a["attempt_id"], peer), ("attempt_id",)),
+    "report": _state_op(lambda st, pr, a, peer: st.report(pr, a.get("compute"), peer), (), ("compute",)),
 }
 
 
@@ -316,6 +338,9 @@ def serve(state_dir: Path, socket_path: Path, owner_uid: int, *, stop: threading
                         root_docker=lambda: rootful.owner_root_docker(owner_uid, view), inference=runner)
     try:
         record = envcheck.environment_record()
+        observed = state.observe_mode()           # AN-27: the mode and its facts at start, signed once (no peer yet)
+        record["mode"] = observed["mode"]
+        record["mode_facts"] = {k: v for k, v in observed["facts"].items() if k != "peer_uid"}
         if runner is not None:
             # the run directories, then the checks that need no Docker call, and only then any Docker call
             problems = runner.remove_leftovers() or runner.start_problems()
