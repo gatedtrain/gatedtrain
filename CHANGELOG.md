@@ -4,9 +4,9 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
-## Changes in 0.7.0 (Unreleased)
+## Changes in 0.7.0
 
-Not released yet. Design revision 27. Rules AN-27 to AN-34 and IMG-1 to IMG-9.
+Implements design revision 27 (tag `rev-27` of gatedtrain-design). Rules AN-27 to AN-34 and IMG-1 to IMG-9.
 
 The AI-native path no longer needs sudo by default, and a result states the keeper mode that produced it (see [Keeper
 modes](docs/ai-native.md#keeper-modes) and the [quickstart without sudo](docs/sudo-free-quickstart.md)):
