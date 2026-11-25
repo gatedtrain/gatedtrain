@@ -467,8 +467,21 @@ def scorer_rename_problems(prior: dict, reg: dict, base: Path) -> list[str]:
     return out
 
 
-def check_contents(reg: dict, *, evaluator_id: str | None = None) -> list[Problem]:
+def is_greedy(sampler: Any) -> bool:
+    """True for a sampler registered as greedy decoding (`decoding: greedy`, 05 section 18.3, AN-26)."""
+    return isinstance(sampler, dict) and sampler.get("decoding") == "greedy"
+
+
+GREEDY_RULE = "REG-GREEDY"
+
+
+def check_contents(reg: dict, *, evaluator_id: str | None = None, greedy_allowed: bool = False) -> list[Problem]:
     """05 section 3.7 contents and the 05 section 3.1 clause.
+
+    `greedy_allowed` (default False) lets a registration use greedy decoding: `sampler.decoding: greedy` with
+    temperature 0, no top_p below 1, one evaluation seed and one sample per item (`REG-GREEDY`). Only a path that
+    runs the determinism check of AN-26 passes True (the AI-native `evaluate_sealed`); everywhere else greedy
+    decoding stays refused.
 
     `evaluator_id` is the spec gate's `evaluator`: the deciding evaluator is the registration entry with that
     id (R11A-23), and its declaration in `items.EVALUATORS` checks direction, estimator and
@@ -617,21 +630,26 @@ def check_contents(reg: dict, *, evaluator_id: str | None = None) -> list[Proble
         else:
             if not isinstance(sampler.get("name"), str):
                 bad("sampler.name", "missing sampler name", "name the deployment sampler")
-            if not (_num(sampler.get("temperature")) and sampler["temperature"] > 0):
-                bad("sampler.temperature", "temperature must be > 0", "set a sampling temperature")
+            _check_decoding(sampler, bad, greedy_allowed)
             if not (_int(sampler.get("max_new_tokens")) and sampler["max_new_tokens"] >= 1):
                 bad("sampler.max_new_tokens", "max_new_tokens must be a positive integer", "set `max_new_tokens`")
             # Tier B sampler fields (TIER-B-SPEC H-7): top_p is NeMo Evaluator GenerationConfig.top_p
             # (config/services.py:39 at ea35ba3); enable_thinking goes to the chat template (G-15).
             if "top_p" in sampler and not (_num(sampler["top_p"]) and 0 < sampler["top_p"] <= 1):
                 bad("sampler.top_p", "top_p must be in (0, 1]", "set `top_p: 1.0`")
+            elif is_greedy(sampler) and "top_p" in sampler and sampler["top_p"] != 1:
+                bad("sampler.top_p", "greedy decoding ignores top_p, so a registered top_p below 1 would state a "
+                    "setting that has no effect", "remove `top_p` or set `top_p: 1.0`", GREEDY_RULE)
             if "enable_thinking" in sampler and sampler["enable_thinking"] is not False:
                 bad("sampler.enable_thinking",
                     "thinking must be off on both sides: the prototype trains and evaluates on NeMo Evaluator's "
                     "GSM8K prompt with enable_thinking false (interim rule G-15)", "set `enable_thinking: false`")
-            for key in sorted(set(sampler) - {"name", "temperature", "max_new_tokens", "top_p", "enable_thinking"}):
+            for key in sorted(set(sampler) - {"name", "temperature", "max_new_tokens", "top_p", "enable_thinking",
+                                              "decoding"}, key=str):
                 bad(f"sampler.{key}", "unknown sampler field",
-                    "use name, temperature, max_new_tokens, top_p, enable_thinking")
+                    "use name, temperature, max_new_tokens, top_p, enable_thinking, decoding")
+            if is_greedy(sampler):
+                _check_greedy_clause(reg, bad, multi)
     if "evaluators" in reg:
         if not (isinstance(evaluators, list) and evaluators and all(isinstance(e, dict) and isinstance(e.get("id"), str)
                                                                      for e in evaluators)):
@@ -968,6 +986,47 @@ def _check_eval_distribution(dist, bad) -> None:
     for key in sorted(set(dist) - set(EVAL_DISTRIBUTION_KEYS), key=str):
         bad(f"eval_distribution.{key}", "unknown eval_distribution field",
             f"remove `{key}`; allowed: {', '.join(EVAL_DISTRIBUTION_KEYS)}")
+
+
+def _check_decoding(sampler: dict, bad, greedy_allowed: bool) -> None:
+    """The temperature and `decoding` rules of a sampler mapping: sampled decoding needs temperature > 0; greedy
+    decoding is the explicit opt-in `decoding: greedy` with temperature exactly 0 (`REG-GREEDY`)."""
+    temperature = sampler.get("temperature")
+    if "decoding" in sampler and sampler["decoding"] != "greedy":
+        bad("sampler.decoding", f"decoding {sampler['decoding']!r} is not `greedy`; omit `decoding` for sampled "
+            "decoding", "set `decoding: greedy` with `temperature: 0`, or remove `decoding`", GREEDY_RULE)
+    if is_greedy(sampler):
+        if not greedy_allowed:
+            bad("sampler.decoding", "greedy decoding is not available on this path: it needs the determinism check "
+                "of the AI-native sealed evaluation (AN-26), and nothing here can check the arms",
+                "register a sampled decoding (temperature > 0), or use the AI-native path", GREEDY_RULE)
+        if not (_num(temperature) and temperature == 0):
+            bad("sampler.temperature", f"greedy decoding has temperature 0, not {temperature!r}",
+                "set `temperature: 0`", GREEDY_RULE)
+    elif _num(temperature) and temperature == 0:
+        bad("sampler.temperature", "temperature 0 is greedy decoding and must be registered explicitly",
+            "add `decoding: greedy` (one evaluation seed), or set a sampling temperature > 0", GREEDY_RULE)
+    elif not (_num(temperature) and temperature > 0):
+        bad("sampler.temperature", "temperature must be > 0", "set a sampling temperature")
+
+
+def _check_greedy_clause(reg: dict, bad, multi: bool) -> None:
+    """A greedy registration decides one clause from one sample per item under one evaluation seed: greedy decoding
+    repeats the same sample under every seed, so more seeds would state samples that are copies (AN-26)."""
+    if multi:
+        bad("clauses", "a greedy registration has one clause", "register one clause in `clause`", GREEDY_RULE)
+        return
+    clause = reg.get("clause")
+    if not isinstance(clause, dict):
+        return
+    seeds = clause.get("eval_seeds")
+    if isinstance(seeds, list) and len(seeds) != 1:
+        bad("clause.eval_seeds", f"greedy decoding has one sample per item, so one evaluation seed, not "
+            f"{len(seeds)}", "give exactly one seed in `eval_seeds`", GREEDY_RULE)
+    for key in ("samples_per_item", "samples_per_prompt"):
+        if key in clause and clause[key] != 1:
+            bad(f"clause.{key}", f"greedy decoding has one sample per item, not {clause[key]!r}",
+                f"set `{key}: 1`", GREEDY_RULE)
 
 
 def _check_clause(c: dict, bad, evaluator_id: str | None = None, *, constraint: bool = False,
