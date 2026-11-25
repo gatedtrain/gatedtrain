@@ -576,7 +576,7 @@ class KeeperState:
             raise _problem("AN-7", "registration", "the registration is not canonical JSON",
                            "use plain JSON values") from None
         try:
-            problems = check_contents(reg)
+            problems = check_contents(reg, greedy_allowed=True)    # AN-26: `evaluate` runs the determinism check
         except Exception as exc:                        # a malformed value the checker did not expect
             raise _problem("AN-7", "registration", f"the registration cannot be checked ({type(exc).__name__})",
                            "send a registration built by preregister") from None

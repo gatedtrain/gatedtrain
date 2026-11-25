@@ -21,12 +21,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import secrets
 from typing import Any, Callable
 
 from .. import gates
 from ..canonical import canonical_json, sha256_bytes
 from ..errors import Problem, Refused
-from ..registration import max_unpaired, min_paired
+from ..registration import is_greedy, max_unpaired, min_paired
 from .batch import CRASH, CRASH_FIX, BatchGenerator, BatchRunner, generate_batch
 
 DEFAULT_MDE = 0.10
@@ -190,16 +191,91 @@ def eval_seeds(full: dict) -> list:
     return seeds
 
 
+# ---------------------------------------------------------------------------
+# greedy decoding: the control seed (AN-26)
+# ---------------------------------------------------------------------------
+
+CONTROL_SEED_LIMIT = 2 ** 31
+
+
+def draw_control_seed(full: dict) -> int:
+    """A fresh seed that the registration does not name (AN-26): drawn per call from the system's random source, so
+    neither the generator nor the agent can know it before the run."""
+    registered = eval_seeds(full)
+    while True:
+        seed = secrets.randbelow(CONTROL_SEED_LIMIT)
+        if seed not in registered:
+            return seed
+
+
+def _check_control(full: dict, control: Any) -> int:
+    """The control seed to use for a greedy registration: `control`, or a fresh one; refused (AN-26) when the
+    registration is not one sample per item under one seed, or when `control` is a registered seed."""
+    seeds = eval_seeds(full)
+    if len(seeds) != 1:
+        raise _refuse("AN-26", "registration.clause.eval_seeds", "a greedy registration has exactly one evaluation "
+                      "seed", "rerun preregister")
+    if control is None:
+        return draw_control_seed(full)
+    if isinstance(control, bool) or not isinstance(control, int) or control in seeds:
+        raise _refuse("AN-26", "control_seed", "the control seed is not an integer outside eval_seeds",
+                      "use a seed the registration does not name")
+    return control
+
+
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _json_value(x: Any) -> bool:
+    if isinstance(x, _JSON_SCALARS):
+        return True
+    if isinstance(x, list):
+        return all(_json_value(v) for v in x)
+    if isinstance(x, dict):
+        return all(isinstance(k, str) and _json_value(v) for k, v in x.items())
+    return False
+
+
+def _equal(a: Any, b: Any) -> bool:
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a) == set(b) and all(_equal(a[k], b[k]) for k in a)
+    return type(a) is type(b) and a == b
+
+
+def same_prediction(a: Any, b: Any) -> bool | None:
+    """True when two predictions are the same JSON value of the same types (`1` and `1.0` differ, a NaN equals
+    nothing, key order does not matter), False when they differ, None when either is not a JSON value (a set,
+    bytes, a non-string key): such a prediction cannot be compared."""
+    if not (_json_value(a) and _json_value(b)):
+        return None
+    return _equal(a, b)
+
+
+def _control_failure(detail: str) -> Refused:
+    return _refuse("AN-26", "predictions", f"the greedy generator is not deterministic: {detail}",
+                   "fix the scenario pack's generator so that greedy decoding gives the same predictions under every "
+                   "seed, or register sampled decoding")
+
+
 def item_scorer(generate: Callable[..., Any], model: dict, full: dict, score: Callable[[Any, Any], float], seed: Any,
-                *, score_range: tuple[float, float], scorer_name: str) -> Callable[[dict], dict]:
+                *, score_range: tuple[float, float], scorer_name: str,
+                control_seed: Any = None) -> Callable[[dict], dict]:
     """A function of one sealed item (`{input, label}`) to its `{item_id, seed, score}` record under one seed.
 
     `item_id` is the item's position in the order the function is called in (counted per seed). `generate` is the
     registered generator, called as `generate(model, {"input": ...}, sampler=..., seed=seed)` with copies of the
     model reference and the registered sampler; the label goes to `score` only. An exception from `generate` or
     `score` (a `Refused` too: pack code may build one with the label in it) is refused (AN-8) with its class name
-    only, and so is a score that is not a finite number in `score_range`."""
+    only, and so is a score that is not a finite number in `score_range`.
+
+    For a greedy registration (`sampler.decoding: greedy`) every item is generated a second time under a control
+    seed that `eval_seeds` does not name (`control_seed`, or a fresh one), and a prediction that differs from the
+    registered seed's is refused (AN-26) without naming the item's content; only the registered seed's prediction is
+    scored. A sampled registration ignores `control_seed`."""
     sampler = full["sampler"]
+    control = _check_control(full, control_seed) if is_greedy(sampler) else None
     counter = [0]
 
     def run(item: dict) -> dict:
@@ -210,6 +286,18 @@ def item_scorer(generate: Callable[..., Any], model: dict, full: dict, score: Ca
         except Exception as exc:       # never carry the item (or the pack's message about it) out
             raise _refuse("AN-8", "generate", f"the generation function failed ({type(exc).__name__})",
                           "fix the scenario pack's generate") from None
+        if control is not None:
+            try:
+                again = generate(dict(model), {"input": item["input"]}, sampler=dict(sampler), seed=control)
+            except Exception as exc:
+                raise _refuse("AN-8", "generate", f"the generation function failed ({type(exc).__name__})",
+                              "fix the scenario pack's generate") from None
+            same = same_prediction(prediction, again)
+            if same is None:
+                raise _control_failure("a prediction is not a JSON value, so it cannot be compared")
+            if not same:
+                raise _control_failure("the predictions under the registered seed and under a seed the registration "
+                                       "does not name differ")
         return {"item_id": index, "seed": seed, "score": _score_one(score, prediction, item["label"], score_range,
                                                                     scorer_name)}
 
@@ -234,7 +322,8 @@ def _score_one(score: Callable[[Any, Any], float], prediction: Any, label: Any, 
 
 def score_arm(items: list[dict], generate: Callable[..., Any] | None, model: dict, full: dict,
               score: Callable[[Any, Any], float], *, score_range: tuple[float, float], scorer_name: str,
-              batch: BatchGenerator | None = None, runner: BatchRunner | None = None) -> list[dict]:
+              batch: BatchGenerator | None = None, runner: BatchRunner | None = None,
+              control_seed: Any = None) -> list[dict]:
     """One `{item_id, seed, score}` record per registered seed and item (seeds outer, items in the given order) of
     one arm: `items` are the sealed `{input, label}` items, `generate` the registered generator, `model` the arm's
     model reference, `full` the registration (its `sampler` and `clause.eval_seeds`), `score` the bound registered
@@ -243,32 +332,52 @@ def score_arm(items: list[dict], generate: Callable[..., Any] | None, model: dic
     With `batch` (AN-25), `generate` is not used: one `generate_batch` call through `runner` gives the predictions
     for all seeds and items, each scored as in `item_scorer`; the records are the same in shape and order. Without a
     `runner` it is refused (AN-8): a batch generator runs only in the keeper's inference container. Predictions not
-    in (seed, item) order, one per pair, are a crash (AN-9)."""
+    in (seed, item) order, one per pair, are a crash (AN-9).
+
+    A greedy registration (AN-26) also generates every item under one control seed that `eval_seeds` does not name
+    (`control_seed`, or a fresh one; in the batch form the same container call carries both seeds, in random
+    order) and refuses an arm whose predictions differ; only the registered seed's records are returned."""
     if batch is not None:
         return _score_arm_batch(items, model, full, score, batch, runner, score_range=score_range,
-                                scorer_name=scorer_name)
+                                scorer_name=scorer_name, control_seed=control_seed)
     records: list[dict] = []
     for seed in eval_seeds(full):
-        run = item_scorer(generate, model, full, score, seed, score_range=score_range, scorer_name=scorer_name)
+        run = item_scorer(generate, model, full, score, seed, score_range=score_range, scorer_name=scorer_name,
+                          control_seed=control_seed)
         records.extend(run(dict(item)) for item in items)
     return records
 
 
 def _score_arm_batch(items: list[dict], model: dict, full: dict, score: Callable[[Any, Any], float],
                      gen: BatchGenerator, runner: BatchRunner | None, *, score_range: tuple[float, float],
-                     scorer_name: str) -> list[dict]:
+                     scorer_name: str, control_seed: Any = None) -> list[dict]:
     if runner is None:
         raise _refuse("AN-8", "generate", "a batch generator runs in the keeper's inference container",
                       "bind the project to a keeper")
     seeds = eval_seeds(full)
+    run_seeds = list(seeds)
+    control = None
+    if is_greedy(full["sampler"]):
+        control = _check_control(full, control_seed)
+        run_seeds = [control, seeds[0]] if secrets.randbelow(2) else [seeds[0], control]
     predictions = generate_batch(gen, dict(model), [{"input": item["input"]} for item in items],
-                                 dict(full["sampler"]), list(seeds), runner=runner)
-    want = [(s, i) for s in seeds for i in range(len(items))]
+                                 dict(full["sampler"]), run_seeds, runner=runner)
+    want = [(s, i) for s in run_seeds for i in range(len(items))]
     if not (isinstance(predictions, list) and len(predictions) == len(want) and all(
             isinstance(p, dict) and p.get("seed") == s and p.get("item_id") == i and "prediction" in p
             for p, (s, i) in zip(predictions, want))):
         raise _refuse("AN-9", "predictions", f"{CRASH}: the runner did not return {len(want)} predictions in seed "
                       "and item order", CRASH_FIX)
+    if control is not None:
+        by_seed = {s: [p["prediction"] for p in predictions if p["seed"] == s] for s in run_seeds}
+        verdicts = [same_prediction(a, b) for a, b in zip(by_seed[seeds[0]], by_seed[control])]
+        if None in verdicts:
+            raise _control_failure("a prediction is not a JSON value, so it cannot be compared")
+        if False in verdicts:       # no count: how many items differ would be a number about the sealed items
+            raise _control_failure("the predictions under the registered seed and under a seed the registration "
+                                   "does not name differ")
+        predictions = [p for p in predictions if p["seed"] == seeds[0]]
+        want = [(seeds[0], i) for i in range(len(items))]
     return [{"item_id": i, "seed": s, "score": _score_one(score, p["prediction"], items[i]["label"], score_range,
                                                           scorer_name)}
             for p, (s, i) in zip(predictions, want)]

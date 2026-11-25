@@ -467,7 +467,7 @@ class Preregister:
         base = _registration(v, item_hash, _deployment(ctx), ctx.inputs["base_model"].sha256, (pack, gen),
                              scorers.evaluator_entry(spec, params),
                              KEEPER_SIGNED_BY if _keeper(ctx) else "prototype-unsigned")
-        problems = check_contents(base)
+        problems = check_contents(base, greedy_allowed=True)
         if problems:
             raise Refused(problems)
         final, amends, post_hoc = base, None, False
@@ -478,7 +478,7 @@ class Preregister:
             if prior_full.get("post_hoc") is True or (changed and _training_ran(ctx.project)):
                 post_hoc, amends = True, prior_out["hash"]
                 final = {**base, "post_hoc": True, "amends": amends, "created_at": _utc_now()}
-                problems = check_contents(final)
+                problems = check_contents(final, greedy_allowed=True)
                 if problems:
                     raise Refused(problems)
         digest = ctx.trust.register(final)
@@ -493,7 +493,7 @@ class Preregister:
     def check(self, ctx: StageContext, outputs: dict[str, ArtifactRef]) -> list[Problem]:
         out = ctx.project.read_artifact(outputs["registration"])
         full = ctx.trust.registration(out["hash"])
-        problems = list(check_contents(full))
+        problems = list(check_contents(full, greedy_allowed=True))
 
         def bad(field: str, message: str) -> None:
             problems.append(Problem("AN-7", field, message, "rerun preregister"))

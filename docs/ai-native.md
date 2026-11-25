@@ -350,3 +350,35 @@ within ±(2**53-1), a bool or null: a float, a larger int, a missing, extra or d
 `/out` is a crash.
 
 Rules: AN-8, AN-9 (see the [test reference](../tests/README.md)).
+
+### Greedy decoding
+
+A scenario pack's deployment record may register greedy decoding instead of sampling. It is an explicit opt-in, never
+a side effect of `temperature: 0`:
+
+```json
+{"sampler": {"name": "greedy", "decoding": "greedy", "temperature": 0, "max_new_tokens": 512},
+ "eval_seeds": [11]}
+```
+
+- `decoding: greedy` needs `temperature` exactly 0, a `top_p` that is absent or 1.0, and **one** evaluation seed (one
+  sample per item). `temperature: 0` without `decoding: greedy`, `decoding: greedy` with another temperature, and
+  several seeds are refused (`REG-GREEDY`). Everywhere else (`ext-*`, Tier B, `check_contents` without
+  `greedy_allowed`) greedy decoding stays refused: nothing there can check the arms.
+- The statistics are unchanged. The item is the resampled unit and a per-item score is the mean of its repeats, so
+  one sample per item gives an interval over items, `n` is the number of items, and the planning SD (the 0/1 bound)
+  already covers the larger per-item variance of a single deterministic output. A greedy score estimates the greedy
+  decoder's accuracy; it is not comparable with a score at temperature 0.7.
+- **Control seed (AN-26).** The keeper does not take "greedy" from the pack. Each arm's container call carries the
+  registered seed and one more seed that the registration does not name, drawn per attempt and placed in random order;
+  the keeper compares the two sets of predictions itself, and scores only the registered seed's. Any difference
+  refuses the attempt (`AN-26`, counts only), settles it as not passed and costs its alpha, like a crash (AN-9): the
+  comparison is one bit about the sealed items. A repeat under the same seed would not do, since seeded sampling
+  repeats too.
+- A pack whose vLLM run is not repeatable fails closed. Making it so (a fixed batch order, no prefix caching, eager
+  mode, one process) is the pack's job and is not checked beyond this comparison. The control pass runs in the same
+  process, so cross-process differences are not seen.
+- The scenario pack's generator must accept `decoding` in its sampler (a script that refuses unknown sampler keys
+  needs the key added) and must ignore the seed.
+
+Rules: REG-GREEDY, AN-26.

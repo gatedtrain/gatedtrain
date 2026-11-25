@@ -4,6 +4,19 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
+## Unreleased
+
+Registered greedy decoding for the AI-native path (design revision 26, AN-26):
+
+- A deployment record may register `sampler.decoding: greedy` with temperature 0, one evaluation seed and one sample
+  per item. It is refused everywhere else, and `temperature: 0` alone is still refused. See [Greedy
+  decoding](docs/ai-native.md#greedy-decoding).
+- `evaluate_sealed` (the keeper and the in-process path) generates every greedy item once more under a control seed
+  that the registration does not name and refuses an arm whose predictions differ.
+- No change to the gate statistics, the power plan or alpha-investing; `ANALYSIS_VERSION` stays `gatedtrain 0.3.0`.
+
+Rules: REG-GREEDY, AN-26.
+
 ## Changes in 0.5.0
 
 The analysis code version stays `gatedtrain 0.3.0` (the gate statistics and registration semantics did not change),
