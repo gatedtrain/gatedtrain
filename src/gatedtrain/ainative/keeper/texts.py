@@ -9,6 +9,8 @@ access was checked: no keeper states it any more, and `verify` exits 1 on a repo
 
 from __future__ import annotations
 
+from .modes import SAME_USER, SEPARATE_USER
+
 KEEPER_GUARANTEE_V1 = ("the sealed items, registrations, claims, ledger and per-item records are held by a separate OS "
                        "user running code the user's account cannot change, and every record is signed; the candidate "
                        "runs inside the keeper process, not in a container (a model format that executes code is "
@@ -41,7 +43,47 @@ KEEPER_SAME_USER_GUARANTEE = ("the keeper runs as the owner's own OS user, so an
                               "its state and signing key: the records are signed, but nothing is sealed (a test or "
                               "development setup)")
 
+# AN-27 (the same-user mode as a supported tier): what a keeper under the owner's own OS user states from now on. It
+# says what is still true (the procedure) and what is not (the data is not sealed from the user's account). The
+# text above stays a recognised legacy text, so reports made before this one still verify and still warn.
+KEEPER_OWNER_RUN_GUARANTEE = (
+    "the keeper ran under the same OS user as the owner (same-user mode). It followed the procedure: the "
+    "registration was signed before training, every sealed attempt spent its alpha before it was scored, and a "
+    "batch generator's model ran in a container without network access that was given the inputs only, never the "
+    "labels (a per-item generator runs inside the keeper process, without that confinement). It does not protect "
+    "the sealed items, the labels, the alpha ledger or its signing key from anything running as that user, such as "
+    "an agent with a shell, so these records show that the procedure was followed, not that the sealed data stayed "
+    "unseen. Run the keeper under a separate OS user (`gatedtrain setup keeper --mode separate-user`, one sudo) for "
+    "that guarantee.")
+
+# The one line every surface prints for the observed mode (AN-27); a surface never words a weaker mode like a stronger.
+MODE_LINE = {
+    SEPARATE_USER: "keeper mode: separate-user (the sealed data and the signing key are held by another OS user)",
+    SAME_USER: "keeper mode: same-user (NOT sealed from the user's account: the procedure is followed, the sealed "
+               "data is not protected from anything running as the user; to harden: gatedtrain setup keeper --mode "
+               "separate-user)"}
+
+# The limit of any statement of the mode that is read without the keeper listening: "separate-user" is then what the key
+# holder states (AN-27), and on a same-user keeper the holder is the user's own account.
+MODE_STATED_NOTE = ("note: the mode is as stated by the holder of the key (a same-user keeper's key is readable by the "
+                    "user, and a signature proves only who wrote the records); the kernel's check of the listener "
+                    "(AN-29) holds for the reader's own account and the account that owns the project files; a reader "
+                    "under a third account must anchor with a fingerprint taken from the real keeper")
+
+# Appended to a report headline in same-user mode, so "PASS" is never read next to "sealed" without the qualifier.
+HEADLINE_SUFFIX_SAME_USER = " (same-user keeper: procedure followed; sealed data not protected from the user's account)"
+
+# Appended to the intake plan's "will be sealed" sentence in same-user mode: the plan must not promise a seal the mode does
+# not give.
+PLAN_SEALED_SAME_USER = ("The keeper is in same-user mode: the sealed part is kept apart by the procedure only, not "
+                         "protected from anything running as your user.")
+
 COMPUTE_BACKEND_SOURCE = "the driver's job records (cooperative, not checked by the keeper)"   # AN-10 `compute`
+
+# The limit of the image provenance in a report and in `verify` (IMG-7): the keeper recognises an image ID, it never saw
+# which image ran.
+LIMIT_IMAGES_NOT_OBSERVED = ("not observed: job records are the driver's (agent-writable); the keeper recognises an image "
+                             "ID but never saw which image ran")
 
 LIMIT_ORIGINAL_DATA = ("the original data file is the user's and stays readable to anything running as the user; run "
                        "intake before handing the project to an agent and keep the original out of its reach")
@@ -50,11 +92,14 @@ LIMIT_KEEPER_CONFIRMATION = ("an agent with the user's shell can run `gatedtrain
                              "records that the confirmation came from the owner uid, not that a human typed it")
 
 
-def sealed_guarantee(keeper_uid: int, owner_uid: int, *, root_docker: bool = False) -> str:
+def sealed_guarantee(keeper_uid: int, owner_uid: int, *, root_docker: bool = False, mode: str | None = None) -> str:
     """The guarantee a keeper running as `keeper_uid` for the user `owner_uid` states; `root_docker`: the rootful-access
-    detection (AN-21) is positive now or was at a check on the sealed set."""
-    if keeper_uid == owner_uid:
-        return KEEPER_SAME_USER_GUARANTEE
+    detection (AN-21) is positive now or was at a check on the sealed set. `mode` (AN-27): the observed mode; when
+    given it decides same-user or not (a same-user keeper's text takes precedence over the rootful one); without it
+    the uids decide, as before."""
+    same_user = (keeper_uid == owner_uid) if mode is None else mode == SAME_USER
+    if same_user:
+        return KEEPER_OWNER_RUN_GUARANTEE
     return KEEPER_ROOT_DOCKER_GUARANTEE if root_docker else KEEPER_GUARANTEE
 
 

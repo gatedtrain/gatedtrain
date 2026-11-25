@@ -37,7 +37,8 @@ from gatedtrain.ainative.keeper_trust import KEEPER_BINDING, KEEPER_PUB, RECEIPT
 from gatedtrain.ainative.project import Project
 from gatedtrain.ainative.keeper import protocol
 from gatedtrain.ainative.keeper.protocol import KeeperClient
-from gatedtrain.ainative.verify import CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_KEEPER, SAME_USER_REPORT
+from gatedtrain.ainative.verify import (CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_KEEPER, OWNER_RUN_REPORT,
+                                        SAME_USER_RECORDS)
 from gatedtrain.errors import Refused
 from gatedtrain.testing import synthetic_pack as pack
 
@@ -82,11 +83,12 @@ class SetupKeeperTest(unittest.TestCase):                          # AN-19
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
+        self.tmp = Path(tmp.name)          # only to check that nothing is created here
+        self.root = Path("/srv/gk")        # the printed paths: nothing is created there, and the socket stays short
 
     def argv(self) -> list[str]:
-        return ["setup", "keeper", "--state", str(self.tmp / "state"), "--socket",
-                str(self.tmp / "run" / "keeper.sock"), "--venv", str(self.tmp / "venv"), "--owner-uid", "4321",
+        return ["setup", "keeper", "--mode", "separate-user", "--state", str(self.root / "state"), "--socket",
+                str(self.root / "run" / "keeper.sock"), "--venv", str(self.root / "venv"), "--owner-uid", "4321",
                 "--packages", "gatedtrain-pack-x==1.2.3"]
 
     def test_prints_the_commands_and_runs_nothing(self):
@@ -94,11 +96,11 @@ class SetupKeeperTest(unittest.TestCase):                          # AN-19
             code, doc = run(self.argv())
             tcode, text, err = run_text(self.argv())
         self.assertEqual((code, doc["ok"], doc["command"]), (0, True, "setup keeper"), doc)
-        self.assertEqual(set(doc["data"]), {"commands", "unit"})
+        self.assertEqual(set(doc["data"]), {"commands", "unit", "mode"})
         self.assertEqual(list(self.tmp.iterdir()), [], "setup created a file")
         commands, unit = doc["data"]["commands"], doc["data"]["unit"]
         joined = "\n".join(commands)
-        state, sock, venv = self.tmp / "state", self.tmp / "run" / "keeper.sock", self.tmp / "venv"
+        state, sock, venv = self.root / "state", self.root / "run" / "keeper.sock", self.root / "venv"
 
         def at(text: str) -> int:
             for i, c in enumerate(commands):
@@ -125,7 +127,7 @@ class SetupKeeperTest(unittest.TestCase):                          # AN-19
 
     def test_defaults_use_a_runtime_directory(self):
         with no_processes():
-            code, doc = run(["setup", "keeper"])
+            code, doc = run(["setup", "keeper", "--mode", "separate-user"])
         self.assertEqual(code, 0, doc)
         unit, joined = doc["data"]["unit"], "\n".join(doc["data"]["commands"])
         self.assertIn("RuntimeDirectory=gatedtrain-keeper\n", unit)
@@ -140,11 +142,11 @@ class SetupKeeperTest(unittest.TestCase):                          # AN-19
 
     def test_an_unpinned_package_or_a_bad_user_is_refused(self):
         with no_processes():
-            code, doc = run(["setup", "keeper", "--packages", "gatedtrain-pack-x"])
+            code, doc = run(["setup", "keeper", "--mode", "separate-user", "--packages", "gatedtrain-pack-x"])
             self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-19"), doc)
-            code, doc = run(["setup", "keeper", "--user", "x; rm -rf /"])
+            code, doc = run(["setup", "keeper", "--mode", "separate-user", "--user", "x; rm -rf /"])
             self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-19"), doc)
-            code, doc = run(["setup", "keeper", "--state", "relative/state"])
+            code, doc = run(["setup", "keeper", "--mode", "separate-user", "--state", "relative/state"])
             self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-19"), doc)
 
     def test_a_path_systemd_would_rewrite_is_refused(self):           # final review 6b: unit specifiers
@@ -153,7 +155,7 @@ class SetupKeeperTest(unittest.TestCase):                          # AN-19
                 for bad in ("/srv/k%h", "/srv/k eeper", "/srv/k\teeper", "/srv/k'eeper", '/srv/k"eeper',
                             "/srv/k\\eeper", "/srv/k$HOME"):
                     with self.subTest(flag=flag, path=bad):
-                        code, doc = run(["setup", "keeper", flag, bad])
+                        code, doc = run(["setup", "keeper", "--mode", "separate-user", flag, bad])
                         self.assertEqual((code, doc["problems"][0]["rule"], doc["problems"][0]["field"]),
                                          (3, "AN-19", flag), doc)
 
@@ -188,6 +190,31 @@ class CliProject(KeeperProject):
             if ref == until:
                 return
 
+    def restamp(self, proj, mode: str | None, **extra) -> None:
+        """Re-sign the project's registration and claim receipts with the keeper's key so they state `mode` (None
+        removes the field, as a keeper before AN-27 signed them) and the registration also `extra` fields; the stage
+        record of the registration follows its new envelope. The report is left as it is."""
+        key = signing.load_private_key(self.kp.state / "keeper.key")
+        lines = [json.loads(x) for x in (proj.root / RECEIPTS).read_bytes().splitlines() if x]
+        out, moved = [], {}
+        for env in lines:
+            if env["kind"] in ("registration", "claim"):
+                rec = {k: v for k, v in env["record"].items() if k not in ("schema", "schema_version", "envelope_sha256")}
+                rec.pop("keeper_mode", None)
+                if mode is not None:
+                    rec["keeper_mode"] = mode
+                if env["kind"] == "registration":
+                    rec.update(extra)
+                new = signing.sign(key, env["kind"], rec)
+                moved[signing.envelope_sha256(env)] = signing.envelope_sha256(new)
+                env = new
+            out.append(env)
+        (proj.root / RECEIPTS).write_bytes(b"".join(json.dumps(e).encode() + b"\n" for e in out))
+        for path in (proj.root / "stages").glob("*/registration.json"):
+            doc = json.loads(path.read_text())
+            doc["envelope_sha256"] = moved[doc["envelope_sha256"]]
+            path.write_text(json.dumps(doc))
+
     def held(self, proj) -> set[str]:
         """The sha256 of every envelope the keeper signed for the project."""
         pid = json.loads((proj.root / KEEPER_BINDING).read_text())["project_id"]
@@ -204,8 +231,12 @@ class CliProject(KeeperProject):
 
         def call(client, op, project, args):
             out = real(client, op, project, args)
-            return {**out, "same_user": False, "owner_has_root_docker": False} if op == "hello" else out
-        with mock.patch.object(KeeperClient, "call", call):
+            if op != "hello":
+                return out
+            return {**out, "same_user": False, "keeper_mode": "separate_user", "owner_has_root_docker": False}
+        # the kernel's answer about the listener (AN-29): another uid than this process's, as for a real keeper user
+        with mock.patch.object(KeeperClient, "call", call), \
+                mock.patch.object(protocol, "attested_listener_uid", lambda sock: os.geteuid() + 1):
             yield
 
 
@@ -217,9 +248,12 @@ class KeeperCliTest(CliProject, unittest.TestCase):
     def test_fingerprint(self):
         code, doc = run(["keeper", "fingerprint", "--socket", str(self.kp.socket)])
         self.assertEqual((code, doc["command"]), (0, "keeper fingerprint"), doc)
+        facts = doc["data"].pop("mode_facts")                                                    # AN-27
+        self.assertEqual(facts["reasons"][0], "the keeper runs under the owner's own uid")
         self.assertEqual(doc["data"], {"fingerprint": signing.fingerprint(self.public()),
-                                       "sealed_guarantee": texts.KEEPER_SAME_USER_GUARANTEE,
-                                       "owner_has_root_docker": False, "root_docker_reasons": []})    # AN-21
+                                       "sealed_guarantee": texts.KEEPER_OWNER_RUN_GUARANTEE,
+                                       "owner_has_root_docker": False, "root_docker_reasons": [],    # AN-21
+                                       "keeper_mode": "same_user"})
         code, doc = run(["keeper", "fingerprint", "--socket", str(self.tmp / "none.sock")])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-12"), doc)
 
@@ -231,8 +265,10 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertEqual(code, 0, doc)
         proj = Project.load(self.tmp / "p")
         binding = json.loads((proj.root / KEEPER_BINDING).read_text())
-        self.assertEqual(doc["data"]["keeper"], {"fingerprint": signing.fingerprint(self.public()),
-                                                 "project_id": binding["project_id"]})
+        keeper = doc["data"]["keeper"]
+        self.assertEqual({k: keeper[k] for k in ("fingerprint", "project_id", "keeper_mode", "require_keeper_mode")},
+                         {"fingerprint": signing.fingerprint(self.public()), "project_id": binding["project_id"],
+                          "keeper_mode": "same_user", "require_keeper_mode": "any"})
         self.assertTrue((proj.root / KEEPER_PUB).is_file())
         code, doc = run(["project", "create", str(self.tmp / "q"), "--goal", "lookup", "--data", str(data),
                          "--pipeline", str(pack.SCENARIO.pipeline), "--keeper", str(self.tmp / "none.sock")])
@@ -262,7 +298,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertFalse(any(e["kind"] == "metric_confirmation" for e in KeeperTrust(proj).receipts()))
         code, doc = run([*argv, "--yes"])
         self.assertEqual((code, doc["command"]), (0, "keeper confirm"), doc)
-        self.assertEqual(set(doc["data"]), {"sentence", "envelope_sha256"})
+        self.assertEqual(set(doc["data"]), {"sentence", "envelope_sha256", "keeper_mode"})
         self.assertIn(spec.what, doc["data"]["sentence"])
         self.assertIn(f"more than {MARGIN * 100:g} points", doc["data"]["sentence"])
         env = [e for e in KeeperTrust(proj).receipts() if e["kind"] == "metric_confirmation"]
@@ -286,7 +322,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         # report states the same-user guarantee, which exits 1 under any anchor
         self.assertEqual((code, doc["ok"], doc["command"], doc["data"]["anchor"], doc["data"]["fingerprint"]),
                          (1, False, "verify", "keeper", fp), doc)
-        self.assertEqual((doc["problems"], doc["warnings"]), ([], [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
+        self.assertEqual((doc["problems"], doc["warnings"]), ([], [SAME_USER_KEEPER, OWNER_RUN_REPORT]), doc)
         n = len((proj.root / RECEIPTS).read_bytes().splitlines())
         self.assertEqual(doc["data"]["checked"], n + 3)                # every receipt, registration, gate, report
         code, text, err = run_text(["verify", root, "--keeper", str(self.kp.socket)])
@@ -296,17 +332,17 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         with self.separate_user_keeper():                              # a keeper under its own user anchors
             code, doc = run(["verify", root, "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["ok"], doc["data"]["anchor"], doc["warnings"]),
-                         (1, False, "keeper", [SAME_USER_REPORT]), doc)
+                         (1, False, "keeper", [OWNER_RUN_REPORT]), doc)
         code, doc = run(["verify", root, "--fingerprint", fp])
         self.assertEqual((code, doc["data"]["anchor"]), (1, "fingerprint"), doc)
         code, doc = run(["verify", root, "--keeper", str(self.kp.socket), "--fingerprint", fp])
         self.assertEqual((code, doc["data"]["anchor"], doc["warnings"]),
-                         (1, "keeper", [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
+                         (1, "keeper", [SAME_USER_KEEPER, OWNER_RUN_REPORT]), doc)
         code, doc = run(["verify", root])
         self.assertEqual((code, doc["ok"], doc["data"]["anchor"]), (1, False, "none"), doc)
-        self.assertEqual(doc["warnings"], [CONSISTENCY_ONLY, OFFLINE_LIMIT, SAME_USER_REPORT])
+        self.assertEqual(doc["warnings"], [CONSISTENCY_ONLY, OFFLINE_LIMIT, OWNER_RUN_REPORT, texts.MODE_STATED_NOTE])
         code, doc = run(["verify", root, "--fingerprint", fp])
-        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, SAME_USER_REPORT])
+        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, OWNER_RUN_REPORT, texts.MODE_STATED_NOTE])
         code, text, err = run_text(["verify", root, "--fingerprint", fp])
         self.assertIn(OFFLINE_LIMIT, err)
 
@@ -366,7 +402,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
             f.write(json.dumps(forged).encode() + b"\n")
         code, doc = run(["verify", str(proj.root), "--fingerprint", signing.fingerprint(self.public())])
         self.assertEqual((code, doc["problems"]), (1, []), doc)      # signed by the key: offline it checks
-        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, SAME_USER_REPORT])    # (exit 1: a same-user report)
+        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, OWNER_RUN_REPORT, texts.MODE_STATED_NOTE])    # (exit 1: a same-user report)
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), doc)
 
@@ -400,7 +436,7 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"][0]["rule"]), (3, "AN-14"), doc)
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])
-        self.assertEqual((code, doc["warnings"]), (0, [OFFLINE_LIMIT]), doc)     # offline: stated, not detected
+        self.assertEqual((code, doc["warnings"]), (1, [OFFLINE_LIMIT, SAME_USER_RECORDS, texts.MODE_STATED_NOTE]), doc)   # stated, not detected
 
     def test_project_report_fetches_missing_receipts(self):
         proj = self.create()
@@ -412,15 +448,17 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertIn("not received by the driver", doc["problems"][0]["message"])
         self.assertIn("project report", doc["problems"][0]["fix"])
         code, doc = run(["project", "report", str(proj.root)])
-        self.assertEqual((code, doc["warnings"]), (0, []), doc)
+        self.assertEqual((code, doc["warnings"]), (0, [texts.MODE_LINE["same_user"]]), doc)
         self.assertEqual(self.received(proj), self.held(proj))
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"]), (1, []), doc)
         self.kp.stop()                                                  # an unreachable keeper: printed, warned
         code, doc = run(["project", "report", str(proj.root)])
         self.assertEqual(code, 0, doc)
-        self.assertEqual(len(doc["warnings"]), 1, doc)
+        self.assertEqual(len(doc["warnings"]), 3, doc)                  # the sync, the mode check and the mode line
         self.assertIn("AN-12", doc["warnings"][0])
+        self.assertIn("could not be asked for its mode", doc["warnings"][1])
+        self.assertEqual(doc["warnings"][2], texts.MODE_LINE["same_user"])
 
     def test_status_reads_the_keeper_ledger(self):                   # project_id and j
         proj, other = self.create(), self.create("other")             # same data: one sealed set, one ledger
@@ -434,15 +472,17 @@ class KeeperCliTest(CliProject, unittest.TestCase):
         self.assertEqual(doc["data"]["alpha_ledger"], entries[1:])     # this project's attempts only
         self.assertEqual(doc["data"]["gate"], "PASS")
         code, doc = run(["project", "report", str(proj.root)])
-        self.assertEqual((code, doc["data"]["report"]["schema_version"]), (0, 2), doc)
+        self.assertEqual((code, doc["data"]["report"]["schema_version"]), (0, 3), doc)
 
         self.kp.stop()
         code, doc = run(["project", "status", str(proj.root)])
         self.assertEqual(code, 0, doc)
         self.assertIsNone(doc["data"]["alpha_ledger"])
         self.assertEqual(doc["data"]["stages"]["report"]["status"], "done")
-        self.assertEqual(len(doc["warnings"]), 1)
+        self.assertEqual(len(doc["warnings"]), 3, doc["warnings"])      # the ledger, the mode check, the mode line
         self.assertIn("AN-12", doc["warnings"][0])
+        self.assertIn("could not be asked for its mode", doc["warnings"][1])
+        self.assertEqual(doc["warnings"][2], texts.MODE_LINE["same_user"])     # unknown counts as the weaker mode
 
 
 @skip_unless_linux
@@ -475,12 +515,12 @@ class AbandonedEvaluateTest(CliProject, unittest.TestCase):
         self.assertEqual(sorted(claims), [1, 2])
         fp = signing.fingerprint(self.public())
         code, doc = run(["verify", str(proj.root), "--fingerprint", fp])          # exit 1: a same-user report
-        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [OFFLINE_LIMIT, SAME_USER_REPORT]), doc)
+        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [OFFLINE_LIMIT, OWNER_RUN_REPORT, texts.MODE_STATED_NOTE]), doc)
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
-        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
+        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [SAME_USER_KEEPER, OWNER_RUN_REPORT]), doc)
         with self.separate_user_keeper():
             code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
-        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [SAME_USER_REPORT]), doc)
+        self.assertEqual((code, doc["problems"], doc["warnings"]), (1, [], [OWNER_RUN_REPORT]), doc)
 
 
 @skip_unless_linux
@@ -510,7 +550,7 @@ class ScoringErrorAfterSpendTest(CliProject, unittest.TestCase):
         self.assertEqual(summary["status"], "MISSING")
         self.assertEqual(self.received(proj), self.held(proj))
         code, doc = run(["verify", str(proj.root), "--fingerprint", signing.fingerprint(self.public())])
-        self.assertEqual((code, doc["problems"]), (0, []), doc)
+        self.assertEqual((code, doc["problems"]), (1, []), doc)         # the receipts state same_user
         code, doc = run(["verify", str(proj.root), "--keeper", str(self.kp.socket)])
         self.assertEqual((code, doc["problems"]), (1, []), doc)
 

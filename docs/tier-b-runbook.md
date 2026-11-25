@@ -180,7 +180,7 @@ docker buildx build --target release --build-context nemo-rl=. -f docker/Dockerf
 docker image inspect nemo-rl:4f39fd8 --format '{{.Id}}'
 ```
 
-Record the image ID. It is the `--image-id` of step 11.
+Record the image ID. It is the `--image-id` of step 11. The image IDs gatedtrain accepts are data, not code: `gatedtrain image list` shows them. A source build gets an ID of its own, which is accepted only after `gatedtrain image check nemo-rl/tierb --ref nemo-rl:4f39fd8` and `gatedtrain image add` (see `containers/nemo-rl-tierb/README.md`); reports then flag it as user-added.
 
 ```sh
 docker run --rm nemo-rl:4f39fd8 git -C /opt/nemo-rl rev-parse HEAD

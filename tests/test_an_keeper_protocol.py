@@ -171,7 +171,8 @@ class TestHandle(unittest.TestCase):
         self.assertEqual(resp["problems"], [])
         self.assertEqual(set(resp["result"]), {"keeper_version", "fingerprint", "public_pem", "sealed_guarantee",
                                                "environment_sha256", "same_user", "owner_has_root_docker",
-                                               "root_docker_reasons"})                     # AN-21
+                                               "root_docker_reasons",                      # AN-21
+                                               "keeper_mode", "mode_facts", "modes_seen"})  # AN-27
         self.assertIs(resp["result"]["same_user"], True)       # the test keeper runs as the owner uid
 
     def test_bad_lines(self):
@@ -304,7 +305,7 @@ class TestInProcessServer(unittest.TestCase):
     def test_response_over_the_cap_refused(self):
         # the cap check is on the server side: a big result becomes one AN-12 problem line
         # the cap leaves room for `hello` (fingerprint, public key, environment hash), which the helper waits on
-        with serving(MAX_RESPONSE_BYTES=1024) as sock, \
+        with serving(MAX_RESPONSE_BYTES=2048) as sock, \
                 mock.patch.dict(server.OPS, {"big": lambda k, pr, a, peer: {"x": "y" * 4000}}):
             p = problem_of(raw_roundtrip(sock, b'{"op":"big","project":null,"args":{}}\n'))
             self.assertEqual((p["rule"], p["field"]), ("AN-12", "response"))

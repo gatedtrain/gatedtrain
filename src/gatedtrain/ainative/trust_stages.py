@@ -46,9 +46,9 @@ from .. import ANALYSIS_CODE_VERSION, gates
 from ..canonical import sha256_bytes
 from ..errors import Problem, Refused
 from ..registration import check_contents, resolved_evaluator_hash
-from . import alpha_investing, scorers, sealed_eval, signing
+from . import alpha_investing, image_provenance, scorers, sealed_eval, signing
 from .batch import BatchGenerator
-from .keeper import texts as keeper_texts
+from .keeper import modes, texts as keeper_texts
 from .project import ArtifactRef, Project, _refuse_links, _utc_now, _write_atomic
 from .stage import Proposal, StageContext
 from .trust import NEW_TEST_FIX, SealedRef
@@ -60,7 +60,8 @@ from .sealed_eval import (DEFAULT_ALPHA, DEFAULT_MDE, DEFAULT_POWER, LIMIT_ALPHA
 from .sealed_eval import effective_status as _effective_status, eval_seeds as _eval_seeds, headline as _headline
 
 SCHEMA_VERSION = 1
-KEEPER_SCHEMA_VERSION = 2          # the keeper-mode records of the same schema ids
+KEEPER_REPORT_VERSIONS = sealed_eval.REPORT_SCHEMA_VERSIONS   # a version 2 report still checks (see `sealed_eval`)
+KEEPER_SCHEMA_VERSION = sealed_eval.KEEPER_SCHEMA_VERSION
 # The registration field that names the alpha rule in keeper mode: `signed_by` names the signer,
 # which under the keeper is the keeper, and the rule it sets each attempt's test level by.
 KEEPER_SIGNED_BY = f"gatedtrain-keeper (alpha rule: {alpha_investing.RULE})"
@@ -141,6 +142,8 @@ class IntakeSeal:
             summary = (f"{s['n_unique']} distinct labelled examples: {s['n_sealed']} will be sealed for the final "
                        f"test and {len(s['train'])} are for training; the test can detect a gain of "
                        f"{s['mde']:.2g} or more.")
+            if _keeper(ctx) and getattr(ctx.trust, "keeper_mode", None) == modes.SAME_USER:
+                summary += " " + keeper_texts.PLAN_SEALED_SAME_USER       # AN-27: never "sealed" without the qualifier
         else:
             summary = (f"{s['n_unique']} distinct labelled examples are too few: the final test will most likely be "
                        f"INCONCLUSIVE (it needs {s['n_needed']} sealed examples to detect a gain of "
@@ -1105,11 +1108,12 @@ def _render_keeper(report: dict) -> list[str]:
     rule = report["alpha_rule"]
     ledger = {row["attempt_id"]: row for row in report["ledger"]}
     lines = ["", "## Sealed attempts of this project"]
+    v3 = report.get("schema_version") == sealed_eval.REPORT_SCHEMA_VERSION              # AN-27: the attempt's keeper mode
     for a in report["attempts"]:
         row = ledger.get(a["attempt_id"], {})
         lines.append(f"- attempt {a['attempt_id']} (j = {a['j']}) at {a['utc']}: status {a['status']}, alpha "
                      f"{a['alpha']}, alpha spent {row.get('cost')}, alpha earned {row.get('earned')}, candidate "
-                     f"{a['candidate_model_sha256']}")
+                     f"{a['candidate_model_sha256']}" + (f", keeper mode {a['keeper_mode']}" if v3 else ""))
     lines += ["", "## Alpha-investing ledger of the sealed set"]
     for row in report["ledger"]:
         lines.append(f"- attempt {row['attempt_id']} of project {row['project_id']}: alpha {row['alpha']}, "
@@ -1132,7 +1136,24 @@ def _render_keeper(report: dict) -> list[str]:
         b = compute.get("backend")
         if b is not None:
             lines.append(f"- backend: {b['jobs']} jobs, {b['seconds']} s, {b['gpu_seconds']} GPU s ({b['source']})")
+            lines += image_provenance.render_lines(b.get("images") or [])         # IMG-7
+            if b.get("images"):
+                lines.append(f"- {keeper_texts.LIMIT_IMAGES_NOT_OBSERVED}")
     return lines
+
+
+def _mode_head(report: dict, lines: list[str]) -> list[str]:
+    """AN-27: a keeper report (version 3) opens with the observed keeper mode, and in same-user mode its headline
+    carries the qualifier, so no surface reads "PASS" next to "sealed" without it. A set served in more than one
+    mode says so."""
+    mode = report["keeper_mode"]
+    out = [keeper_texts.MODE_LINE[mode], "", lines[0] + (keeper_texts.HEADLINE_SUFFIX_SAME_USER
+                                                         if mode == modes.SAME_USER else ""), *lines[1:]]
+    seen = [m["mode"] for m in report.get("modes_seen") or []]
+    if len(set(seen)) > 1:
+        out[2:2] = [f"This sealed set was served in more than one keeper mode ({', '.join(seen)}); the report states "
+                    f"the weakest, {mode}.", ""]
+    return out
 
 
 def render_markdown(report: dict) -> str:
@@ -1140,7 +1161,9 @@ def render_markdown(report: dict) -> str:
     `schema_version` 2 (the keeper's) lists every attempt with alpha spent and earned, the alpha rule and the key
     fingerprint; version 1 renders as in step 1."""
     lines = _render_head(report)
-    if report.get("schema_version") == 2:
+    if report.get("schema_version") == sealed_eval.REPORT_SCHEMA_VERSION:
+        lines = _mode_head(report, lines)
+    if report.get("schema_version") in KEEPER_REPORT_VERSIONS:
         lines += _render_keeper(report)
     else:
         lines += ["", "## Gate attempts"]
@@ -1211,7 +1234,7 @@ class Report:
                           "rerun report with the gate result of the latest registration")
         ctx.trust.receipts()
         report = ctx.trust.report()
-        if report.get("schema") != SCHEMA_REPORT or report.get("schema_version") != KEEPER_SCHEMA_VERSION or \
+        if report.get("schema") != SCHEMA_REPORT or report.get("schema_version") not in KEEPER_REPORT_VERSIONS or \
                 gate.get("attempt_id") not in [a.get("attempt_id") for a in report.get("attempts") or []]:
             raise _refuse("AN-10", "report", "the keeper's report does not cover this project's gate result",
                           "check the keeper")

@@ -15,6 +15,9 @@ Layout under the state directory (every file mode 0600, every directory 0700, ne
   `sets/<sealed hex>/closed`: present once a report closed the set;
   `sets/<sealed hex>/root_docker_seen.json`: written once, at the first check on the set that found rootful access
   by the owner (AN-21: first time and reasons); from then on the set's guarantee is the downgraded text;
+  `sets/<sealed hex>/mode_seen.json`: each keeper mode (AN-27) a request on the set was served in, with the first time
+  and the key fingerprint, appended once per mode and never removed (a closed set is left as it is): the set's mode is
+  the weakest ever recorded, so a set only ever gets weaker;
   `sets/<sealed hex>/attempts/<j>.json`: sealed attempt j on the set (from any project): its claim and ledger `grant`
   envelopes, and once settled its gate record, gate summary and ledger `settle` envelopes. The attempt files are the
   set's alpha-investing ledger; the grant is committed (this file written) before anything is scored;
@@ -87,17 +90,17 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ...canonical import canonical_json, sha256_bytes
-from ... import gates
+from ... import gates, imagelock
 from ...errors import Problem, Refused
 from ...registration import check_contents, resolved_evaluator_hash
-from .. import alpha_investing as ai, scorers, sealed_eval, signing
+from .. import alpha_investing as ai, image_provenance, scorers, sealed_eval, signing
 from ..batch import BatchGenerator, BatchRunner
 from ..alpha_investing import PLANNING_ALPHA
 from ..project import _utc_now, _write_atomic
 from ..trust_stages import (MAX_DATA_BYTES, MAX_MARGIN, SCHEMA_POWER, SCHEMA_REPORT, SCHEMA_SEALED_SUMMARY,
                             registered_base, registered_generator, scenario_batch_generators, scenario_generators,
                             scenario_pack_of)
-from . import envcheck, texts
+from . import envcheck, modes, texts
 from .protocol import RefusedAfterSpend
 
 KEY_FILE = "keeper.key"
@@ -112,7 +115,8 @@ SCHEMA_ATTEMPT = "gatedtrain.ainative.keeper_attempt"
 SCHEMA_ARM_RECORDS = "gatedtrain.ainative.keeper_arm_records"
 SCHEMA_STORED_REPORT = "gatedtrain.ainative.keeper_report"
 SCHEMA_ROOT_DOCKER_SEEN = "gatedtrain.ainative.keeper_root_docker_seen"
-REPORT_SCHEMA_VERSION = 2
+SCHEMA_MODE_SEEN = "gatedtrain.keeper.mode_seen"
+REPORT_SCHEMA_VERSION = sealed_eval.REPORT_SCHEMA_VERSION         # named in `sealed_eval`, with the versions accepted
 NEW_DATA_FIX = "a new test needs new labelled data"
 PASSED_FIX = "this project passed; write its report"
 MAX_SENTENCE_CHARS = 4000
@@ -152,6 +156,8 @@ class KeeperState:
         self.keeper_uid = os.geteuid()
         self.owner_uid = self.keeper_uid if owner_uid is None else owner_uid
         self.root_docker = root_docker
+        self._peer_uid: int | None = None              # the peer of the op in progress (set by `_begin`, AN-27)
+        self._mode_now = modes.SAME_USER               # the effective mode of the op in progress
         self.inference = inference          # the inference container (AN-25); None: a batch generator is refused
         self._mutex = threading.RLock()
         self.environment_sha256: str | None = None     # set by `serve` once it signed the environment record
@@ -318,16 +324,35 @@ class KeeperState:
             raise _damaged(f"{self._project_rel(project_id)}/project.json")
         return doc, rec
 
-    def open_project(self, project_id: str) -> dict:
+    def open_project(self, project_id: str, require_keeper_mode: str | None = None,
+                     peer_uid: int | None = None) -> dict:
+        """Open the project. `require_keeper_mode` (AN-28, one of `modes.REQUIREMENTS`; None: `any` for a new project,
+        unchanged for an open one) is fixed by the first open: a later one that names another value is refused, and
+        a requirement this keeper cannot meet for this peer is refused before anything is stored."""
         with self._mutex:
+            if require_keeper_mode is not None and require_keeper_mode not in modes.REQUIREMENTS:
+                raise _problem(modes.RULE_POLICY, "args.require_keeper_mode", "the requirement is not one of "
+                               f"{', '.join(modes.REQUIREMENTS)}", f"send one of: {', '.join(modes.REQUIREMENTS)}")
             rel = self._project_rel(project_id)
             doc = self._read_json(f"{rel}/project.json", SCHEMA_PROJECT)
             if doc is None:
+                want = modes.REQUIRE_ANY if require_keeper_mode is None else require_keeper_mode
+                mode = self.observe_mode(peer_uid)["mode"]
+                if not modes.satisfies(mode, want):
+                    raise _problem(modes.RULE_POLICY, "args.require_keeper_mode", f"this keeper is {mode}, so it "
+                                   f"cannot serve a project that requires {want}", "bind the project to a keeper "
+                                   "under a separate OS user (`gatedtrain setup keeper --mode separate-user`)")
                 doc = {"schema": SCHEMA_PROJECT, "schema_version": STATE_SCHEMA_VERSION, "project_id": project_id,
                        "opened_utc": _utc_now(), "data_sha256": None, "sealed_id": None, "reused": None,
-                       "latest_registration": None, "attempts": []}
+                       "latest_registration": None, "attempts": [], "require_keeper_mode": want}
                 self._save_project(doc)
-            return {"project_id": doc["project_id"], "opened_utc": doc["opened_utc"]}
+            elif require_keeper_mode is not None and require_keeper_mode != doc.get("require_keeper_mode",
+                                                                                    modes.REQUIRE_ANY):
+                raise _problem(modes.RULE_POLICY, "args.require_keeper_mode", "the project was opened with another "
+                               "requirement, and it is fixed at the first open", "create a new project for another "
+                               "requirement")
+            return {"project_id": doc["project_id"], "opened_utc": doc["opened_utc"],
+                    "require_keeper_mode": doc.get("require_keeper_mode", modes.REQUIRE_ANY)}
 
     # ---- intake (AN-16) -------------------------------------------------------------------------------------------
 
@@ -346,7 +371,8 @@ class KeeperState:
 
     def _result(self, rec: dict, reused: bool) -> dict:
         summary = {"schema": SCHEMA_SEALED_SUMMARY, "schema_version": ARTIFACT_SCHEMA_VERSION, **rec["sealed_summary"],
-                   "guarantee": self._guarantee(rec["sealed_id"])}
+                   "guarantee": self._guarantee(rec["sealed_id"]),
+                   "keeper_mode": self.set_mode(rec["sealed_id"], self._peer_uid)}
         power = {"schema": SCHEMA_POWER, "schema_version": ARTIFACT_SCHEMA_VERSION, **rec["power"]}
         return {"sealed_id": rec["sealed_id"], "train_rows": rec["train_rows"], "sealed_summary": summary,
                 "power": power, "reused": bool(reused)}
@@ -391,7 +417,8 @@ class KeeperState:
         self._index_intake(rec)
         return rec
 
-    def intake(self, project_id: str, raw: bytes, data_sha256: str, *, accept_inconclusive: bool = False) -> dict:
+    def intake(self, project_id: str, raw: bytes, data_sha256: str, *, accept_inconclusive: bool = False,
+               peer_uid: int | None = None) -> dict:
         """Split and seal the data file (AN-16); returns `{sealed_id, train_rows, sealed_summary, power, reused}`.
         New data whose split would most likely be INCONCLUSIVE are refused (AN-6) unless `accept_inconclusive`,
         before anything is stored, so the same rows plus more can be taken in afterwards."""
@@ -414,6 +441,7 @@ class KeeperState:
                 rec = self._intake_record(data_sha256)
                 if rec is None:
                     raise _damaged(f"{self._project_rel(project_id)}/project.json")
+                self._begin(project_id, rec["sealed_id"], peer_uid, enforce=True)       # AN-28
                 self._check_set(rec["sealed_id"])
                 return self._result(rec, doc["reused"])
             rec = self._intake_record(data_sha256)
@@ -425,14 +453,16 @@ class KeeperState:
             else:
                 rec = self._seal_new(project_id, raw, data_sha256, accept_inconclusive)
                 reused = False
+            self._begin(project_id, rec["sealed_id"], peer_uid, enforce=True)     # AN-28: before the project takes it
             doc.update(data_sha256=data_sha256, sealed_id=rec["sealed_id"], reused=reused)
             self._save_project(doc)
             self._check_set(rec["sealed_id"])
             return self._result(rec, reused)
 
-    def sealed_summary(self, project_id: str) -> dict:
+    def sealed_summary(self, project_id: str, peer_uid: int | None = None) -> dict:
         with self._mutex:
             doc, rec = self._taken_in(project_id)
+            self._begin(project_id, rec["sealed_id"], peer_uid)
             self._check_set(rec["sealed_id"])
             return self._result(rec, doc["reused"])["sealed_summary"]
 
@@ -480,7 +510,8 @@ class KeeperState:
     def _guarantee(self, sealed_id: str) -> str:
         """The guarantee for the set (its recorded detection; run `_check_set` first)."""
         return texts.sealed_guarantee(self.keeper_uid, self.owner_uid,
-                                      root_docker=self.root_docker_seen(sealed_id) is not None)
+                                      root_docker=self.root_docker_seen(sealed_id) is not None,
+                                      mode=self.set_mode(sealed_id, self._peer_uid))
 
     def root_docker_for(self, project_id: str, reasons: list[str]) -> tuple[bool, list[str]]:
         """`hello` for a project: (rootful access now or recorded on the project's set, the
@@ -498,6 +529,90 @@ class KeeperState:
             seen = self.root_docker_seen(sealed_id) or {}
             return True, [f"recorded on this sealed set at {seen.get('first_utc')}: {r}"
                           for r in seen.get("reasons", [])]
+
+    # ---- keeper mode (AN-27, AN-28) -------------------------------------------------------------------------------
+
+    def observe_mode(self, peer_uid: int | None = None) -> dict:
+        """`modes.observe` of this keeper now: its uids, its state directory and, per connection, the peer."""
+        return modes.observe(self.keeper_uid, self.owner_uid, os.stat(self.dir), peer_uid)
+
+    def mode_seen(self, sealed_id: str) -> dict | None:
+        """The set's `mode_seen` record, or None."""
+        return self._read_json(f"{self._set_rel(sealed_id)}/mode_seen.json", SCHEMA_MODE_SEEN)
+
+    def modes_seen(self, sealed_id: str) -> list[dict]:
+        """The modes recorded on the set, `[{mode, first_utc, fingerprint}]` in first-seen order."""
+        doc = self.mode_seen(sealed_id)
+        return list(doc["modes"]) if doc is not None else []
+
+    def record_mode(self, sealed_id: str, mode: str) -> None:
+        """Append `mode` to the set's `mode_seen` once (never changed or removed; a closed set is left as it is)."""
+        with self._mutex:
+            if self._closed(sealed_id) or any(m["mode"] == mode for m in self.modes_seen(sealed_id)):
+                return
+            entries = [*self.modes_seen(sealed_id), {"mode": mode, "first_utc": _utc_now(),
+                                                      "fingerprint": signing.fingerprint(self.key)}]
+            self._write_json(f"{self._set_rel(sealed_id)}/mode_seen.json", {
+                "schema": SCHEMA_MODE_SEEN, "schema_version": STATE_SCHEMA_VERSION, "sealed_id": sealed_id,
+                "modes": entries})
+
+    def _signed_modes(self, sealed_id: str) -> list[str]:
+        """The `keeper_mode` of every signed claim on the set and every signed registration of a project on it, read
+        from the keeper's own state: a second record of what the set was served in, so removing or restoring
+        `mode_seen.json` cannot make the set stronger (AN-27). A value that is not a mode counts as `same_user`; a
+        record that cannot be read is damaged (refused)."""
+        found = [att["claim"].get("record", {}).get("keeper_mode") for att in self._raw_attempts(sealed_id)]
+        projects = self.dir / "projects"
+        for pdir in sorted(projects.iterdir()) if projects.is_dir() else []:
+            doc = self._read_json(f"projects/{pdir.name}/project.json", SCHEMA_PROJECT)
+            if doc is None or doc.get("sealed_id") != sealed_id:
+                continue
+            regs = pdir / "registrations"
+            for path in sorted(regs.glob("*.json")) if regs.is_dir() else []:
+                stored = self._read_json(f"projects/{pdir.name}/registrations/{path.name}", SCHEMA_REGISTRATION)
+                record = stored.get("envelope", {}).get("record") if isinstance(stored, dict) else None
+                found.append(record.get("keeper_mode") if isinstance(record, dict) else None)
+        return [m if m in modes.MODES else modes.SAME_USER for m in found if m is not None]
+
+    def set_mode(self, sealed_id: str, peer_uid: int | None = None) -> str:
+        """The set's mode: the weakest ever recorded on it (`mode_seen`, and the `keeper_mode` of its signed claims and
+        registrations) and the one observed now for `peer_uid` (so a set only ever gets weaker; a restart under a
+        stronger observation never upgrades it, nor does deleting `mode_seen.json`)."""
+        with self._mutex:
+            seen = [m["mode"] for m in self.modes_seen(sealed_id)]
+            return modes.weakest(self.observe_mode(peer_uid)["mode"], *seen, *self._signed_modes(sealed_id))
+
+    def project_modes(self, project_id: str) -> list[str]:
+        """The modes recorded on the project's sealed set (for `hello`), from the same two sources `set_mode` weighs:
+        `mode_seen` and the `keeper_mode` of the signed claims and registrations, each mode once, in that order; []
+        for an unknown project or one without a set yet. `hello` takes the weakest of these and the peer's
+        observation, so it never states a mode stronger than the operations enforce."""
+        with self._mutex:
+            doc = self._read_json(f"{self._project_rel(project_id)}/project.json", SCHEMA_PROJECT)
+            sealed_id = doc.get("sealed_id") if doc is not None else None
+            if not sealed_id:
+                return []
+            found = [m["mode"] for m in self.modes_seen(sealed_id)] + self._signed_modes(sealed_id)
+            return [m for i, m in enumerate(found) if m not in found[:i]]
+
+    def _require(self, project_id: str) -> str:
+        return self._project(project_id).get("require_keeper_mode", modes.REQUIRE_ANY)
+
+    def _begin(self, project_id: str, sealed_id: str, peer_uid: int | None, *, enforce: bool = False) -> str:
+        """Start of an op that grants, settles or states something on the set: the mode observed for this peer is
+        checked against the project's policy first when `enforce` (AN-28: a refused peer records nothing), then
+        recorded on the set, and kept for the signed records and texts of this op."""
+        with self._mutex:
+            mode = self.set_mode(sealed_id, peer_uid)
+            if enforce and not modes.satisfies(mode, self._require(project_id)):
+                raise _problem(modes.RULE_POLICY, "keeper_mode", f"this project requires a {self._require(project_id)} "
+                               f"keeper but this sealed set, as served to this peer, is {mode}",
+                               "use a keeper under a separate OS user (`gatedtrain setup keeper --mode "
+                               "separate-user`) and a new project, or create the project without "
+                               "`--require-keeper-mode`")
+            self.record_mode(sealed_id, self.observe_mode(peer_uid)["mode"])
+            self._peer_uid, self._mode_now = peer_uid, mode
+            return mode
 
     # ---- signed records -------------------------------------------------------------------------------------------
 
@@ -631,16 +746,19 @@ class KeeperState:
                            f"register it with post_hoc true and amends {latest}")
         return digest, spec
 
-    def register(self, project_id: str, registration: dict) -> dict:
-        """Check, store and sign the registration; it becomes the project's latest. Returns `{hash, envelope}`."""
+    def register(self, project_id: str, registration: dict, peer_uid: int | None = None) -> dict:
+        """Check, store and sign the registration; it becomes the project's latest. Returns `{hash, envelope}`. The
+        signed record names the keeper mode and the project's policy (AN-27, AN-28)."""
         with self._mutex:
             doc, rec = self._taken_in(project_id)
+            self._begin(project_id, doc["sealed_id"], peer_uid, enforce=True)
             digest, _ = self._check_registration(doc, rec, registration)
             stored = self._stored_registration(project_id, digest)
             if stored is None:
                 env = signing.sign(self.key, "registration", {
                     "project_id": project_id, "sealed_id": doc["sealed_id"], "hash": digest,
-                    "registration": registration, "utc": _utc_now()})
+                    "registration": registration, "utc": _utc_now(), "keeper_mode": self._mode_now,
+                    "require_keeper_mode": self._require(project_id)})
                 stored = {"schema": SCHEMA_REGISTRATION, "schema_version": STATE_SCHEMA_VERSION, "hash": digest,
                           "registration": registration, "envelope": env}
                 self._write_json(self._registration_rel(project_id, digest), stored)
@@ -939,11 +1057,13 @@ class KeeperState:
         return {"attempt_id": att["attempt_id"], "j": att["j"], "alpha": att["grant"]["record"]["alpha"],
                 "claim": att["claim"], "ledger": att["grant"]}
 
-    def evaluate(self, project_id: str, registration_hash: str, baseline: dict, candidate: dict) -> dict:
+    def evaluate(self, project_id: str, registration_hash: str, baseline: dict, candidate: dict,
+                 peer_uid: int | None = None) -> dict:
         """Grant, sign and commit a sealed attempt, then score both arms (AN-8, AN-15); see the module docstring."""
         with self._mutex:
             doc, _ = self._taken_in(project_id)
             sealed_id = doc["sealed_id"]
+            self._begin(project_id, sealed_id, peer_uid, enforce=True)
             self._check_set(sealed_id)
             self._settle_open(sealed_id)
             if self._closed(sealed_id):
@@ -1045,7 +1165,7 @@ class KeeperState:
         ident = {"attempt_id": attempt_id, "j": j, "project_id": project_id, "sealed_id": sealed_id}
         claim = signing.sign(self.key, "claim", {**ident, "registration_hash": registration_hash,
                                                  "baseline_model_sha256": base_sha, "candidate_model_sha256": cand_sha,
-                                                 "alpha": alpha, "utc": utc})
+                                                 "alpha": alpha, "utc": utc, "keeper_mode": self._mode_now})
         grant = signing.sign(self.key, "ledger_entry", {"entry": "grant", **ident, "alpha": alpha,
                                                         "wealth_before": wealth, "utc": utc})
         att = {"schema": SCHEMA_ATTEMPT, "schema_version": STATE_SCHEMA_VERSION, **ident,
@@ -1157,10 +1277,11 @@ class KeeperState:
         self._append_record(pid, settle)
         return att
 
-    def gate(self, project_id: str, attempt_id: str) -> dict:
+    def gate(self, project_id: str, attempt_id: str, peer_uid: int | None = None) -> dict:
         """The attempt's gate summary and ledger settle envelopes (AN-9); computed once, then the stored ones."""
         with self._mutex:
             doc, _ = self._taken_in(project_id)
+            self._begin(project_id, doc["sealed_id"], peer_uid, enforce=True)
             self._check_set(doc["sealed_id"])
             found = [a for a in self._attempts(doc["sealed_id"])
                      if a["attempt_id"] == attempt_id and a["project_id"] == project_id]
@@ -1174,7 +1295,7 @@ class KeeperState:
 
     # ---- report (AN-10, AN-16) --------------------------------------------------------------------------------------
 
-    def report(self, project_id: str, compute: dict | None = None) -> dict:
+    def report(self, project_id: str, compute: dict | None = None, peer_uid: int | None = None) -> dict:
         """Settle the set's open attempt, build and sign `report.json` (`schema_version` 2) from keeper records, close
         the sealed set (AN-16). A second call returns the stored envelope. `compute` (optional, AN-10): the driver's
         backend totals `{jobs, seconds, gpu_seconds}`, stated in the report as the driver's."""
@@ -1182,6 +1303,7 @@ class KeeperState:
             doc, rec = self._taken_in(project_id)
             backend = _backend_compute(compute)
             sealed_id = doc["sealed_id"]
+            self._begin(project_id, sealed_id, peer_uid)
             self._check_set(sealed_id)
             rel = f"{self._project_rel(project_id)}/report.json"
             stored = self._read_json(rel, SCHEMA_STORED_REPORT)
@@ -1223,6 +1345,8 @@ class KeeperState:
         gate = head["gate_record"]["record"]["result"]
         power = dict(rec["power"])
         guarantee = self._guarantee(rec["sealed_id"])
+        keeper_mode = self.set_mode(rec["sealed_id"], self._peer_uid)
+        seen = [{"mode": m["mode"], "first_utc": m["first_utc"]} for m in self.modes_seen(rec["sealed_id"])]
         registration = {"hash": head["registration_hash"], "scorer": clause.get("metric"),
                         "direction": clause.get("direction"), "margin": clause.get("margin"),
                         "alpha": clause.get("alpha"),
@@ -1232,7 +1356,8 @@ class KeeperState:
                                                          "earned", "wealth_after")} for a in atts]
         attempts = [{"attempt_id": a["attempt_id"], "j": a["j"], "candidate_model_sha256": a["candidate_model_sha256"],
                      "alpha": a["grant"]["record"]["alpha"], "status": a["summary"]["record"]["status"],
-                     "utc": a["claim"]["record"]["utc"]} for a in mine]
+                     "utc": a["claim"]["record"]["utc"],
+                     "keeper_mode": a["claim"]["record"].get("keeper_mode", keeper_mode)} for a in mine]
         return {"schema": SCHEMA_REPORT, "schema_version": REPORT_SCHEMA_VERSION,
                 "status": sealed_eval.effective_status(gate["status"], registration["post_hoc"]),
                 "metric": {"scorer": clause.get("metric"), "unit": found[0].unit},
@@ -1243,6 +1368,8 @@ class KeeperState:
                 "display": sealed_eval.display_block(gate, power),
                 "ledger": ledger, "attempts": attempts,
                 "sealed_guarantee": guarantee,
+                "keeper_mode": keeper_mode, "modes_seen": seen,
+                "require_keeper_mode": self._require(project_id),
                 "known_limits": texts.known_limits(guarantee, len(atts)),
                 "alpha_rule": {"rule": ai.RULE, "initial_wealth": ai.INITIAL_WEALTH, "payout": ai.PAYOUT,
                                "min_bid": ai.MIN_BID, "planning_alpha": PLANNING_ALPHA, "guarantee": ai.GUARANTEE},
@@ -1256,15 +1383,22 @@ COMPUTE_KEYS = frozenset({"jobs", "seconds", "gpu_seconds"})
 
 
 def _backend_compute(compute: Any) -> dict | None:
-    """AN-10: the driver's backend totals as the report states them (marked as the driver's), None when not sent."""
+    """AN-10: the driver's backend totals as the report states them (marked as the driver's), None when not sent. The
+    optional `images` (IMG-8) are the driver's declaration of the trainer images, checked against the keeper's own lock."""
     if compute is None:
         return None
-    if not (isinstance(compute, dict) and set(compute) == COMPUTE_KEYS and all(
-            isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_COMPUTE for v in compute.values())):
+    images = compute.get("images") if isinstance(compute, dict) else None
+    totals = {k: v for k, v in compute.items() if k != "images"} if isinstance(compute, dict) else compute
+    if not (isinstance(totals, dict) and set(totals) == COMPUTE_KEYS and all(
+            isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_COMPUTE for v in totals.values())):
         raise _problem("AN-10", "compute", "compute is not {jobs, seconds, gpu_seconds}, each a whole number >= 0",
                        "send the backend's job totals, or leave compute out")
-    return {"jobs": compute["jobs"], "seconds": compute["seconds"], "gpu_seconds": compute["gpu_seconds"],
-            "source": texts.COMPUTE_BACKEND_SOURCE}
+    out = {"jobs": totals["jobs"], "seconds": totals["seconds"], "gpu_seconds": totals["gpu_seconds"],
+           "source": texts.COMPUTE_BACKEND_SOURCE}
+    if isinstance(compute, dict) and "images" in compute:
+        # IMG-8: the keeper's own shipped lock; the hash is of the same bytes the entries were checked against
+        out["images"], out[image_provenance.LOCK_SHA_KEY] = image_provenance.checked_images(images)
+    return out
 
 
 def _keeper_compute(mine: list[dict]) -> dict:

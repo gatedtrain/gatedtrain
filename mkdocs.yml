@@ -46,6 +46,8 @@ nav:
   - Guides:
       - External training runs: external-runs.md
       - AI-native projects: ai-native.md
+      - Quickstart without sudo: sudo-free-quickstart.md
+      - NeMo RL on a rootless host: rootless-nemo-rl.md
   - Reference:
       - Commands: commands.md
       - Configuration: configuration.md

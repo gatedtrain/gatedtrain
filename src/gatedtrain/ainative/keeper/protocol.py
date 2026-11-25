@@ -84,11 +84,32 @@ def read_line(sock: socket.socket, cap: int, *, deadline: float | None = None) -
             return bytes(buf)
 
 
+# `struct ucred` as `SO_PEERCRED` returns it on Linux: pid, uid, gid (three C ints). The kernel reports "no uid" as -1.
+PEERCRED_FORMAT = "3i"
+NO_UID = -1
+
+
 def peer_uid(conn: socket.socket) -> int:
     """The uid of the process at the other end of a connected Unix socket (Linux `SO_PEERCRED`: pid, uid, gid)."""
-    size = struct.calcsize("3i")
-    _pid, uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size))
+    size = struct.calcsize(PEERCRED_FORMAT)
+    _pid, uid, _gid = struct.unpack(PEERCRED_FORMAT, conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size))
     return uid
+
+
+def attested_listener_uid(sock: socket.socket) -> int | None:
+    """AN-29: the uid of the process that LISTENS at the other end of the client's connected Unix socket. On Linux
+    `SO_PEERCRED` of a connected socket holds the credentials of the peer, and for a client the peer is the listener
+    (the credentials the kernel took when it called `listen`), which the listener cannot choose. None when the kernel
+    gives none: no `SO_PEERCRED` (not Linux), an error, or uid -1."""
+    option = getattr(socket, "SO_PEERCRED", None)
+    if option is None:
+        return None
+    try:
+        _pid, uid, _gid = struct.unpack(PEERCRED_FORMAT, sock.getsockopt(socket.SOL_SOCKET, option,
+                                                                          struct.calcsize(PEERCRED_FORMAT)))
+    except (OSError, struct.error):
+        return None
+    return None if uid == NO_UID else uid
 
 
 def peer_allowed(uid: int, *, owner_uid: int, keeper_uid: int) -> bool:
@@ -182,6 +203,7 @@ class KeeperClient:
     def __init__(self, socket_path: Path, *, timeout: float | None = None) -> None:
         self.socket_path = Path(socket_path)
         self.timeout = timeout
+        self.last_attested_uid: int | None = None      # AN-29: the listener's uid at the last call's connect
 
     def timeout_for(self, op: str) -> float:
         if self.timeout is not None:
@@ -203,6 +225,7 @@ class KeeperClient:
                 raise refused("socket", "the keeper is not reachable at the socket",
                               "start it (`gatedtrain keeper serve`, see `gatedtrain setup keeper`) or pass its "
                               "socket path") from None
+            self.last_attested_uid = attested_listener_uid(sock)
             try:
                 try:
                     sock.sendall(line)

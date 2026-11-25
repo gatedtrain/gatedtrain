@@ -16,12 +16,13 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 from pathlib import Path
 
 from . import STUB_MARK, __version__
-from .errors import Problem, Refused
-from .output import Result, emit
+from .errors import Problem, Refused, printable
+from .output import Result, emit, notice_scope
 from .paths import resolve
 
 EXIT_OK, EXIT_NOT_PASS, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
@@ -300,8 +301,12 @@ def _project_command(args) -> str:
 
 def _pfinish(args, data: dict, human: str = "", *, ok: bool = True, exit_code: int = EXIT_OK,
              warnings: list[str] | None = None) -> int:
-    return emit(Result(_project_command(args), ok, exit_code, data, [], list(warnings or [])), as_json=_as_json(args),
-                human=human)
+    warnings = list(warnings or [])
+    if not _as_json(args):                  # the human text already carries the mode line: not a second time on stderr
+        from .ainative.keeper import texts
+
+        warnings = [w for w in warnings if w not in texts.MODE_LINE.values()]
+    return emit(Result(_project_command(args), ok, exit_code, data, [], warnings), as_json=_as_json(args), human=human)
 
 
 def _prefuse(args, problems: list[Problem]) -> int:
@@ -327,41 +332,92 @@ def _load_decision(path: str | None) -> dict:
     return doc
 
 
+def _keeper_modes():
+    from .ainative.keeper import modes
+
+    return modes
+
+
 def _keeper_hello(socket: Path) -> dict:
     """The keeper's `hello`, its key checked (AN-14). It waits with the long-op deadline: on a keeper busy with another
     client's evaluation the wait is queueing; a keeper that is not running fails at the connect (AN-12)."""
     from .ainative.keeper import protocol
     from .ainative.keeper_trust import _hello_key
 
-    hello = protocol.KeeperClient(socket, timeout=protocol.LONG_OP_TIMEOUT_S).call("hello", None, {})
+    from .ainative.keeper import modes
+
+    asking = protocol.KeeperClient(socket, timeout=protocol.LONG_OP_TIMEOUT_S)
+    hello = asking.call("hello", None, {})
     _hello_key(hello)
-    return hello
+    # AN-29: the mode to state is the keeper's claim weakened by the kernel's answer; a contradiction is refused
+    mode, note = modes.effective_client_mode(modes.claimed_mode(hello), asking.last_attested_uid, os.geteuid())
+    return {**hello, "effective_mode": mode, "mode_note": note}
+
+
+def _remove_unbound_project(root: Path, existed: bool) -> None:
+    """Undo `create_project` after a binding that failed: everything in `root` was written by it (it refuses a root
+    that holds anything), so the contents go, and the directory too when it did not exist before."""
+    for child in list(root.iterdir()):
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    if not existed:
+        root.rmdir()
 
 
 def cmd_project_create(args) -> int:
+    from .ainative.keeper import modes, texts
     from .ainative.keeper_trust import bind_project
     from .ainative.pipeline import load_pipeline
     from .ainative.project import create_project
 
     pipeline = Path(args.pipeline).absolute()
     socket = Path(args.keeper).absolute() if args.keeper else None
+    require = args.require_keeper_mode.replace("-", "_")
+    hello = None
     try:
         load_pipeline(pipeline)                                  # syntax only; stage types are checked on `plan`/`run`
         if socket is not None:
-            _keeper_hello(socket)                                # an unreachable keeper: nothing is created
-        project = create_project(Path(args.root).absolute(), goal=args.goal, data=Path(args.data).absolute(),
+            hello = _keeper_hello(socket)                        # an unreachable keeper: nothing is created
+            if require != modes.REQUIRE_ANY and "keeper_mode" not in hello:   # a keeper before AN-27 cannot hold a policy
+                raise Refused([Problem(modes.RULE_POLICY, "--require-keeper-mode", "the keeper does not state a mode "
+                                       "and cannot enforce a requirement: keeper predates AN-28; upgrade it",
+                                       "upgrade the keeper (`gatedtrain setup keeper`, then restart it), or leave out "
+                                       "--require-keeper-mode")])
+            if not modes.satisfies(hello["effective_mode"], require):         # AN-28: refuse before anything is made
+                raise Refused([Problem(modes.RULE_POLICY, "--require-keeper-mode", "the bound keeper is in "
+                                       f"{hello['effective_mode'].replace('_', '-')} mode, which does not meet the "
+                                       f"requirement {args.require_keeper_mode}", "bind a keeper under a separate OS "
+                                       "user (`gatedtrain setup keeper --mode separate-user`), or leave out "
+                                       "--require-keeper-mode")])
+        elif require != modes.REQUIRE_ANY:
+            raise Refused([Problem(modes.RULE_POLICY, "--require-keeper-mode", "a keeper requirement needs a keeper",
+                                   "pass --keeper SOCKET, or leave out --require-keeper-mode")])
+        root = Path(args.root).absolute()
+        existed = root.exists()                                  # create_project accepts only an empty existing root
+        project = create_project(root, goal=args.goal, data=Path(args.data).absolute(),
                                  pipeline=str(pipeline), budget={"gpu_hours": args.gpu_hours, "llm_usd": 0},
                                  pipeline_bytes=pipeline.read_bytes())     # the project keeps its own copy
-        binding = bind_project(project, socket) if socket is not None else None
+        try:
+            binding = bind_project(project, socket, require) if socket is not None else None
+        except BaseException:
+            _remove_unbound_project(root, existed)               # a refused binding leaves no half-made project
+            raise
     except Refused as exc:
         return _prefuse(args, exc.problems)
     data = {"root": str(project.root), "pipeline": project.pipeline, "pipeline_sha256": project.pipeline_sha256,
             "budget": project.budget}
     human = f"project: {project.root}\n"
+    warnings: list[str] = []
     if binding is not None:
-        data["keeper"] = {"fingerprint": binding.fingerprint, "project_id": binding.project_id}
-        human += f"keeper: {binding.socket} (key {binding.fingerprint})\n"
-    return _pfinish(args, data, human)
+        mode = hello["effective_mode"]
+        warnings = _same_user_warnings(mode)
+        data["keeper"] = {"fingerprint": binding.fingerprint, "project_id": binding.project_id, "keeper_mode": mode,
+                          "mode_facts": hello.get("mode_facts"), "require_keeper_mode": require}
+        human += (f"keeper: {binding.socket} (key {binding.fingerprint})\n{texts.MODE_LINE[mode]}\n"
+                  + (f"requirement: {args.require_keeper_mode}\n" if require != modes.REQUIRE_ANY else ""))
+    return _pfinish(args, data, human, warnings=warnings)
 
 
 def cmd_project_plan(args) -> int:
@@ -369,13 +425,73 @@ def cmd_project_plan(args) -> int:
     from .ainative.project import Project
 
     try:
-        proposal = plan_stage(Project.load(Path(args.root)), args.stage)
+        project = Project.load(Path(args.root))
+        proposal = plan_stage(project, args.stage)
+        mode, mode_warnings = _mode_surface(project)
     except Refused as exc:
         return _prefuse(args, exc.problems)
     data = {"stage": proposal.stage, "summary": proposal.summary, "choices": proposal.choices,
             "estimate": proposal.estimate, "needs_user": proposal.needs_user}
     human = f"{proposal.stage}: {proposal.summary}\n" + (f"needs_user: {proposal.needs_user}\n" if proposal.needs_user else "")
-    return _pfinish(args, data, human)
+    human = _with_mode(data, human, mode)
+    return _pfinish(args, data, human, warnings=mode_warnings)
+
+
+def _effective_mode(project, stated: str | None, *, tolerate_unreachable: bool = False) -> tuple[str | None, str | None]:
+    """AN-27, AN-29: `(mode, warning)` to print for a keeper project: the weakest of the keeper's stated mode (from
+    its summary or report) and this client's own check of the keeper (`KeeperTrust.keeper_mode`: its claim weakened
+    by the kernel's answer), never the keeper's statement alone. A keeper that contradicts the kernel is refused
+    (AN-29); with `tolerate_unreachable` an unreachable keeper leaves the stated mode and a warning. Without a stated
+    mode (a stage that is not the intake, `status`, `plan`) a keeper-bound project is judged by the check alone;
+    a project without a keeper has no mode (None)."""
+    from .ainative.keeper import modes
+    from .ainative.keeper_trust import KeeperTrust, load_binding
+
+    if stated is None and load_binding(project) is None:        # no keeper: there is no mode to state
+        return None, None
+    known = [stated] if stated in modes.MODES else []
+    try:
+        known.append(KeeperTrust(project).keeper_mode)
+    except Refused as exc:
+        if not tolerate_unreachable or any(p.rule == modes.RULE_ATTESTATION for p in exc.problems):
+            raise
+        return (modes.weakest(*known) if known else modes.SAME_USER,
+                "the keeper could not be asked for its mode now; the mode shown is the one the records state, read "
+                "from the project files and not verified against the keeper: "
+                + exc.problems[0].line())
+    return modes.weakest(*known) if known else modes.SAME_USER, None
+
+
+def _same_user_warnings(mode: str | None) -> list[str]:
+    """AN-27: one warning with the mode line for a same-user result, so a consumer of the JSON envelope that reads
+    only `ok` and `warnings` still sees that the data are not sealed from the user's account."""
+    from .ainative.keeper import modes, texts
+
+    return [texts.MODE_LINE[mode]] if mode == modes.SAME_USER else []
+
+
+def _mode_surface(project, stated: str | None = None) -> tuple[str | None, list[str]]:
+    """`(mode, warnings)` for a command that prints a result for `project`: `_effective_mode` (an unreachable keeper
+    leaves a warning and the weaker mode), plus the same-user warning. `(None, [])` for a project without a keeper."""
+    mode, warning = _effective_mode(project, stated, tolerate_unreachable=True)
+    return mode, ([warning] if warning else []) + _same_user_warnings(mode)
+
+
+def _with_mode(data: dict, human: str, mode: str | None, *, first: bool = False) -> str:
+    """Put the mode in the JSON data and its line (AN-27) in the human text, after it or `first`."""
+    if mode is None:
+        return human
+    from .ainative.keeper import texts
+
+    data["keeper_mode"] = mode
+    return f"{texts.MODE_LINE[mode]}\n{human}" if first else f"{human}{texts.MODE_LINE[mode]}\n"
+
+
+def _gate_line(status: str, mode: str | None) -> str:
+    """The gate result line; in same-user mode it carries the headline qualifier (AN-27), as the report's does."""
+    from .ainative.keeper import modes, texts
+
+    return f"gate: {status}" + (texts.HEADLINE_SUFFIX_SAME_USER if mode == modes.SAME_USER else "") + "\n"
 
 
 def cmd_project_run(args) -> int:
@@ -391,13 +507,18 @@ def cmd_project_run(args) -> int:
         if result.stage == _GATE_STAGE and "gate_result" in result.outputs:
             status = project.read_artifact(result.outputs["gate_result"]).get("status")
             data["status"] = status
+        summary = project.read_artifact(result.outputs["sealed_summary"]) if "sealed_summary" in result.outputs \
+            else None
+        # AN-27: every stage of a keeper project states the mode: the intake's own statement, weakened by this client's check
+        mode, mode_warnings = _mode_surface(project, summary.get("keeper_mode") if isinstance(summary, dict) else None)
     except Refused as exc:
         return _prefuse(args, exc.problems)
-    human = f"{result.stage}: {'reused' if result.reused else 'done'}\n" + (f"gate: {status}\n" if status else "")
+    human = f"{result.stage}: {'reused' if result.reused else 'done'}\n" + (_gate_line(status, mode) if status else "")
+    human = _with_mode(data, human, mode)
     if result.stage == _GATE_STAGE:                              # `run` of the gate: EXIT_OK on PASS only
         ok = status == "PASS"
-        return _pfinish(args, data, human, ok=ok, exit_code=EXIT_OK if ok else EXIT_NOT_PASS)
-    return _pfinish(args, data, human)
+        return _pfinish(args, data, human, ok=ok, exit_code=EXIT_OK if ok else EXIT_NOT_PASS, warnings=mode_warnings)
+    return _pfinish(args, data, human, warnings=mode_warnings)
 
 
 def _recorded_gate(project) -> tuple[str | None, list | None, list[str]]:
@@ -427,6 +548,8 @@ def cmd_project_status(args) -> int:
         stages = status(project)
         gate = done_output(project, _GATE_STAGE, "gate_result")
         recorded, ledger, warnings = _recorded_gate(project)
+        mode, mode_warnings = _mode_surface(project)
+        warnings = [*warnings, *mode_warnings]
     except Refused as exc:
         return _prefuse(args, exc.problems)
     gate_status = gate.get("status") if isinstance(gate, dict) else None
@@ -442,16 +565,16 @@ def cmd_project_status(args) -> int:
         note = f" (last attempt refused: {', '.join(ref['rules'] or [])} {ref['reason']})" if ref else ""
         lines.append(f"{n}: {s['status']}{note}\n")
     if gate_status:
-        lines.append(f"gate: {gate_status}\n")
+        lines.append(_gate_line(gate_status, mode))
     elif recorded:
-        lines.append(f"gate: recorded {recorded}, but the gate stage is {stages[_GATE_STAGE]['status']}\n")
+        lines.append(_gate_line(f"recorded {recorded}, but the gate stage is {stages[_GATE_STAGE]['status']}", mode))
     elif ledger:
         lines.append("gate: alpha spent, no gate result recorded\n")
     elif ledger is None:
         lines.append("gate: no gate result recorded; the alpha ledger cannot be read\n")
     else:
         lines.append("gate: no gate result recorded and no alpha spent\n")
-    return _pfinish(args, data, "".join(lines), warnings=warnings)
+    return _pfinish(args, data, _with_mode(data, "".join(lines), mode, first=True), warnings=warnings)
 
 
 def cmd_project_report(args) -> int:
@@ -477,8 +600,19 @@ def cmd_project_report(args) -> int:
     ok = report.get("status") == "PASS"
     md = project.root / "stages" / "report" / "report.md"
     human = md.read_text(encoding="utf-8") if md.is_file() else f"status: {report.get('status')}\n"
-    return _pfinish(args, {"report": report, "report_md": str(md)}, human, ok=ok,
-                    exit_code=EXIT_OK if ok else EXIT_NOT_PASS, warnings=warnings)
+    stated = report.get("keeper_mode")                           # AN-27: a keeper report (version 3) names its mode
+    try:
+        mode, mode_warnings = _mode_surface(project, stated)
+    except Refused as exc:
+        return _prefuse(args, exc.problems)
+    warnings = [*warnings, *mode_warnings]
+    if mode is not None and (mode != stated or not human.startswith("keeper mode:")):
+        from .ainative.keeper import texts
+
+        human = f"{texts.MODE_LINE[mode]}\n" + (f"(the report states {stated or 'no mode'}; this check of the keeper "
+                                                 f"shows {mode})\n" if mode != stated else "") + human
+    return _pfinish(args, {"report": report, "report_md": str(md), "keeper_mode": mode, "report_keeper_mode": stated},
+                    human, ok=ok, exit_code=EXIT_OK if ok else EXIT_NOT_PASS, warnings=warnings)
 
 
 def _job_call(args, op):
@@ -568,7 +702,12 @@ def _add_project(sub) -> None:
                    help="the GPU-hour budget; step 1 only records it in project.yaml and does not enforce it")
     c.add_argument("--keeper", metavar="SOCKET",
                    help="bind the project to the keeper at this socket (trust/keeper.json, trust/keeper.pub); the "
-                        "keeper then seals, scores and gates (AN-12, AN-14)")
+                        "keeper then seals, scores and gates (sealed from your account only in separate-user mode) "
+                        "(AN-12, AN-14)")
+    c.add_argument("--require-keeper-mode", choices=[m.replace("_", "-") for m in _keeper_modes().REQUIREMENTS],
+                   default=_keeper_modes().REQUIRE_ANY,
+                   help="the weakest keeper mode this project accepts, fixed now and signed into its registration "
+                        "(AN-28); `separate-user` refuses a same-user keeper")
     c.set_defaults(func=cmd_project_create)
 
     c = ps.add_parser("plan", help="show what a stage would do, without running it")
@@ -611,7 +750,7 @@ def _add_project(sub) -> None:
 def _command_name(args) -> str:
     if args.command == "project":
         return _project_command(args)
-    sub = {"keeper": "keeper_cmd", "setup": "setup_cmd"}.get(args.command)
+    sub = {"keeper": "keeper_cmd", "setup": "setup_cmd", "image": "image_cmd"}.get(args.command)
     return f"{args.command} {getattr(args, sub)}" if sub else args.command
 
 
@@ -668,11 +807,17 @@ def cmd_keeper_fingerprint(args) -> int:
         hello = _keeper_hello(Path(args.socket).absolute())
     except Refused as exc:
         return _krefuse(args, exc.problems)
+    from .ainative.keeper import modes, texts
+
+    mode = hello["effective_mode"]
     data = {"fingerprint": hello["fingerprint"], "sealed_guarantee": hello.get("sealed_guarantee"),
             "owner_has_root_docker": hello.get("owner_has_root_docker"),
-            "root_docker_reasons": hello.get("root_docker_reasons")}
+            "root_docker_reasons": hello.get("root_docker_reasons"), "keeper_mode": mode,
+            "mode_facts": hello.get("mode_facts")}
     reasons = "".join(f"  {r}\n" for r in data["root_docker_reasons"] or [])
-    return _kfinish(args, data, f"fingerprint: {data['fingerprint']}\nguarantee: {data['sealed_guarantee']}\n"
+    harden = "harden: gatedtrain setup keeper --mode separate-user (one sudo)\n" if mode == modes.SAME_USER else ""
+    return _kfinish(args, data, f"fingerprint: {data['fingerprint']}\n{texts.MODE_LINE[mode]}\n{harden}{texts.MODE_STATED_NOTE}\n"
+                                f"guarantee: {data['sealed_guarantee']}\n"
                                 f"owner has rootful access (AN-21): {data['owner_has_root_docker']}\n{reasons}")
 
 
@@ -683,6 +828,7 @@ def cmd_keeper_confirm(args) -> int:
     """AN-18: show the plan sentence of the decision's scorer, scorer_params and margin, take `yes` on stdin (or
     `--yes`), then record the confirmation in the keeper. The prompt goes to stderr, so stdout stays the result."""
     from .ainative import signing
+    from .ainative.keeper import texts
     from .ainative.keeper_trust import KeeperTrust
     from .ainative.project import Project
     from .ainative.trust_stages import keeper_confirmation
@@ -696,6 +842,7 @@ def cmd_keeper_confirm(args) -> int:
             raise Refused([Problem("AN-18", "--yes", f"--json cannot prompt; the sentence to confirm is: {sentence}",
                                    "rerun without --json to read the sentence and type yes, or pass --yes")])
         if not args.yes:
+            print(texts.MODE_LINE[trust.keeper_mode], file=sys.stderr)       # AN-27: before the sentence
             print(sentence, file=sys.stderr)
             print(CONFIRM_PROMPT, end="", file=sys.stderr, flush=True)
             answer = sys.stdin.readline()
@@ -710,29 +857,71 @@ def cmd_keeper_confirm(args) -> int:
     except Refused as exc:
         return _krefuse(args, exc.problems)
     sha = signing.envelope_sha256(env)
-    return _kfinish(args, {"sentence": sentence, "envelope_sha256": sha}, f"{sentence}\nconfirmed: {sha}\n")
+    return _kfinish(args, {"sentence": sentence, "envelope_sha256": sha, "keeper_mode": trust.keeper_mode},
+                    f"{texts.MODE_LINE[trust.keeper_mode]}\n{sentence}\nconfirmed: {sha}\n",
+                    warnings=_same_user_warnings(trust.keeper_mode) if _as_json(args) else None)   # the text has the line
 
 
 def cmd_setup_keeper(args) -> int:
     """AN-19: print the privileged commands and the systemd unit; run and write nothing."""
     import os
 
+    from .ainative import layout
+    from .ainative.keeper import setup_user
     from .ainative.keeper.setup import installed_packs, setup_commands
 
     owner = os.getuid() if args.owner_uid is None else args.owner_uid
-    try:
-        out = setup_commands(user=args.user, state=args.state, socket=args.socket, venv=args.venv, owner_uid=owner,
-                             packages=args.packages, inference_image=args.inference_image,
-                             eval_trees=args.eval_tree, docker_host=args.docker_host)
+    defaulted = args.mode is None                         # the default changed in 0.7.0: say so when it was not chosen
+    args.mode = args.mode or "same-user"
+    try:                                                  # an empty value is a typo in both modes, never the default
+        setup_user.refuse_empty(user=args.user, state=args.state, socket=args.socket, venv=args.venv,
+                                executable=args.executable)
+        lay = layout.resolve(args.mode, args, args.layout)           # AN-34: flag > layout file > default
     except Refused as exc:
         return _krefuse(args, exc.problems)
+    if args.mode == "same-user":                          # AN-30, AN-31: the default, user-level commands only
+        return _cmd_setup_keeper_same_user(args, owner, lay, [setup_user.DEFAULT_MODE_WARNING] if defaulted else [])
+    try:
+        if args.executable is not None:
+            raise setup_user.executable_mode_problem()
+        out = setup_commands(user=lay.values["user"], state=lay.values["state"], socket=lay.values["socket"],
+                             venv=lay.values["venv"], owner_uid=owner,
+                             packages=args.packages, inference_image=args.inference_image,
+                             eval_trees=lay.values["eval_trees"], docker_host=args.docker_host)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    out["commands"] = [*lay.header, *out["commands"]]
     warnings = []
     if args.packages is None and not installed_packs():
         warnings.append("no scenario pack is installed here; pass --packages NAME==VERSION for each pack the keeper "
                         "must run")
-    human = ("# run these once, as a user who may use sudo; gatedtrain runs none of them\n"
-             + "".join(c + "\n" for c in out["commands"]))
-    return _kfinish(args, out, human, warnings=warnings)
+    human = printable("# run these once, as a user who may use sudo; gatedtrain runs none of them\n"
+                      + "".join(c + "\n" for c in out["commands"]), keep="\n\t")
+    return _kfinish(args, {**out, "mode": "separate_user", **({"layout": lay.info} if lay.info else {})}, human,
+                    warnings=warnings)
+
+
+def _cmd_setup_keeper_same_user(args, owner: int, lay, warnings: list[str]) -> int:
+    """AN-30, AN-31: print user-level commands and a systemd user unit; no sudo, run and write nothing."""
+    from .ainative.keeper import setup_user
+
+    try:
+        for field in ("user", "venv"):
+            if getattr(args, field) is not None:
+                raise setup_user.mode_option_problem(f"--{field}")
+        out = setup_user.setup_commands_same_user(owner_uid=owner, state=lay.values["state"],
+                                                  socket=lay.values["socket"], executable=lay.values["executable"],
+                                                  inference_image=args.inference_image,
+                                                  eval_trees=lay.values["eval_trees"], docker_host=args.docker_host)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    if args.packages is not None:
+        warnings = [*warnings, "--packages is ignored in same-user mode: the keeper runs from the current "
+                    "environment, with the packs installed here"]
+    out["commands"] = [*lay.header, *out["commands"]]
+    # Defence in depth: the validators refuse non-printable values; whatever slips through is shown escaped.
+    human = printable(setup_user.HEADER + "\n" + "".join(c + "\n" for c in out["commands"]), keep="\n\t")
+    return _kfinish(args, {**out, **({"layout": lay.info} if lay.info else {})}, human, warnings=warnings)
 
 
 def cmd_setup_host(args) -> int:
@@ -741,9 +930,12 @@ def cmd_setup_host(args) -> int:
     import os
     import pwd
 
+    from .ainative import layout
     from .ainative.hostsetup import RULE, host_script
 
     try:
+        lay = layout.resolve("host", args, args.layout)             # AN-34: flag > layout file > default
+        v = lay.values
         if args.owner is None:
             owner, uid = pwd.getpwuid(os.getuid()).pw_name, os.getuid() if args.owner_uid is None else args.owner_uid
         else:
@@ -755,21 +947,24 @@ def cmd_setup_host(args) -> int:
                     raise Refused([Problem(RULE, "--owner-uid", f"there is no user {owner!r} on this host to take "
                                            "the uid from", "pass --owner-uid")]) from None
         requirements = None
-        if args.eval_requirements is not None:
+        if v["eval_requirements"] is not None:
             try:
-                requirements = Path(args.eval_requirements).read_bytes()
+                requirements = Path(v["eval_requirements"]).read_bytes()
             except OSError as exc:
                 raise Refused([Problem(RULE, "--eval-requirements", f"the requirements file cannot be read "
                                        f"({type(exc).__name__})", "pass a readable requirements file")]) from None
-        out = host_script(owner=owner, owner_uid=uid, keeper_user=args.keeper_user, keeper_home=args.keeper_home,
-                          keeper_data_root=args.keeper_data_root, owner_data_root=args.owner_data_root,
-                          handoff=args.handoff, state=args.state, socket=args.socket, venv=args.venv,
-                          inference_ref=args.inference_image, eval_requirements=requirements,
-                          eval_python=args.eval_python, eval_venv=args.eval_venv,
-                          confirm_group_removal=args.confirm_group_removal)
+        out = host_script(owner=owner, owner_uid=uid, keeper_user=v["user"], keeper_home=v["keeper_home"],
+                          keeper_data_root=v["keeper_data_root"], owner_data_root=v["owner_data_root"],
+                          handoff=v["handoff"], state=v["state"], socket=v["socket"], venv=v["venv"],
+                          inference_ref=v["image"], eval_requirements=requirements,
+                          eval_python=v["eval_python"], eval_venv=v["eval_venv"],
+                          eval_python_root=v["eval_python_root"], confirm_group_removal=args.confirm_group_removal)
     except Refused as exc:
         return _krefuse(args, exc.problems)
-    return _kfinish(args, out, out["script"])
+    if lay.info:                                   # the header goes after the shebang
+        first, _, rest = out["script"].partition("\n")
+        out = {**out, "script": first + "\n" + "".join(h + "\n" for h in lay.header) + rest, "layout": lay.info}
+    return _kfinish(args, out, printable(out["script"], keep="\n\t"))
 
 
 def cmd_verify(args) -> int:
@@ -777,9 +972,12 @@ def cmd_verify(args) -> int:
     1 when there is no anchor and only their consistency was checked (no anchor given, a keeper that runs as the
     owner's own uid, or one whose owner reaches a rootful daemon (AN-21), either of which can read its key), 1 also
     under any anchor when a report states any guarantee but the separate-user one (`report_warnings`), 3 on a bad
-    signature or a mismatch."""
-    from .ainative.verify import (CONSISTENCY_ONLY, OFFLINE_LIMIT, ROOT_DOCKER_KEEPER, SAME_USER_KEEPER,
-                                  report_warnings, verify_project)
+    signature or a mismatch. A result without the keeper as the anchor says its mode is as stated by the holder of
+    the key (`MODE_STATED_NOTE`, a warning, never the exit code)."""
+    from .ainative import image_provenance, verify_mode
+    from .ainative.keeper import texts
+    from .ainative.verify import (CONSISTENCY_ONLY, MODE_UNKNOWN_HEADLINE, NO_REPORT_IMAGES,
+                                  OFFLINE_LIMIT, ROOT_DOCKER_KEEPER, SAME_USER_KEEPER, report_warnings, verify_project)
 
     try:
         out = verify_project(Path(args.root), keeper=Path(args.keeper) if args.keeper else None,
@@ -787,24 +985,59 @@ def cmd_verify(args) -> int:
     except Refused as exc:
         return _krefuse(args, exc.problems)
     reports = report_warnings(out)
+    has_report = bool(out.get("report_guarantees"))
+    if has_report:
+        img_warn, img_fail = image_provenance.image_check(out, args.require_maintainer_images)      # IMG-9
+    else:               # a project with no report states no image: the flag cannot be met (it must not pass vacuously)
+        img_warn, img_fail = ([NO_REPORT_IMAGES] if args.require_maintainer_images else []), args.require_maintainer_images
+    mode = out.get("effective_mode")
+    stated = [texts.MODE_STATED_NOTE] if out["anchor"] != "keeper" and mode is not None else []     # AN-27
+
+    def fin(args, data, human="", *, ok=True, exit_code=EXIT_OK, warnings=None):
+        """User-added or undeclared trainer images warn; with --require-maintainer-images they also make the exit 1."""
+        if img_fail and ok:
+            ok, exit_code = False, EXIT_NOT_PASS
+        limit = f"{texts.LIMIT_IMAGES_NOT_OBSERVED}\n" if has_report and out.get("images_undeclared") == \
+            image_provenance.IMAGES_STATED else ""
+        return _kfinish(args, data, human + image_provenance.lock_line(out) + limit, ok=ok, exit_code=exit_code,
+                        warnings=[*(warnings or []), *stated, *img_warn])
+
+    if verify_mode.accepted_weaker(out, args.accept_mode):          # AN-27: the reader's own, per-call decision
+        mode_warnings = [w for w in (SAME_USER_KEEPER if out["same_user"] else None,
+                                     OFFLINE_LIMIT if out["anchor"] != "keeper" else None, *reports) if w]
+        return fin(args, {**out, "accepted_weaker_mode": True},
+                   f"accepted (weaker mode): {out['checked']} records under key {out['fingerprint']} checked against "
+                   f"the {out['anchor']}\n{verify_mode.ACCEPTED_WEAKER_MODE}\n", warnings=mode_warnings)
     if out["anchor"] == "none":
-        return _kfinish(args, out, f"consistent: {out['checked']} records under key {out['fingerprint']}\n",
+        return fin(args, out, f"consistent: {out['checked']} records under key {out['fingerprint']}\n",
                         ok=False, exit_code=EXIT_NOT_PASS, warnings=[CONSISTENCY_ONLY, OFFLINE_LIMIT, *reports])
     if out["anchor"] == "keeper" and out["same_user"]:
-        return _kfinish(args, out, f"consistent with a same-user keeper: {out['checked']} records under key "
+        return fin(args, out, f"consistent with a same-user keeper: {out['checked']} records under key "
                                    f"{out['fingerprint']}\n", ok=False, exit_code=EXIT_NOT_PASS,
                         warnings=[SAME_USER_KEEPER, *reports])
     if out["anchor"] == "keeper" and out["root_docker"]:
-        return _kfinish(args, out, f"consistent with a keeper whose owner reaches a rootful daemon: {out['checked']} "
+        return fin(args, out, f"consistent with a keeper whose owner reaches a rootful daemon: {out['checked']} "
                                    f"records under key {out['fingerprint']}\n", ok=False, exit_code=EXIT_NOT_PASS,
                         warnings=[ROOT_DOCKER_KEEPER, *reports])
     warnings = [] if out["anchor"] == "keeper" else [OFFLINE_LIMIT]       # only the keeper sees a deleted record
+    if out.get("mode_unknown"):               # no mode in any record (a project written before 0.7.0): not a report fault
+        return fin(args, out, f"verified against the {out['anchor']}, but {MODE_UNKNOWN_HEADLINE}: {out['checked']} "
+                                   f"records under key {out['fingerprint']}\n", ok=False, exit_code=EXIT_NOT_PASS,
+                        warnings=[*warnings, *reports])
     if reports:
-        return _kfinish(args, out, f"verified against the {out['anchor']}, but the report's guarantee does not hold: "
+        return fin(args, out, f"verified against the {out['anchor']}, but the report's guarantee does not hold: "
                                    f"{out['checked']} records under key {out['fingerprint']}\n", ok=False,
                         exit_code=EXIT_NOT_PASS, warnings=[*warnings, *reports])
-    return _kfinish(args, out, f"verified against the {out['anchor']}: {out['checked']} records under key "
-                               f"{out['fingerprint']}\n", warnings=warnings)
+    line = "" if mode is None else (texts.MODE_LINE[mode] if out["anchor"] == "keeper" else
+                                    f"mode as stated in the signed records: {mode}") + "\n"
+    return fin(args, out, f"verified against the {out['anchor']}: {out['checked']} records under key "
+                               f"{out['fingerprint']}\n{line}", warnings=warnings)
+
+
+def verify_mode_choices() -> list[str]:
+    from .ainative.verify_mode import ACCEPT_MODES
+
+    return list(ACCEPT_MODES)
 
 
 def _add_keeper(sub) -> None:
@@ -844,11 +1077,22 @@ def _add_keeper(sub) -> None:
 
     p = sub.add_parser("setup", help="print the commands that install a component; runs nothing (AN-19)")
     ss = p.add_subparsers(dest="setup_cmd", required=True)
-    c = ss.add_parser("keeper", help="print the sudo commands and the systemd unit that install the keeper")
-    c.add_argument("--user", default=setup.DEFAULT_USER, help="the keeper's system user")
-    c.add_argument("--state", default=setup.DEFAULT_STATE, metavar="DIR")
-    c.add_argument("--socket", default=setup.DEFAULT_SOCKET, metavar="PATH")
-    c.add_argument("--venv", default=setup.DEFAULT_VENV, metavar="DIR", help="the root-owned virtual environment")
+    c = ss.add_parser("keeper", help="print the commands and the systemd unit that install the keeper")
+    c.add_argument("--mode", choices=("same-user", "separate-user"), default=None,
+                   help="same-user (the default since 0.7.0, with a warning when left out): your own user, no sudo, "
+                        "no sealing from your account; separate-user: a keeper user, sudo commands, the sealed-data "
+                        "guarantee")
+    from . import cli_layout
+
+    cli_layout.add_layout_option(c)
+    c.add_argument("--user", help=f"separate-user: the keeper's system user (default {setup.DEFAULT_USER})")
+    c.add_argument("--state", metavar="DIR", help="the keeper's state directory (default: per mode)")
+    c.add_argument("--socket", metavar="PATH", help="the keeper's socket (default: per mode)")
+    c.add_argument("--venv", metavar="DIR", help=f"separate-user: the root-owned virtual environment (default "
+                                                f"{setup.DEFAULT_VENV})")
+    c.add_argument("--executable", metavar="PATH",
+                   help="same-user: the gatedtrain command the unit runs (default: the one next to this Python; give "
+                        "a link at a plain path when that path holds a space, `%%` or `$`)")
     c.add_argument("--owner-uid", type=int, metavar="UID", help="the user the keeper serves (default: yours)")
     c.add_argument("--packages", nargs="+", metavar="SPEC",
                    help="scenario packs as NAME==VERSION (default: the installed packs at their versions)")
@@ -866,18 +1110,19 @@ def _add_keeper(sub) -> None:
                                    "(AN-20); runs nothing")
     c.add_argument("--owner", metavar="NAME", help="the user the keeper serves (default: you)")
     c.add_argument("--owner-uid", type=int, metavar="UID", help="the owner's uid (default: the owner's uid here)")
-    c.add_argument("--keeper-user", default=setup.DEFAULT_USER, metavar="NAME", help="the keeper's system user")
-    c.add_argument("--keeper-home", default=hostsetup.DEFAULT_KEEPER_HOME, metavar="DIR")
-    c.add_argument("--keeper-data-root", default=hostsetup.DEFAULT_KEEPER_DATA_ROOT, metavar="DIR",
+    cli_layout.add_layout_option(c)
+    c.add_argument("--keeper-user", metavar="NAME", help="the keeper's system user")
+    c.add_argument("--keeper-home", metavar="DIR")
+    c.add_argument("--keeper-data-root", metavar="DIR",
                    help="the keeper's rootless Docker data root")
-    c.add_argument("--owner-data-root", default=hostsetup.DEFAULT_OWNER_DATA_ROOT, metavar="DIR",
+    c.add_argument("--owner-data-root", metavar="DIR",
                    help="the owner's rootless Docker data root")
-    c.add_argument("--handoff", default=hostsetup.DEFAULT_HANDOFF, metavar="DIR",
+    c.add_argument("--handoff", metavar="DIR",
                    help="the hand-off directory (the owner's output_root)")
-    c.add_argument("--state", default=setup.DEFAULT_STATE, metavar="DIR", help="the keeper's state (as setup keeper)")
-    c.add_argument("--socket", default=setup.DEFAULT_SOCKET, metavar="PATH", help="the keeper's socket (as setup "
+    c.add_argument("--state", metavar="DIR", help="the keeper's state (as setup keeper)")
+    c.add_argument("--socket", metavar="PATH", help="the keeper's socket (as setup "
                                                                                   "keeper)")
-    c.add_argument("--venv", default=setup.DEFAULT_VENV, metavar="DIR", help="the keeper's venv (as setup keeper)")
+    c.add_argument("--venv", metavar="DIR", help="the keeper's venv (as setup keeper)")
     c.add_argument("--inference-image", metavar="REF@sha256:...",
                    help="the inference base image, pinned by digest, the keeper's daemon pulls; its ID goes into a "
                         "drop-in of the keeper's unit")
@@ -885,17 +1130,29 @@ def _add_keeper(sub) -> None:
                    help="hash-pinned requirements of the keeper's eval venv (needs --eval-python)")
     c.add_argument("--eval-python", metavar="PATH",
                    help=f"the interpreter the eval venv is created from, under {hostsetup.DEFAULT_EVAL_PYTHON_ROOT}")
-    c.add_argument("--eval-venv", default=hostsetup.DEFAULT_EVAL_VENV, metavar="DIR",
+    c.add_argument("--eval-venv", metavar="DIR",
                    help="the keeper's root-owned eval venv")
     c.add_argument("--confirm-group-removal", action="store_true",
                    help="pause before removing you from the docker group")
     c.set_defaults(func=cmd_setup_host)
+
+    from . import cli_setup_check
+
+    cli_setup_check.add_parser(ss)
+    cli_layout.add_parser(ss)
 
     p = sub.add_parser("verify", help="check a keeper project's signed records against the keeper or a fingerprint "
                                       "(AN-14)")
     p.add_argument("root", help="the project directory")
     p.add_argument("--keeper", metavar="SOCKET", help="anchor on the key the keeper at this socket serves")
     p.add_argument("--fingerprint", metavar="FP", help="anchor on a key fingerprint held out of band")
+    p.add_argument("--accept-mode", choices=verify_mode_choices(),
+                   help="accept a same-user result (exit 0, stated in the output); a stricter project policy still "
+                        "refuses it (AN-27, AN-28)")
+    p.add_argument("--require-maintainer-images", action="store_true",
+                   help="exit 1 unless a report states its trainer images and every one is in the maintainer lock: a "
+                        "project with no report, a report with no image list (undeclared) or a user-added image "
+                        "fails (IMG-9)")
     p.set_defaults(func=cmd_verify)
 
 
@@ -933,6 +1190,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print one JSON object (schema gatedtrain.cli_result) instead of text; goes before the "
                          "subcommand (AN-1)")
     sub = ap.add_subparsers(dest="command", required=True)
+
+    from . import cli_image                              # IMG-5, IMG-6: `gatedtrain image list|check|add`
+    cli_image.register(sub)
 
     p = sub.add_parser("validate", help="check a spec and its registration")
     p.add_argument("spec")
@@ -1077,14 +1337,16 @@ def main(argv: list[str] | None = None) -> int:
         _Parser.json_errors = False
     runner.QUIET = _as_json(args)                        # AN-1: no progress lines on stderr under --json
     try:
-        return args.func(args)
-    except Exception as exc:
-        if not _as_json(args):
-            raise
-        name = _command_name(args)
-        problem = Problem("INTERNAL", "", f"unexpected {type(exc).__name__}; this is a bug", "report it")
-        return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem], list(getattr(args, "ext_warnings", []))),
-                    as_json=True, human="")
+        with notice_scope():          # warnings raised below the command are queued for `emit` (also for INTERNAL)
+            try:
+                return args.func(args)
+            except Exception as exc:
+                if not _as_json(args):
+                    raise
+                name = _command_name(args)
+                problem = Problem("INTERNAL", "", f"unexpected {type(exc).__name__}; this is a bug", "report it")
+                return emit(Result(name, False, EXIT_NOT_PASS, {}, [problem],
+                                   list(getattr(args, "ext_warnings", []))), as_json=True, human="")
     finally:
         runner.QUIET = False
 

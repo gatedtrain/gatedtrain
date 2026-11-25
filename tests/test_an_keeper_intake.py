@@ -93,7 +93,7 @@ class TextsTest(unittest.TestCase):
         self.assertEqual(texts.sealed_guarantee(1001, 1000), texts.KEEPER_GUARANTEE)
 
     def test_same_user_text(self):
-        self.assertEqual(texts.sealed_guarantee(1000, 1000), texts.KEEPER_SAME_USER_GUARANTEE)
+        self.assertEqual(texts.sealed_guarantee(1000, 1000), texts.KEEPER_OWNER_RUN_GUARANTEE)
         self.assertIn("nothing is sealed", texts.KEEPER_SAME_USER_GUARANTEE)
 
 
@@ -154,7 +154,7 @@ class KeeperIntakeTest(unittest.TestCase):
         self.assertEqual(summary["manifest_sha256"], r["sealed_id"])
         self.assertEqual(summary["schema"], "gatedtrain.ainative.sealed_summary")
         self.assertEqual(power["schema"], "gatedtrain.ainative.power")
-        self.assertEqual(summary["guarantee"], texts.KEEPER_SAME_USER_GUARANTEE)
+        self.assertEqual(summary["guarantee"], texts.KEEPER_OWNER_RUN_GUARANTEE)
         self.assertEqual(power["alpha"], 0.02375)
         self.assertEqual(power["planning_alpha"], 0.02375)
         step1 = sealed_eval.split_data(TOY, sha256_bytes(TOY), planning_alpha=0.05)
@@ -301,7 +301,7 @@ class KeeperIntakeTest(unittest.TestCase):
         self.assertIsNone(self.call("latest_registration", pid))
 
     def test_hello_states_the_same_user_guarantee(self):
-        self.assertEqual(self.call("hello", None)["sealed_guarantee"], texts.KEEPER_SAME_USER_GUARANTEE)
+        self.assertEqual(self.call("hello", None)["sealed_guarantee"], texts.KEEPER_OWNER_RUN_GUARANTEE)
 
     def test_second_keeper_on_the_same_state_refused(self):           # AN-12
         cmd = [sys.executable, str(RUN_CLI), "keeper", "serve", "--state", str(self.kp.state),

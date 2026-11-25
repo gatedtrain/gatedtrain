@@ -32,7 +32,7 @@ from _support import FIXTURES, cli_env
 from gatedtrain.ainative import alpha_investing as ai, signing
 from gatedtrain.ainative.keeper import texts
 from gatedtrain.ainative.keeper_trust import KEEPER_PUB, RECEIPTS
-from gatedtrain.ainative.verify import OFFLINE_LIMIT, SAME_USER_KEEPER, SAME_USER_REPORT
+from gatedtrain.ainative.verify import OFFLINE_LIMIT, SAME_USER_KEEPER, OWNER_RUN_REPORT
 from gatedtrain.canonical import sha256_bytes
 from gatedtrain.testing import synthetic_pack as pack
 
@@ -118,7 +118,7 @@ class KeeperEndToEndTest(unittest.TestCase):
         doc = self.cli("verify", str(root), "--keeper", str(self.kp.socket), expect=expect)
         if expect == EXIT_NOT_PASS:
             self.assertEqual(doc["problems"], [], doc)
-            self.assertIn(doc["warnings"], ([SAME_USER_KEEPER], [SAME_USER_KEEPER, SAME_USER_REPORT]), doc)
+            self.assertIn(doc["warnings"], ([SAME_USER_KEEPER], [SAME_USER_KEEPER, OWNER_RUN_REPORT]), doc)
         return doc
 
     # helpers --------------------------------------------------------------------------------------------------------
@@ -170,10 +170,10 @@ class KeeperEndToEndTest(unittest.TestCase):
         self.assertEqual(status["data"]["gate"], "PASS")
         doc = self.verify(root)
         self.assertEqual((doc["data"]["anchor"], doc["data"]["fingerprint"]), ("keeper", self.fingerprint()))
-        self.assertEqual(doc["warnings"], [SAME_USER_KEEPER, SAME_USER_REPORT])
+        self.assertEqual(doc["warnings"], [SAME_USER_KEEPER, OWNER_RUN_REPORT])
         # a fingerprint anchors the key, but the report states the same-user guarantee: exit 1, naming it
         doc = self.cli("verify", str(root), "--fingerprint", self.fingerprint(), expect=EXIT_NOT_PASS)
-        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, SAME_USER_REPORT])
+        self.assertEqual(doc["warnings"], [OFFLINE_LIMIT, OWNER_RUN_REPORT, texts.MODE_STATED_NOTE])
         self.assertEqual(doc["data"]["anchor"], "fingerprint")
         self.assert_no_sealed_input([root])
 

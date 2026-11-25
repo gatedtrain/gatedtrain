@@ -68,6 +68,14 @@ def _path(field: str, value: str) -> PurePosixPath:
     return path
 
 
+def check_inference_ref(ref: object) -> None:
+    """Refused (AN-20) unless `ref` is an image reference pinned by digest (`<name>@sha256:<64 hex>`); the one rule
+    `--inference-image` and the layout file's `[inference] image` (AN-34) share."""
+    if not (isinstance(ref, str) and ref.isprintable() and "@sha256:" in ref and launch.IMAGE_RE.fullmatch(ref)):
+        raise _refuse("--inference-image", "the inference image is not a reference pinned by digest "
+                      "(<name>@sha256:<64 hex>)", "pass the public CUDA base image as <name>@sha256:<digest>")
+
+
 def _requirements(data: bytes) -> str:
     """The requirements text, refused unless every requirement carries `--hash=sha256:` (pip `--require-hashes`
     needs one for each; PyPI's hashes are the integrity anchor, design 5.8.1)."""
@@ -109,10 +117,11 @@ def host_script(*, owner: str, owner_uid: int, keeper_user: str = setup.DEFAULT_
                 state: str = setup.DEFAULT_STATE, socket: str = setup.DEFAULT_SOCKET, venv: str = setup.DEFAULT_VENV,
                 inference_ref: str | None = None, eval_requirements: bytes | None = None,
                 eval_python: str | None = None, eval_venv: str = DEFAULT_EVAL_VENV,
-                confirm_group_removal: bool = False) -> dict:
+                eval_python_root: str = DEFAULT_EVAL_PYTHON_ROOT, confirm_group_removal: bool = False) -> dict:
     """`{"script": str, "command": str}` (AN-20). Refused (AN-20) on a user name, uid, path, image reference or
     requirements file that is not safe to print or would not hold the guarantee: an inference reference not pinned
-    by digest, a requirement without `--hash=sha256:`, an eval interpreter outside `DEFAULT_EVAL_PYTHON_ROOT`."""
+    by digest, a requirement without `--hash=sha256:`, an eval interpreter outside `eval_python_root` (default
+    `DEFAULT_EVAL_PYTHON_ROOT`; only a layout file (AN-34) sets it)."""
     for field, name in (("--owner", owner), ("--keeper-user", keeper_user)):
         if not (isinstance(name, str) and setup._USER.fullmatch(name)):
             example = "your login name" if field == "--owner" else setup.DEFAULT_USER
@@ -138,35 +147,38 @@ def host_script(*, owner: str, owner_uid: int, keeper_user: str = setup.DEFAULT_
             if pa == pb or pa in pb.parents or pb in pa.parents:
                 raise _refuse(b, f"{b} and {a} are the same directory or one holds the other",
                               "give each of them its own directory")
-    if inference_ref is not None and not (isinstance(inference_ref, str) and "@sha256:" in inference_ref
-                                          and launch.IMAGE_RE.fullmatch(inference_ref)):
-        raise _refuse("--inference-image", "the inference image is not a reference pinned by digest "
-                      "(<name>@sha256:<64 hex>)", "pass the public CUDA base image as <name>@sha256:<digest>")
+    if inference_ref is not None:
+        check_inference_ref(inference_ref)
+    py_root = _path("eval_python_root", eval_python_root)
+    ev, pr = paths["--eval-venv"], py_root
+    if ev == pr or ev in pr.parents or pr in ev.parents:
+        raise _refuse("eval_python_root", "the eval interpreter root and --eval-venv are the same directory or one "
+                      "holds the other", "give each of them its own directory")
     requirements = None
     if eval_requirements is not None:
         requirements = _requirements(eval_requirements)
         if eval_python is None:
             raise _refuse("--eval-python", "--eval-requirements needs --eval-python, the interpreter the eval venv is "
-                          "created from", f"install a standalone CPython under {DEFAULT_EVAL_PYTHON_ROOT} and pass "
+                          "created from", f"install a standalone CPython under {py_root} and pass "
                           "its bin/python3.x")
     elif eval_python is not None:
         raise _refuse("--eval-python", "--eval-python needs --eval-requirements", "pass the hash-pinned "
                       "requirements of the eval venv, or leave out --eval-python")
     if eval_python is not None:
         py = _path("--eval-python", eval_python)
-        if PurePosixPath(DEFAULT_EVAL_PYTHON_ROOT) not in py.parents:
-            raise _refuse("--eval-python", f"the eval interpreter is not under {DEFAULT_EVAL_PYTHON_ROOT}, the "
+        if py_root not in py.parents:
+            raise _refuse("--eval-python", f"the eval interpreter is not under {py_root}, the "
                           "root-owned tree the keeper mounts", f"install a standalone CPython under "
-                          f"{DEFAULT_EVAL_PYTHON_ROOT} (`uv python install` with UV_PYTHON_INSTALL_DIR) and pass "
+                          f"{py_root} (`uv python install` with UV_PYTHON_INSTALL_DIR) and pass "
                           "its bin/python3.x")
     script = _script(owner=owner, owner_uid=owner_uid, keeper=keeper_user, paths=paths,
                      inference_ref=inference_ref, requirements=requirements, eval_python=eval_python,
-                     confirm=bool(confirm_group_removal))
+                     eval_python_root=str(py_root), confirm=bool(confirm_group_removal))
     return {"script": script, "command": COMMAND}
 
 
 def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_ref: str | None,
-            requirements: str | None, eval_python: str | None, confirm: bool) -> str:
+            requirements: str | None, eval_python: str | None, eval_python_root: str, confirm: bool) -> str:
     q = shlex.quote
     p = {k: str(v) for k, v in paths.items()}
     khome, kroot, oroot, handoff, venv = (p["--keeper-home"], p["--keeper-data-root"], p["--owner-data-root"],
@@ -177,7 +189,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
     parents = [str(PurePosixPath(p[f]).parent) for f in ("--keeper-home", "--keeper-data-root", "--owner-data-root",
                                                           "--handoff")]
     if requirements is not None:
-        parents += [str(PurePosixPath(venv).parent), str(PurePosixPath(DEFAULT_EVAL_PYTHON_ROOT).parent)]
+        parents += [str(PurePosixPath(venv).parent), str(PurePosixPath(eval_python_root).parent)]
     parents = [d for d in dict.fromkeys(parents) if d != "/"]
     cdi_globs = " ".join(f"{d}/*.{ext}" for d in CDI_SPEC_DIRS for ext in ("yaml", "json"))
     L = [
@@ -242,10 +254,10 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
     if requirements is not None:
         L += [
             "# The eval interpreter is a standalone CPython that root installs before this script runs, for example",
-            f"#   env UV_PYTHON_INSTALL_DIR={DEFAULT_EVAL_PYTHON_ROOT} uv python install 3.12",
+            f"#   env UV_PYTHON_INSTALL_DIR={eval_python_root} uv python install 3.12",
             "# (run as root). This script does not download or install it; it checks that the tree is root-owned",
             "# and not group- or other-writable, since the keeper mounts it into its inference container.",
-            f"PYROOT={q(DEFAULT_EVAL_PYTHON_ROOT)}",
+            f"PYROOT={q(eval_python_root)}",
             f"EVAL_PYTHON={q(eval_python)}",
             '[ -d "$PYROOT" ] && [ ! -L "$PYROOT" ] || fail "$PYROOT is not a directory"',
             '[ -z "$(find "$PYROOT" \\( ! -user root -o \\( ! -type l -perm /022 \\) \\) -print -quit)" ] \\',
@@ -291,7 +303,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         "APPARMOR",
         "  apparmor_parser -r /etc/apparmor.d/usr.bin.rootlesskit",
         "fi",
-        "# the keeper user, as `gatedtrain setup keeper` creates it, when missing",
+        "# the keeper user, as `gatedtrain setup keeper --mode separate-user` creates it, when missing",
         'if ! id -u "$KEEPER" >/dev/null 2>&1; then',
         f"  useradd --system --user-group --home-dir {q(p['--state'])} --no-create-home --shell /usr/sbin/nologin "
         '"$KEEPER"',
@@ -385,7 +397,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
             ]
     trees: list[str] = []
     if requirements is not None:
-        trees = [DEFAULT_EVAL_PYTHON_ROOT, venv]
+        trees = [eval_python_root, venv]
         L += [
             "# the keeper's eval venv: root-owned, from the interpreter checked above and the hash-pinned requirements",
             f'"$EVAL_PYTHON" -I -m venv --clear {q(venv)}',
@@ -426,7 +438,7 @@ def _script(*, owner: str, owner_uid: int, keeper: str, paths: dict, inference_r
         f'  if [ -n "$KEEPER_STOPPED" ]; then systemctl start {setup.UNIT_NAME}; '
         f"else systemctl try-restart {setup.UNIT_NAME}; fi",
         "else",
-        f'  echo "gatedtrain host setup: {setup.UNIT_NAME} is not installed; install it with gatedtrain setup keeper"',
+        f'  echo "gatedtrain host setup: {setup.UNIT_NAME} is not installed; install it with gatedtrain setup keeper --mode separate-user"',
         "fi",
         '[ -z "$OWNER_MANAGER_WAS_ACTIVE" ] || echo "gatedtrain host setup: warning: the user manager of $OWNER was '
         'already running; after all sessions of $OWNER have ended run: systemctl restart user@$OWNER_UID.service (or '

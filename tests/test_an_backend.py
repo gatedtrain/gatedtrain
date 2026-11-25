@@ -11,7 +11,6 @@ import contextlib
 import dataclasses
 import datetime
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -663,11 +662,11 @@ class TestReportCompute(_Base):
         fake = mock.Mock(project=self.project)
         fake._call = lambda op, args=None: calls.append((op, args)) or {"report": {}}
         fake._keep = lambda env, kind: {"kind": kind}
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        from gatedtrain import output
+        with output.notice_scope():
             self.assertEqual(KeeperTrust.report(fake), {"kind": "report"})
-        self.assertEqual([op for op, _ in calls], ["report"])
-        return calls[0][1] or {}, err.getvalue()
+            self.assertEqual([op for op, _ in calls], ["report"])
+            return calls[0][1] or {}, "\n".join(output.drain_notices())     # warnings go to the command's warnings list
 
     def test_no_jobs_no_compute(self) -> None:
         self.assertEqual(self.sent(), ({}, ""))

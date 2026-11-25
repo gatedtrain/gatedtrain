@@ -1,42 +1,39 @@
-# NeMo RL image for a trainer running as uid 1000 (`gatedtrain-a6-nemo-rl:1`)
+# NeMo RL trainer image for a trainer running as uid 1000 (logical name `nemo-rl/tierb-uid1000`)
 
-The NeMo RL family's derived trainer image, pinned in `gatedtrain.families.nemo_rl` as `NEMO_RL_UID1000_IMAGE`
-(`sha256:7a4078e7...`; `NEMO_RL_IMAGES` holds it next to the Tier B image `NEMO_RL_IMAGE`). The NeMo RL recipes (CAD,
-VLM, agentic) run their trainer and generation containers in it.
+The NeMo RL family's derived trainer image. The IDs gatedtrain accepts for it are data in the image lock
+(`gatedtrain image list`; the shipped file is `src/gatedtrain/data/image-lock.json`), not code. The NeMo RL recipes
+(CAD, VLM, agentic) run their trainer and generation containers in it.
 
-It is the Tier B image `nemo-rl:4f39fd8` plus one layer: the ten vLLM files NeMo RL patches at start-up, and their
-directories, belong to uid 1000. NeMo RL writes `<file>.patch_lock` beside them, and gatedtrain refuses a trainer running as
-root (MM-34), so without this layer the first GRPO step fails with PermissionError. Nothing is added or upgraded.
+`containers/` is not shipped in the wheel or sdist: the build recipes need a source checkout of gatedtrain.
 
-## The base image `nemo-rl:4f39fd8`
+It is the Tier B image (`containers/nemo-rl-tierb`) plus one layer: the ten vLLM files NeMo RL patches at start-up, and
+their directories, belong to uid 1000. NeMo RL writes `<file>.patch_lock` beside them, and gatedtrain refuses a trainer
+running as root (MM-34), so without this layer the first GRPO step fails with PermissionError. Nothing is added or
+upgraded. The rootless-host variant (owner 0:0) is `containers/nemo-rl-rootless`.
 
-`nemo-rl:4f39fd8` is a local tag, not a published image. It is built from the public NeMo RL repository
-(<https://github.com/NVIDIA-NeMo/RL>) at commit `4f39fd86289a2ffd5aaf5d202702f7fd7185c924`, with that repository's own
-`docker/Dockerfile` (`gatedtrain.backends.nemo_rl.DEFAULT_IMAGE` defaults to this tag):
+## The base image
 
-    git clone https://github.com/NVIDIA-NeMo/RL.git nemo-rl
-    git -C nemo-rl checkout 4f39fd86289a2ffd5aaf5d202702f7fd7185c924
-    git -C nemo-rl submodule update --init --recursive
-    cd nemo-rl
-    docker buildx build --target release --build-context nemo-rl=. -f docker/Dockerfile \
-      --build-arg SKIP_TRTLLM_BUILD=1 --build-arg SKIP_SGLANG_BUILD=1 \
-      --build-arg NEMO_RL_COMMIT=4f39fd86289a2ffd5aaf5d202702f7fd7185c924 \
-      --build-arg MAX_JOBS=<CPU cores / 2> --tag nemo-rl:4f39fd8 --load .
-
-`docs/tier-b-runbook.md` step 2 has the checks (the Automodel submodule commit, the commit inside the image) and the
-build lessons (`--target release`, memory limits). The reference build had image ID `sha256:8cd5b714...`; an image
-built elsewhere may get a different ID, which then has to be recorded deliberately (`NEMO_RL_IMAGE`).
+The base is the Tier B image, a local build, not a published image. `containers/nemo-rl-tierb/README.md` explains how to
+build it and how an image of your own is recorded; the source repository and commit are in the lock
+(`gatedtrain --json image list`). `docs/tier-b-runbook.md` step 2 has the checks and the build lessons.
 
 ## Build this image
 
 From this directory, on the Docker daemon that will run the containers (no network needed):
 
-    docker build -t gatedtrain-a6-nemo-rl:1 .
+    docker build --build-arg BASE=<the Tier B image tag or ID> -t <tag> .
 
-Pass `--context <name>` when that daemon is not the default Docker context (the reference host used a dedicated
-context named `gatedtrain`). Check the image ID against `NEMO_RL_UID1000_IMAGE` after the build; a different ID is a
-different image, which `ext-launch` refuses until the constant is changed deliberately.
+Pass `--context <name>` when that daemon is not the default Docker context. `BASE` has no default on purpose. Then:
+
+    gatedtrain image check nemo-rl/tierb-uid1000 --ref <tag> [--docker-context <name>]
+
+The maintainer lock records no Containerfile hash for the reference build of this image: it was built from the file
+before it took `BASE` as a build argument (same chown list, same layers), so the hash of the file shipped here would
+claim a build that did not happen.
+
+A different ID is a different image: `ext-launch` refuses it until it is accepted, either by the maintainers (a new
+lock entry in a release) or by you with `gatedtrain image add` (a recorded act; reports flag it as USER-ADDED).
 
 The Containerfile ends with `USER root` (the user needed for the `chown`). It is kept because it is part of the image
-configuration behind the pinned image ID; ext-launch always passes an explicit non-root `--user` (MM-34), so the
+configuration behind the accepted image ID; ext-launch always passes an explicit non-root `--user` (MM-34), so the
 image's default user is never used by gatedtrain.

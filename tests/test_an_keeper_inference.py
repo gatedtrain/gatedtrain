@@ -30,7 +30,7 @@ from test_an_keeper_attempts import TOY, arm
 from test_an_keeper_intake import confirm_args, intake_args, project_id
 from gatedtrain.ainative import batch, runtime as runtime_mod, scorers, signing, trust_stages
 from gatedtrain.ainative.alpha_investing import PLANNING_ALPHA
-from gatedtrain.ainative.keeper import envcheck, protocol, rootful, server
+from gatedtrain.ainative.keeper import envcheck, modes, protocol, rootful, server
 from gatedtrain.ainative.keeper.protocol import RefusedAfterSpend
 from gatedtrain.ainative.keeper.state import KeeperState
 from gatedtrain.ainative.runtime import DaemonInfo, DockerCLIRuntime, RuntimeFailure
@@ -995,7 +995,10 @@ class EnvironmentRecordTest(unittest.TestCase):
             finally:
                 stop.set()
                 thread.join(10)
-        expected = {"stub": 1, "inference": {"image_id": IMAGE, "docker_host": f"unix://{dsock}",
+        facts = modes.observe(os.geteuid(), os.getuid(), os.stat(state))["facts"]       # AN-27: signed at start
+        facts.pop("peer_uid")
+        expected = {"stub": 1, "mode": "same_user", "mode_facts": facts,
+                    "inference": {"image_id": IMAGE, "docker_host": f"unix://{dsock}",
                                              "eval_trees": [envcheck.eval_tree_record(tree)],
                                              "docker_cli_sha256": None}}
         self.assertEqual(hello["environment_sha256"], envcheck.environment_sha256(expected))

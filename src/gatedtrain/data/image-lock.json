@@ -1,0 +1,50 @@
+{
+  "schema": "gatedtrain.image-lock",
+  "schema_version": 1,
+  "images": {
+    "nemo-rl/tierb": {
+      "purpose": "NeMo RL trainer image built from NeMo RL's own docker/Dockerfile at the pinned commit (the Tier B image, local tag nemo-rl:4f39fd8)",
+      "accepted": [
+        {
+          "id": "sha256:8cd5b714ea91ec7ea9a976c75b0ae6f6932140cf7a8aea803100de6331a2113a",
+          "origin": "maintainer-built",
+          "recipe": {
+            "name": "nemo-rl-4f39fd8-release",
+            "source": "https://github.com/NVIDIA-NeMo/RL",
+            "commit": "4f39fd86289a2ffd5aaf5d202702f7fd7185c924",
+            "containerfile_sha256": null,
+            "build": "containers/nemo-rl-tierb"
+          },
+          "base_id": null,
+          "built_utc": "2026-11-12",
+          "added_by": "gatedtrain 0.4.0 lock",
+          "note": "reference build"
+        }
+      ]
+    },
+    "nemo-rl/tierb-uid1000": {
+      "purpose": "the Tier B image plus one layer handing the ten vLLM files NeMo RL patches at start-up to uid 1000 (a trainer running as 1000:1000)",
+      "accepted": [
+        {
+          "id": "sha256:7a4078e70b28cc6de622fa3cf25c7596c52337fa3f1779488b402c5fa1c74e69",
+          "origin": "maintainer-built",
+          "recipe": {
+            "name": "nemo-rl-uid1000",
+            "source": "https://github.com/NVIDIA-NeMo/RL",
+            "commit": "4f39fd86289a2ffd5aaf5d202702f7fd7185c924",
+            "containerfile_sha256": null,
+            "build": "containers/nemo-rl-uid1000"
+          },
+          "base_id": "sha256:8cd5b714ea91ec7ea9a976c75b0ae6f6932140cf7a8aea803100de6331a2113a",
+          "built_utc": "2026-11-19",
+          "added_by": "gatedtrain 0.4.0 lock",
+          "note": "reference build from the pre-ARG file, same chown list; see containers/nemo-rl-uid1000 (the shipped Containerfile later took BASE as a build argument; no hash is recorded because the shipped file is not the file that built this image)"
+        }
+      ]
+    },
+    "nemo-rl/tierb-rootless": {
+      "purpose": "the Tier B image plus one layer making those vLLM files owned by root, for a rootless Docker host (build it with containers/nemo-rl-rootless; the ID is host specific, add it with `gatedtrain image add`)",
+      "accepted": []
+    }
+  }
+}

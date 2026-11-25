@@ -42,6 +42,7 @@ MINIMAL_ARGS = {
     "project": ["status", "root"],
     "keeper": ["serve", "--state", "s", "--socket", "k.sock", "--owner-uid", "1000"],
     "setup": ["keeper"],
+    "image": ["list"],
     "verify": ["root"],
 }
 
@@ -56,6 +57,7 @@ PROJECT_JOB_ARGS = {
 SETUP_ARGS = {
     "keeper": ["setup", "keeper"],
     "host": ["setup", "host"],
+    "check": ["setup", "check"],
 }
 
 

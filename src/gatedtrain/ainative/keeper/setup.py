@@ -34,7 +34,9 @@ UNIT_NAME = "gatedtrain-keeper.service"
 UNIT_PATH = f"/etc/systemd/system/{UNIT_NAME}"
 SCENARIO_ENTRY_POINT_GROUP = "gatedtrain.scenarios"
 KEEP_FINGERPRINT = ("# keep the fingerprint the last command printed somewhere the agent cannot write (a note on "
-                    "another device); `gatedtrain verify <project> --fingerprint <fp>` checks a project against it")
+                    "another device); `gatedtrain verify <project> --fingerprint <fp>` checks a project against it. "
+                    "It protects a separate-user keeper only: a same-user keeper's key is readable by your own "
+                    "account, so a fingerprint kept away from the agent does not protect it")
 
 _USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
@@ -63,10 +65,21 @@ def installed_packs() -> list[str]:
 _UNIT_UNSAFE = re.compile(r"[%$\s'\"\\]")
 
 
-def _absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
+def plain_absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
+    """`value` as an absolute path without `..` and without a non-printable character (escape, NUL, line and bidi
+    separators, ...): such a character would reach a printed command line raw. The path is shell-quoted where printed
+    (not part of a unit's `ExecStart=`); `_absolute` adds the unit rule."""
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or "\n" in value:
         raise _refuse(field, "the path is not an absolute path without `..`", "pass an absolute path", rule)
+    if not value.isprintable():
+        raise _refuse(field, "the path holds a non-printable character (a control, escape or separator character)",
+                      "pass a path of letters, digits, `/`, `.`, `_` and `-`", rule)
+    return path
+
+
+def _absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
+    path = plain_absolute(field, value, rule)
     if _UNIT_UNSAFE.search(value):
         raise _refuse(field, "the path holds a character systemd rewrites or splits in a unit (`%`, `$`, whitespace, "
                       "a quote or a backslash)", "pass a path of letters, digits, `/`, `.`, `_` and `-`", rule)
@@ -111,6 +124,14 @@ def _unit(user: str, serve: list[str], runtime_dir: str | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def check_eval_tree(tree: str, rule: str = RULE) -> None:
+    """Refused unless `tree` is a plain absolute path a docker mount can carry (shared with the layout file, AN-34)."""
+    _absolute("--eval-tree", tree, rule)
+    if any(c in tree for c in ":,"):
+        raise _refuse("--eval-tree", "the eval tree holds `:` or `,`, which a docker mount cannot carry",
+                      "pass a path of letters, digits, `/`, `.`, `_` and `-`", rule)
+
+
 def _inference_options(inference_image: str | None, eval_trees: list[str] | None,
                        docker_host: str | None) -> tuple[str | None, list[str], str | None]:
     """The keeper's inference options (AN-25) checked for the unit's `ExecStart=`; Refused (AN-19) for an image that
@@ -127,14 +148,11 @@ def _inference_options(inference_image: str | None, eval_trees: list[str] | None
         raise _refuse("--inference-image", "the inference image is not an image ID sha256:<64 hex>",
                       "pass the ID the keeper's daemon prints for the image (`docker image inspect -f '{{.Id}}'`)")
     for tree in trees:
-        _absolute("--eval-tree", tree)
-        if any(c in tree for c in ":,"):
-            raise _refuse("--eval-tree", "the eval tree holds `:` or `,`, which a docker mount cannot carry",
-                          "pass a path of letters, digits, `/`, `.`, `_` and `-`")
-    if docker_host is not None and (not docker_host or docker_host.startswith("-")
+        check_eval_tree(tree)
+    if docker_host is not None and (not docker_host or docker_host.startswith("-") or not docker_host.isprintable()
                                     or _UNIT_UNSAFE.search(docker_host)):
-        raise _refuse("--docker-host", "the Docker host is empty, starts with `-`, or holds a character systemd "
-                      "rewrites or splits in a unit", "pass unix:///run/user/<keeper uid>/docker.sock")
+        raise _refuse("--docker-host", "the Docker host is empty, starts with `-`, holds a non-printable character, "
+                      "or holds a character systemd rewrites or splits in a unit", "pass unix:///run/user/<keeper uid>/docker.sock")
     return inference_image, trees, docker_host
 
 

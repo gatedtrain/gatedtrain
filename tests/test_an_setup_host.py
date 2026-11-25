@@ -294,7 +294,7 @@ class SetupHostTest(unittest.TestCase):                             # AN-20
 class SetupKeeperInferenceTest(unittest.TestCase):                 # AN-19 with the AN-25 serve options
     def test_inference_options_go_into_exec_start(self):
         with no_processes():
-            code, doc = run(["setup", "keeper", "--owner-uid", "4321", "--packages", "p==1",
+            code, doc = run(["setup", "keeper", "--mode", "separate-user", "--owner-uid", "4321", "--packages", "p==1",
                              "--inference-image", f"sha256:{HEX}", "--eval-tree", "/x", "--eval-tree", "/y/z",
                              "--docker-host", "unix:///run/user/999/docker.sock"])
         self.assertEqual(code, 0, doc)
@@ -312,7 +312,7 @@ class SetupKeeperInferenceTest(unittest.TestCase):                 # AN-19 with 
                  (["--inference-image", f"sha256:{HEX}", "--docker-host", "unix:///a b"], "--docker-host")]
         for extra, field in cases:
             with self.subTest(extra=extra), no_processes():
-                code, doc = run(["setup", "keeper", "--packages", "p==1", *extra])
+                code, doc = run(["setup", "keeper", "--mode", "separate-user", "--packages", "p==1", *extra])
                 self.assertEqual((code, doc["problems"][0]["rule"], doc["problems"][0]["field"]),
                                  (3, "AN-19", field), doc)
 

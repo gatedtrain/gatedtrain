@@ -24,6 +24,20 @@ another uid than the owner's (`same_user` not false) is no anchor either: the ow
 rootful access was checked, `UNCHECKED_GUARANTEE_REPORT`), the same-user guarantee (`KEEPER_SAME_USER_GUARANTEE`,
 `SAME_USER_REPORT`) or a text this version does not know (`UNKNOWN_GUARANTEE_REPORT`).
 
+The keeper mode (AN-27 to AN-29, `verify_mode`) is stated as a fact with its sources (`keeper_mode`, `effective_mode`,
+`mode_sources`). The effective mode (also `keeper_mode`, never the unverified claim) is the weakest of the keeper's
+claim weakened by the kernel's answer about the process that listens on its socket, the `keeper_mode` of every signed
+registration and claim receipt, and each report's mode; a report stronger than the receipts it covers, or whose
+`modes_seen` or attempts contradict them, is refused (AN-14), and receipts with no stated mode give `mode_unknown`
+(`MODE_UNKNOWN`, exit 1). A claim of separate-user mode from a listener with the reader's own uid, or with the uid that owns the project
+files (the account that wrote the records, `project_account_uids`), is refused (AN-29, exit 3); `mode_basis` says what
+the effective mode rests on (`kernel_attestation`, `signed_records`, `report_text`), and any result not anchored by the
+keeper warns that the mode is as stated by the holder of the key (`MODE_STATED_NOTE`). A report of
+`schema_version` 3 names its `keeper_mode`, which must agree with its signed guarantee text (AN-14); a version 2
+report's mode is read from its text. A project whose registration requires `separate_user` is refused (AN-28, exit 3)
+when the evidence shows same-user, also under `--accept-mode same-user`, which otherwise turns a same-user result
+(`OWNER_RUN_REPORT`, `SAME_USER_REPORT`, `SAME_USER_KEEPER`) from exit 1 into exit 0 and says so.
+
 Only `--keeper` finds a deleted record: the project must hold exactly the envelopes the keeper's `records` op lists for
 it, no more and no fewer. Offline (`--fingerprint` or no anchor) a report is bound to this project through its
 registration hash and attempt ids, which must be among the project's signed receipts, but a record removed together
@@ -39,13 +53,14 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import Problem, Refused
-from . import signing
-from .keeper import protocol
+from . import image_provenance, signing, verify_mode
+from .keeper import modes, protocol
 from .keeper.protocol import KeeperClient
-from .keeper.texts import (KEEPER_GUARANTEE, KEEPER_GUARANTEE_V1, KEEPER_ROOT_DOCKER_GUARANTEE,
-                           KEEPER_SAME_USER_GUARANTEE)
-from .keeper_trust import KEEPER_PUB, RECEIPTS, _hello_key, load_binding, project_id
+from .keeper.texts import (KEEPER_GUARANTEE, KEEPER_GUARANTEE_V1, KEEPER_OWNER_RUN_GUARANTEE,
+                           KEEPER_ROOT_DOCKER_GUARANTEE, KEEPER_SAME_USER_GUARANTEE)
+from .keeper_trust import KEEPER_PUB, RECEIPTS, _hello_key, load_binding, project_account_uids, project_id
 from .project import Project, _refuse_links
+from .sealed_eval import REPORT_SCHEMA_VERSION
 from .trust_stages import REPORT_MD, SCHEMA_GATE_RESULT, SCHEMA_REGISTRATION, SCHEMA_REPORT, render_markdown
 
 CONSISTENCY_ONLY = "checked consistency only: no keeper and no fingerprint"
@@ -59,12 +74,23 @@ ROOT_DOCKER_REPORT = ("the report states that the user's account could reach a r
                       "user's account")
 UNCHECKED_GUARANTEE_REPORT = ("the report states the guarantee of gatedtrain 0.4.0, which was stated before rootful "
                               "access was checked: its separate-user claim is not established")
+OWNER_RUN_REPORT = verify_mode.OWNER_RUN_REPORT
 SAME_USER_REPORT = ("the report states that the keeper ran as the owner's own OS user: nothing was sealed from the "
                     "user's account")
 UNKNOWN_GUARANTEE_REPORT = ("the report states a guarantee this version of gatedtrain does not know: its separate-user "
                             "claim is not established")
+MODE_UNKNOWN = ("mode unknown: the project holds keeper receipts, but no signed record or report states the keeper mode "
+                "(receipts written before keeper modes state none), so no claim of separate-user sealing can be made; "
+                "verify with --keeper against the keeper, or with --fingerprint once the project holds a report that "
+                "states the mode")
+SAME_USER_RECORDS = ("the project's signed records state that the keeper ran as the owner's own OS user: nothing was "
+                     "sealed from the user's account")
 OFFLINE_LIMIT = ("offline verify cannot detect deleted records; verify against the keeper (--keeper) to check "
                  "that the project holds every record the keeper signed for it")
+BASIS_KERNEL, BASIS_RECORDS, BASIS_TEXT = "kernel_attestation", "signed_records", "report_text"    # `mode_basis`
+NO_REPORT_IMAGES = "no report states any trainer image: --require-maintainer-images cannot be met by a project with " \
+                   "no report"
+MODE_UNKNOWN_HEADLINE = ("the records carry no keeper mode (written before 0.7.0) and no report states one")
 _FP = re.compile(r"sha256:[0-9a-f]{64}")
 _ENVELOPE_META = ("schema", "schema_version", "envelope_sha256")
 
@@ -100,10 +126,11 @@ def _receipts(project: Project) -> list[tuple[str, Any]]:
 
 
 def _anchor(project: Project, keeper: Path | None,
-            fingerprint: str | None) -> tuple[str, str, Any, bool | None, bool | None]:
+            fingerprint: str | None) -> tuple[str, str, Any, bool | None, bool | None, dict]:
     """(anchor kind, anchor fingerprint, anchor public key, whether the keeper runs as the owner's uid, whether the
     owner reaches a rootful daemon (AN-21); both None without a keeper, and True unless the keeper's `hello` for the
-    project says false)."""
+    project says false), and the mode evidence `{claim, attested, effective}` (all None without a keeper; AN-29:
+    `same_user` is true unless the keeper claims separate-user mode and the kernel confirms another listener uid)."""
     if fingerprint is not None and not _FP.fullmatch(fingerprint):
         raise _bad("--fingerprint", "the fingerprint is not sha256:<64 lowercase hex>",
                    "pass the fingerprint `gatedtrain keeper fingerprint` printed at setup")
@@ -119,12 +146,19 @@ def _anchor(project: Project, keeper: Path | None,
     except OSError:
         raise _bad(KEEPER_PUB, "the project's copy of the keeper key is missing") from None
     same_user = root_docker = None
+    evidence = {"claim": None, "attested": None, "effective": None}
     if keeper is not None:
-        hello = KeeperClient(Path(keeper).absolute(), timeout=protocol.LONG_OP_TIMEOUT_S).call(
-            "hello", binding.project_id, {})
+        asking = KeeperClient(Path(keeper).absolute(), timeout=protocol.LONG_OP_TIMEOUT_S)
+        hello = asking.call("hello", binding.project_id, {})
         fp, pem = _hello_key(hello)
         kind, public = "keeper", signing.load_public_pem(pem)
-        same_user = hello.get("same_user") is not False
+        claim = modes.claimed_mode(hello)
+        uid = asking.last_attested_uid
+        account = project_account_uids(project.root)                  # the accounts that wrote the project (AN-29)
+        mode, note = modes.effective_client_mode(claim, uid, os.geteuid(), account)    # refuses a contradiction
+        attested = modes.attested_mode(uid, os.geteuid(), account)
+        evidence = {"claim": claim, "attested": attested, "effective": mode, "note": note}
+        same_user = mode == modes.SAME_USER
         root_docker = hello.get("owner_has_root_docker") is not False
         if fingerprint is not None and fingerprint != fp:
             raise _bad("--fingerprint", "the keeper serves another key than the fingerprint given")
@@ -136,7 +170,7 @@ def _anchor(project: Project, keeper: Path | None,
         raise _bad(KEEPER_PUB, "the project's copy of the keeper key is not the anchor's key")
     if binding.fingerprint != fp:
         raise _bad("trust/keeper.json.fingerprint", "the project is bound to another key than the anchor's")
-    return kind, fp, public, same_user, root_docker
+    return kind, fp, public, same_user, root_docker, evidence
 
 
 _NAMED = {"registration.json": SCHEMA_REGISTRATION, "gate_result.json": SCHEMA_GATE_RESULT,
@@ -195,13 +229,14 @@ def _check_registration(rel: str, doc: dict, env: dict) -> None:
 
 
 def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) -> dict:
-    """`{anchor: "keeper" | "fingerprint" | "none", checked, fingerprint, same_user, root_docker, report_guarantees}`
+    """`{anchor: "keeper" | "fingerprint" | "none", checked, fingerprint, same_user, root_docker, report_guarantees,
+    mode_basis, ...}`
     (`same_user` and `root_docker` None without a keeper; `report_guarantees`: the `sealed_guarantee` of each checked
     `report.json`, in path order); refused (AN-14) on a bad signature, a record the keeper does not hold, or a
     record, key copy or binding that differs from the anchor. `checked` counts the envelopes in the receipts plus the
     registration, gate result and report records compared with them."""
     project = Project.load(Path(root))
-    kind, fp, public, same_user, root_docker = _anchor(project, keeper, fingerprint)
+    kind, fp, public, same_user, root_docker, evidence = _anchor(project, keeper, fingerprint)
     pid = project_id(project)
     by_sha: dict[str, dict] = {}
     for where, env in _receipts(project):
@@ -231,7 +266,13 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
                        "report <project>` again to fetch them from the keeper, then verify again; if they stay "
                        "missing, do not trust the report")
     checked = len(by_sha)
+    receipts = verify_mode.receipt_modes(list(by_sha.values()))              # AN-14: a value that is no mode is refused
     guarantees = []
+    report_modes: list[str | None] = []
+    report_requirements: list[Any] = []
+    user_added: list[str] = []
+    undeclared, lock_hashes = [], []                                                       # IMG-9
+    signed_report_mode = False                  # a report of the current version carries its mode as a signed field
     for rel, doc in _records(project):
         schema = doc["schema"]
         if schema == SCHEMA_REPORT:
@@ -240,6 +281,9 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
             _cross_bind(by_sha, rel, doc)
             if _dict(doc.get("keeper")).get("fingerprint") != fp:
                 raise _bad(f"{rel}.keeper.fingerprint", "the report names another key than the anchor's")
+            report_modes.append(verify_mode.report_mode(rel, doc, receipts))   # AN-14: refuses a contradiction
+            signed_report_mode = signed_report_mode or doc.get("schema_version") == REPORT_SCHEMA_VERSION
+            report_requirements.append(doc.get("require_keeper_mode"))
             md = str(Path(rel).with_name(REPORT_MD))
             _refuse_links(project.root, md)
             try:
@@ -249,6 +293,11 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
             if text != render_markdown(doc):
                 raise _bad(md, "report.md is not the rendering of report.json")
             guarantees.append(doc.get("sealed_guarantee"))
+            user_added += [i for i in image_provenance.user_added_images(doc) if i not in user_added]     # IMG-9
+            undeclared.append(image_provenance.images_undeclared(doc))
+            h = image_provenance.report_lock_sha256(doc)
+            if h is not None and h not in lock_hashes:
+                lock_hashes.append(h)
         else:
             sha = doc.get("envelope_sha256")
             env = by_sha.get(sha) if isinstance(sha, str) else None
@@ -260,8 +309,35 @@ def verify_project(root: Path, *, keeper: Path | None, fingerprint: str | None) 
             elif env["record"] != {k: v for k, v in doc.items() if k not in _ENVELOPE_META}:
                 raise _bad(rel, "the gate result is not the gate summary the keeper signed")
         checked += 1
+    require = verify_mode.required_mode(list(by_sha.values()), report_requirements)
+    now = verify_mode.effective(evidence["effective"], report_modes, receipts[0])         # the weakest of all sources
+    verify_mode.check_policy(require, now)                                # AN-28: whatever `--accept-mode` says
+    basis = mode_basis(now, anchor=kind, attested=evidence["attested"], receipt_modes=receipts[0],
+                       signed_report_mode=signed_report_mode, report_modes=report_modes)
     return {"anchor": kind, "checked": checked, "fingerprint": fp, "same_user": same_user, "root_docker": root_docker,
-            "report_guarantees": guarantees}
+            "report_guarantees": guarantees, "user_added_images": user_added,
+            "images_undeclared": max(undeclared, default=image_provenance.IMAGES_NOT_STATED),   # the worst of any report
+            "image_lock_sha256": lock_hashes,
+            "keeper_mode": now, "effective_mode": now,           # never the unverified claim (that is in mode_sources)
+            "mode_basis": basis,
+            "mode_sources": verify_mode.sources(evidence["claim"], evidence["attested"], report_modes, receipts[0]),
+            "mode_unknown": now is None and bool(by_sha), "receipt_modes": receipts[0],
+            "mode_note": evidence.get("note"), "require_keeper_mode": require}
+
+
+def mode_basis(effective_mode: str | None, *, anchor: str, attested: str | None, receipt_modes: list[str],
+               signed_report_mode: bool, report_modes: list[str | None]) -> str | None:
+    """What the effective mode rests on, so a reader never takes a statement for an observation (AN-27): `kernel_attestation`
+    when the keeper is the anchor and the kernel answered for its listener (AN-29); `signed_records` when it comes from
+    signed receipts or a signed `keeper_mode` field, which prove only that the holder of the key wrote them;
+    `report_text` when it comes only from the guarantee text of a version 2 report; None when no mode is determined."""
+    if effective_mode is None:
+        return None
+    if anchor == "keeper" and attested is not None:
+        return BASIS_KERNEL
+    if receipt_modes or signed_report_mode:
+        return BASIS_RECORDS
+    return BASIS_TEXT if any(m is not None for m in report_modes) else None
 
 
 def report_warnings(out: dict) -> list[str]:
@@ -269,8 +345,14 @@ def report_warnings(out: dict) -> list[str]:
     only `KEEPER_GUARANTEE` passes; the downgraded, the revision 23, the same-user and any other text each warn."""
     found = out.get("report_guarantees") or []
     known = {KEEPER_ROOT_DOCKER_GUARANTEE: ROOT_DOCKER_REPORT, KEEPER_GUARANTEE_V1: UNCHECKED_GUARANTEE_REPORT,
-             KEEPER_SAME_USER_GUARANTEE: SAME_USER_REPORT}
+             KEEPER_SAME_USER_GUARANTEE: SAME_USER_REPORT, KEEPER_OWNER_RUN_GUARANTEE: OWNER_RUN_REPORT}
     warnings = [w for g, w in known.items() if g in found]
     if any(g != KEEPER_GUARANTEE and g not in known for g in found):
         warnings.append(UNKNOWN_GUARANTEE_REPORT)
+    same_user_texts = (KEEPER_SAME_USER_GUARANTEE, KEEPER_OWNER_RUN_GUARANTEE)
+    if modes.SAME_USER in (out.get("receipt_modes") or []) and not out.get("same_user") and \
+            not any(g in same_user_texts for g in found):
+        warnings.append(SAME_USER_RECORDS)     # same-user receipts that neither a report text nor the keeper anchor say
+    if out.get("mode_unknown"):
+        warnings.append(MODE_UNKNOWN)
     return warnings
