@@ -2,7 +2,7 @@
 
 This page is for people who want gatedtrain to run a whole training goal as one project, from labelled data to a
 gate report. It covers the `gatedtrain project` commands, the keeper that holds the sealed test data (in
-[one of two modes](#keeper-modes): under your own OS user, the default, which needs no sudo, or under its own OS user,
+[one of two modes](#keeper-modes): under your own OS user, the default, whose setup commands need no sudo (rootless Docker and its prerequisites may need an administrator once; `gatedtrain setup check` names them), or under its own OS user,
 the hardened mode), the rootless containers that run the jobs, and scenario packs. It is a preview: the guarantees and limits
 below are stated exactly, and the quoted texts are the ones the reports print. New to the ideas? Read
 [Concepts](concepts.md) first.
@@ -102,7 +102,7 @@ how to set up each.
 A keeper runs in one of two modes. The mode is an observed fact, not an option: nothing you pass on a command line, in
 an environment variable or in a project file can state it.
 
-- **Same-user mode (the default).** The keeper runs under your own OS user. Setup needs no sudo. The keeper follows
+- **Same-user mode (the default).** The keeper runs under your own OS user. Its setup commands need no sudo (rootless Docker and its prerequisites may need an administrator once; `gatedtrain setup check` names them). The keeper follows
   the procedure (it signs the registration before training, spends alpha before it scores, and runs a batch generator's
   model in a container without network access and without the labels; a per-item generator runs inside the keeper process
   without that confinement), but nothing is sealed from your account: anything running as you, such as an

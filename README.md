@@ -70,8 +70,8 @@ report and shows control runs that FAIL or come out INCONCLUSIVE on purpose.
 ## No sudo
 
 The AI-native keeper runs without sudo by default: `gatedtrain setup keeper` prints user-level commands for a keeper
-under your own OS user (same-user mode), and `gatedtrain setup check` names the outside prerequisites, such as rootless
-Docker, and changes nothing. Same-user mode follows the procedure but does not seal the data from your account, and
+under your own OS user (same-user mode), and `gatedtrain setup check` names the outside prerequisites and changes nothing: gatedtrain itself needs no sudo, but rootless
+Docker and its prerequisites (uidmap, subuid ranges, the NVIDIA CDI spec) may need an administrator once on a machine that lacks them. Same-user mode follows the procedure but does not seal the data from your account, and
 every result says so on its first line:
 
 ```text
