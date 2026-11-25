@@ -165,9 +165,11 @@ container, all optional, all set by the person who starts the keeper and never b
   `GATEDTRAIN_PACK_*_EVAL_PYTHON` variable is not needed. The keeper still runs it only when it is a regular file inside
   a configured eval tree.
 
-`--gpu-busy-mib` is bounded (0 to 1 TiB) so that it cannot switch the busy check off; `--gpu-wait-s` is bounded by the
-fit check, which refuses every generator, GPU or not, when the wait plus two time limits and the slack exceed the client's
-timeout. A value that differs from the default is part of the keeper's signed environment record (`inference.gpu`,
+`--gpu-busy-mib` is bounded (0 to 1 TiB) against absurd values; a threshold above the GPU's memory still turns the busy
+check off, which is why a non-default value is part of the signed record. `--gpu-wait-s` is bounded by the client's deadline
+less the slack (3298 s at the defaults) and is refused when set above it; a wait above the default of 900 s also shortens the
+time limit a generator may declare, because the fit check (every generator, GPU or not) keeps the wait plus two time limits
+plus the slack under the deadline: with the default 1200 s limit, a wait above 900 s refuses that generator before the grant. A value that differs from the default is part of the keeper's signed environment record (`inference.gpu`,
 `inference.eval_python`), and the report names that record's hash; with the defaults the record is byte-identical to
 before. They need `--inference-image`.
 

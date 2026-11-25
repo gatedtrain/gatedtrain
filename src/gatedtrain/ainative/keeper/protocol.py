@@ -33,7 +33,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ...errors import Problem, Refused
-from ..batch import MAX_GENERATOR_TIME_LIMIT_S, evaluation_wait_bound
+from ..batch import EVAL_SLACK_S, MAX_GENERATOR_TIME_LIMIT_S, evaluation_wait_bound
 from ..limits import MAX_DATA_TEXT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES
 from ..runtime import GPU_WAIT_S
 
@@ -42,6 +42,10 @@ LONG_OPS = frozenset({"intake", "evaluate", "gate", "report"})
 # A batch evaluation (AN-25): the wait for the GPU, one container per arm for at most the generator's time limit each, and
 # the slack the keeper adds; 3900 s with the current limits (pinned by tests/test_single_source.py).
 LONG_OP_TIMEOUT_S = float(evaluation_wait_bound(GPU_WAIT_S, MAX_GENERATOR_TIME_LIMIT_S))
+# The longest GPU wait the owner may set (`--gpu-wait-s`): the client's deadline minus the slack and two one-second time
+# limits. A larger wait could never fit any generator, so it is refused when it is set, not at the first evaluation. A
+# wait above the default also shortens the time limit a generator may declare: the fit check keeps its sum under the deadline.
+MAX_GPU_WAIT_S = LONG_OP_TIMEOUT_S - EVAL_SLACK_S - 2
 MAX_SOCKET_PATH = 107                         # sun_path is 108 bytes including the terminating NUL
 
 RULE = "AN-12"

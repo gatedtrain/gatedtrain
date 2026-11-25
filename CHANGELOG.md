@@ -16,7 +16,8 @@ Owner-side settings (the audit's open items; defaults and every recorded hash un
   `host_config_sha256` only when set. The `GATEDTRAIN_EXT_*` layout variables are deprecated (a stderr line names the
   file key) and removed in 0.9.0.
 - **Keeper options.** `keeper serve` and `setup keeper` take `--gpu-wait-s`, `--gpu-busy-mib` and `--eval-python`; a
-  non-default value is in the signed environment record. The three layout rows 0.7.0 reserved for them (`[gpu] wait_s`,
+  non-default value is in the signed environment record. The wait is bounded by the client's deadline less the slack and the busy threshold to 1 TiB (a threshold above the GPU's
+  memory still turns the check off: it is signed when set). The three layout rows 0.7.0 reserved for them (`[gpu] wait_s`,
   `[gpu] busy_mib`, `[inference] keeper_eval_python`) are supported in both `setup keeper` modes, validated like the flags
   and printed into the unit; a flag beats the layout; they need `--inference-image`. `rowkit.runtime_dir(..., pack=)` reads the host file's
   `[packs.<name>] runtime_dir` (the pack's runtime variable is deprecated). `launch.pack_setting` reads any pack setting.
@@ -42,6 +43,8 @@ Constants that were copied or tied to one machine now have one name and one plac
   script variants).
 - `docs/configuration.md` lists the fixed trust values and why they are not settings.
 - `gatedtrain export-gsm8k` takes its default rows per shard from `tierb.DEFAULT_ROWS_PER_SHARD`; the value is unchanged.
+
+Rules: AN-35, EXT-264, AN-34 (three rows supported).
 
 ## Changes in 0.7.0
 

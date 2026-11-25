@@ -35,7 +35,7 @@ from pathlib import Path, PurePosixPath
 from ...errors import Problem, Refused, printable
 from . import protocol
 from .setup import (_UNIT_UNSAFE, KEEP_FINGERPRINT, UNIT_NAME, _absolute, _gpu_options, _inference_options,
-                    plain_absolute)
+                    format_seconds, plain_absolute)
 
 RULE = "AN-31"                   # the same-user commands
 MODE_RULE = "AN-30"              # an option that belongs to the other mode
@@ -250,7 +250,7 @@ def setup_commands_same_user(*, owner_uid: int, state: str | None = None, socket
         serve += ["--docker-host", host]
     for flag, value in (("--gpu-wait-s", gpu_wait_s), ("--gpu-busy-mib", gpu_busy_mib), ("--eval-python", eval_python)):
         if value is not None:
-            serve += [flag, f"{value:g}" if flag == "--gpu-wait-s" else str(value)]
+            serve += [flag, format_seconds(value) if flag == "--gpu-wait-s" else str(value)]
     sock_dir = socket_p.parent
     runtime_base = PurePosixPath(paths["runtime"])
     for field, directory in (("--state", state_p), ("--socket", sock_dir)):

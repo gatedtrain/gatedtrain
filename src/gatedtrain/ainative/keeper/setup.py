@@ -89,6 +89,12 @@ def _absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
     return path
 
 
+def format_seconds(value: float) -> str:
+    """`value` as printed in a unit: a whole number without `.0`, any other as Python's shortest exact `repr` (never rounded,
+    so the printed option is the value the keeper runs with)."""
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
+
+
 def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath, owner_uid: int, *,
                inference_image: str | None = None, eval_trees: list[str] | tuple[str, ...] = (),
                docker_host: str | None = None, gpu_wait_s: float | None = None, gpu_busy_mib: int | None = None,
@@ -105,7 +111,7 @@ def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath,
     if docker_host is not None:
         argv += ["--docker-host", docker_host]
     if gpu_wait_s is not None:
-        argv += ["--gpu-wait-s", f"{gpu_wait_s:g}"]
+        argv += ["--gpu-wait-s", format_seconds(gpu_wait_s)]
     if gpu_busy_mib is not None:
         argv += ["--gpu-busy-mib", str(gpu_busy_mib)]
     if eval_python is not None:
@@ -170,11 +176,14 @@ def _inference_options(inference_image: str | None, eval_trees: list[str] | None
 def check_gpu_wait(value: Any, field: str = "--gpu-wait-s") -> None:
     """Refused (AN-19) unless `value` is a finite number of seconds above 0."""
     try:
-        bad = isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+        bad = (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               or not 0 < value <= protocol.MAX_GPU_WAIT_S)
     except OverflowError:                                  # an integer too large for a float
         bad = True
     if bad:
-        raise _refuse(field, "the GPU wait is not a number of seconds above 0", "pass seconds, such as 900")
+        raise _refuse(field, "the GPU wait is not a number of seconds above 0 and at most "
+                      f"{protocol.MAX_GPU_WAIT_S:g} (the client's deadline less the slack)",
+                      "pass seconds, such as 900")
 
 
 def check_gpu_busy(value: Any, field: str = "--gpu-busy-mib") -> None:

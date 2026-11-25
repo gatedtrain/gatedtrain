@@ -307,6 +307,28 @@ class KeeperGpuAndInterpreter(unittest.TestCase):
         self.assertGreater(batch.evaluation_wait_bound(k.config.gpu_wait_s, gen.time_limit_s),
                            protocol.LONG_OP_TIMEOUT_S)
 
+    def test_the_printed_wait_is_the_value_given(self) -> None:
+        from pathlib import PurePosixPath as P
+        for value, text in ((123.5, "123.5"), (300, "300"), (1000.25, "1000.25"), (3000.125, "3000.125")):
+            argv = setup.serve_argv(P("/v"), P("/s"), P("/k"), 5, inference_image=IMAGE, gpu_wait_s=value)
+            self.assertEqual(argv[argv.index("--gpu-wait-s") + 1], text)
+            unit = setup.setup_commands(owner_uid=1000, inference_image=IMAGE, docker_host="unix:///x/d.sock",
+                                        gpu_wait_s=value)["unit"]
+            self.assertIn(f"--gpu-wait-s {text}\n", unit)
+
+    def test_a_wait_the_client_cannot_cover_is_refused_when_it_is_set(self) -> None:
+        from gatedtrain.ainative.keeper import protocol
+        top = protocol.MAX_GPU_WAIT_S
+        self.assertEqual(top, protocol.LONG_OP_TIMEOUT_S - batch.EVAL_SLACK_S - 2)
+        self.config(gpu_wait_s=top)                                   # the largest wait that fits is accepted
+        for bad in (top + 1, 1e300):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.config(gpu_wait_s=bad)
+                with self.assertRaises(Refused):
+                    setup.setup_commands(owner_uid=1000, inference_image=IMAGE, docker_host="unix:///x/d.sock",
+                                         gpu_wait_s=bad)
+
     def test_serve_argv_prints_only_what_was_set(self) -> None:
         from pathlib import PurePosixPath as P
         base = setup.serve_argv(P("/v"), P("/s"), P("/k"), 5, inference_image=IMAGE)
