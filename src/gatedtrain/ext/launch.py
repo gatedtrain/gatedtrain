@@ -38,7 +38,7 @@ from typing import Any, Callable, Mapping
 import yaml
 
 from .. import TAGS
-from ..canonical import canonical_json, file_sha256, sha256_bytes, text_lines
+from ..canonical import canonical_json, file_sha256, plain_decimal, sha256_bytes, text_lines
 from ..errors import Problem, Refused
 from ..paths import realpath as _realpath
 from ..renamed import old_schema_note
@@ -107,6 +107,14 @@ HOST_FILE_BOOL_KEYS = ("rootless",)
 # enters `host_config_sha256` (so the launch record binds it) only when the file sets it.
 HOST_FILE_NUMBER_KEYS = ("gpu_mem_limit_gb", "gpu_cap_h")
 GPU_MEM_LIMIT_GB = 22.5          # the smoke bound for a 24 GB card (EXT-29); the host file's `gpu_mem_limit_gb` replaces it
+# The largest value the host file may give each number (trust constants, fixed; owner decision to widen). Without a top,
+# `1e308` would switch the smoke check off while still passing validation. 1024 GB: a terabyte is about 3.5 times the
+# memory of the largest single accelerator of 2026 (288 GB), so no real card needs more and a bound above it checks
+# nothing. 100000 GPU hours: more than one 8-GPU node can burn in a year (8 x 8760 h = 70080 h), so a ceiling above it
+# is no ceiling for a node-scale host. `HOST_FILE_NUMBER_MAX` is the one table the validation reads.
+MAX_GPU_MEM_LIMIT_GB = 1024
+MAX_GPU_CAP_H = 100000
+HOST_FILE_NUMBER_MAX = {"gpu_mem_limit_gb": MAX_GPU_MEM_LIMIT_GB, "gpu_cap_h": MAX_GPU_CAP_H}
 # Optional host file paths and path lists that used to be settable only by `GATEDTRAIN_EXT_*` variables: the layout the
 # launch rules check against (EXT-79, EXT-112, EXT-113).
 HOST_FILE_PATH_KEYS = ("interpreter", "mirror_root")
@@ -267,9 +275,11 @@ def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         raise Refused([Problem("EXT-HOST", str(path), f"has keys {bad} besides {list(known)}", fix)])
     for k, v in doc.items():
         if k in HOST_FILE_NUMBER_KEYS:
-            if not _positive_number(v):
-                raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not a number above 0",
-                                       f"write `{k}` in {path} as a TOML number above zero, for example `{k} = 22.5`")])
+            if not _positive_number(v, HOST_FILE_NUMBER_MAX[k]):
+                top = HOST_FILE_NUMBER_MAX[k]
+                raise Refused([Problem("EXT-HOST", f"{path}.{k}", f"{v!r} is not a number above 0 and at most {top:g}",
+                                       f"write `{k}` in {path} as a TOML number above zero and at most {top:g}, for "
+                                       f"example `{k} = 22.5`")])
         elif k == HOST_FILE_PACKS_KEY:
             _check_packs(v, path)
         elif k in HOST_FILE_LIST_KEYS or k in HOST_FILE_PATHLIST_KEYS:
@@ -285,10 +295,10 @@ def host_file(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     return dict(doc)
 
 
-def _positive_number(v: Any) -> bool:
-    """A finite number above 0 (not a bool; an integer too large for a float is not finite enough)."""
+def _positive_number(v: Any, top: float) -> bool:
+    """A finite number above 0 and at most `top` (not a bool; an integer too large for a float is not finite enough)."""
     try:
-        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 < v <= top
     except OverflowError:
         return False
 
@@ -330,6 +340,30 @@ def pack_setting(pack: str, key: str, environ: Mapping[str, str] | None = None) 
     return table.get(key)
 
 
+def env_conflict(var: str, key: str, from_env: Any, from_file: Any, where: str) -> Refused:
+    """The refusal (EXT-HOST) for a deprecated variable and the owner's host file key that name different values: a
+    variable set by whoever controls the process environment must not silently outrank what the owner wrote."""
+    return Refused([Problem("EXT-HOST", key, f"{var} is {from_env!r} but the host file {where} sets `{key}` to "
+                            f"{from_file!r}; the two disagree and neither outranks the other",
+                            f"remove the variable {var} or the key `{key}` from the host file {where}")])
+
+
+def env_or_file(var: str, key: str, from_env: Any, from_file: Any, where: str) -> Any:
+    """The value of the setting `key`: `from_env` (the deprecated variable `var`) or `from_file`; both set and unequal
+    is Refused (`env_conflict`), so the host file's key is never outranked silently. An unset side is falsy."""
+    if from_env and from_file and from_env != from_file:
+        raise env_conflict(var, key, from_env, from_file, where)
+    return from_env or from_file
+
+
+def _env_or_file(env: Mapping[str, str], var: str, file: Mapping[str, Any], from_env: Any) -> Any:
+    key = ENV_TO_FILE_KEY[var]
+    from_file = tuple(file.get(key, ())) if key in HOST_FILE_PATHLIST_KEYS else file.get(key)
+    where = os.path.expanduser(env.get(ENV_HOST_CONFIG) or DEFAULT_HOST_CONFIG)
+    value = env_or_file(var, key, from_env, from_file, where)
+    return value if key in HOST_FILE_PATHLIST_KEYS else (value or None)
+
+
 def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
     """The host file's layout, or the `GATEDTRAIN_EXT_HOST_WORK`, `GATEDTRAIN_EXT_OUTPUT_ROOT` and
     `GATEDTRAIN_EXT_INPUT_ROOTS` overrides (tests; another host). Without the input-roots override the adapter's roots
@@ -338,9 +372,9 @@ def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
     (EXT-263)."""
     env = os.environ if environ is None else environ
     file = host_file(env)
-    roots = tuple(r for r in env.get(ENV_INPUT_ROOTS, "").split(os.pathsep) if r) or tuple(file.get("input_roots", ()))
-    trees = (tuple(r for r in env.get(ENV_INTERPRETER_TREES, "").split(os.pathsep) if r)
-             or tuple(file.get("interpreter_trees", ())))                                    # EXT-113
+    roots = _env_or_file(env, ENV_INPUT_ROOTS, file, tuple(r for r in env.get(ENV_INPUT_ROOTS, "").split(os.pathsep) if r))
+    trees = _env_or_file(env, ENV_INTERPRETER_TREES, file,
+                         tuple(r for r in env.get(ENV_INTERPRETER_TREES, "").split(os.pathsep) if r))   # EXT-113
     layout = {"host_work": env.get(ENV_HOST_WORK) or file.get("host_work"),
               "output_root": env.get(ENV_OUTPUT_ROOT) or file.get("output_root")}
     missing = [k for k, v in layout.items() if not v]
@@ -351,8 +385,8 @@ def host_config(environ: Mapping[str, str] | None = None) -> HostConfig:
                        for k in missing])
     return HostConfig(host_work=layout["host_work"], output_root=layout["output_root"],
                       input_roots=roots or None, interpreter_trees=trees or None,
-                      interpreter=env.get(ENV_INTERPRETER) or file.get("interpreter"),
-                      mirror_root=env.get(ENV_MIRROR_ROOT) or file.get("mirror_root"),
+                      interpreter=_env_or_file(env, ENV_INTERPRETER, file, env.get(ENV_INTERPRETER) or None),
+                      mirror_root=_env_or_file(env, ENV_MIRROR_ROOT, file, env.get(ENV_MIRROR_ROOT) or None),
                       extra_daemon_configs=tuple(file.get("extra_daemon_configs", ())),
                       extra_daemon_sockets=tuple(file.get("extra_daemon_sockets", ())),
                       rootless=file.get("rootless", False), gpu_mem_limit_gb=file.get("gpu_mem_limit_gb"),
@@ -1940,7 +1974,9 @@ def gpu_used_h(gpu_log_md: Path) -> float:
 # ---------------------------------------------------------------------------
 
 def _g(x: float) -> str:
-    return "%g" % x
+    """A number printed into the gpu-step.sh command: the exact shortest value, never rounded (`%g` kept six digits, so a
+    ceiling of 1000.4 was enforced as 1000) and never in exponent form (`canonical.plain_decimal`)."""
+    return plain_decimal(x)
 
 
 def build_command(record: dict, env: dict[str, str], *, est_h: float, gpu_cap_h: float = GPU_CAP_H) -> str:

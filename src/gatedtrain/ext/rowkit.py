@@ -19,19 +19,28 @@ CONTAINER_PATHS = {"ro_identity": True, "ro_under": ("/inputs",), "rw": ("/out",
 _WARNED: set[str] = set()      # deprecated variables already named on stderr by this process
 
 def runtime_dir(env_var: str, anchor: str, parents: int = 2, *, pack: str | None = None) -> str:
-    """The recipe's runtime directory, by precedence: `env_var` when set (a deprecated workaround, named on stderr), the
-    host file's `[packs.<pack>] runtime_dir` when `pack` is given, else `<repository>/runtime`, the repository being the
-    `parents`-th parent of `anchor` (the rows module's `__file__`; an editable or source checkout)."""
+    """The recipe's runtime directory: `env_var` when set (a deprecated workaround, named on stderr, removed in
+    `ENV_REMOVED_IN`), the host file's `[packs.<pack>] runtime_dir` when `pack` is given, else `<repository>/runtime`,
+    the repository being the `parents`-th parent of `anchor` (the rows module's `__file__`; an editable or source
+    checkout). The variable and the file key both set to different values is Refused (EXT-HOST): neither outranks the
+    other."""
     import os
     import sys
     from pathlib import Path
 
-    from .launch import ENV_REMOVED_IN, pack_setting
+    from .launch import DEFAULT_HOST_CONFIG, ENV_HOST_CONFIG, ENV_REMOVED_IN, env_conflict, pack_setting
 
     from ..errors import Refused
 
     from_env = os.environ.get(env_var)
     if from_env:
+        try:
+            from_file = pack_setting(pack, "runtime_dir") if pack else None
+        except Refused:
+            from_file = None                              # a malformed file: named below, as for no variable
+        if from_file and from_file != from_env:           # the owner's file key is never outranked silently
+            raise env_conflict(env_var, f"packs.{pack}.runtime_dir", from_env, from_file,
+                               os.path.expanduser(os.environ.get(ENV_HOST_CONFIG) or DEFAULT_HOST_CONFIG))
         if env_var not in _WARNED:                        # once per variable and process
             _WARNED.add(env_var)
             print(f"warning: {env_var} is deprecated: set `runtime_dir` in the host file's "

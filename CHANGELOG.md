@@ -8,21 +8,37 @@ each rule to its tests.
 
 On top of 0.7.0. Implements design revision 28 (tag `rev-28` of gatedtrain-design).
 
-Owner-side settings (the audit's open items; defaults and every recorded hash unchanged):
+Owner-side settings that used to be code constants or environment variables are now keys of the host file. Defaults
+and every recorded hash are unchanged unless a key is set:
 
 - **Host file keys.** `gpu_mem_limit_gb` and `gpu_cap_h` (numbers above 0), `input_roots`, `interpreter_trees`,
-  `interpreter`, `mirror_root`, and `[packs.<name>]` tables of absolute paths. `smoke_verdict` and `smoke_problems` take the
-  bounds as parameters; `ext-launch` and `ext-collect` pass the host's. The numbers and the pack tables enter
-  `host_config_sha256` only when set. The `GATEDTRAIN_EXT_*` layout variables are deprecated (a stderr line names the
-  file key) and removed in 0.9.0.
+  `interpreter`, `mirror_root`, and `[packs.<name>]` tables of absolute paths. `smoke_verdict` and `smoke_problems`
+  take the bounds as parameters; `ext-launch` and `ext-collect` pass the host's. The numbers and the pack tables enter
+  `host_config_sha256` only when set.
+- **The two numbers are owner-side and bounded.** `gpu_mem_limit_gb` is at most 1024 and `gpu_cap_h` at most 100000
+  (`launch.MAX_GPU_MEM_LIMIT_GB`, `launch.MAX_GPU_CAP_H`; fixed, not settings): a larger value is refused, because a
+  bound no real card or node can reach checks nothing. Only the owner's host file sets them, no variable or flag does,
+  and `host_config_sha256` binds them. `GATEDTRAIN_GPU_CAP_H` in the printed command is now the exact value (it was
+  rounded to six digits, so 1000.4 was enforced as 1000), in plain decimal.
+- **Deprecated variables.** The `GATEDTRAIN_EXT_*` layout variables are deprecated and removed in 0.9.0, and so are a
+  pack's runtime variables (for example `GATEDTRAIN_PACK_TEXT_GSM8K_RUNTIME`). Every `ext-*` command prints a stderr
+  line naming each one that is set and the host file key that replaces it. A variable and its host file key
+  (`input_roots`, `interpreter_trees`, `interpreter`, `mirror_root`, `[packs.<name>] runtime_dir`) set to different
+  values is refused (EXT-HOST): the variable never outranks what the owner wrote. Equal values, or either alone, work.
+  `GATEDTRAIN_EXT_HOST_WORK` and `GATEDTRAIN_EXT_OUTPUT_ROOT` still override the file, as in 0.7.0.
 - **Keeper options.** `keeper serve` and `setup keeper` take `--gpu-wait-s`, `--gpu-busy-mib` and `--eval-python`; a
-  non-default value is in the signed environment record. The wait is bounded by the client's deadline less the slack and the busy threshold to 1 TiB (a threshold above the GPU's
-  memory still turns the check off: it is signed when set). The three layout rows 0.7.0 reserved for them (`[gpu] wait_s`,
-  `[gpu] busy_mib`, `[inference] keeper_eval_python`) are supported in both `setup keeper` modes, validated like the flags
-  and printed into the unit; a flag beats the layout; they need `--inference-image`. `rowkit.runtime_dir(..., pack=)` reads the host file's
-  `[packs.<name>] runtime_dir` (the pack's runtime variable is deprecated). `launch.pack_setting` reads any pack setting.
+  non-default value is in the signed environment record. The wait is bounded by the client's deadline less the slack,
+  and the busy threshold to 1 TiB (a threshold above the GPU's memory still turns the check off: it is signed when
+  set). A bad flag value is reported under its own flag. The three layout rows 0.7.0 reserved for them (`[gpu] wait_s`,
+  `[gpu] busy_mib`, `[inference] keeper_eval_python`) are supported in both `setup keeper` modes, validated like the
+  flags and printed into the unit; a flag beats the layout; they need `--inference-image`.
+  `rowkit.runtime_dir(..., pack=)` reads the host file's `[packs.<name>] runtime_dir`. `launch.pack_setting` reads any
+  pack setting.
+- **Downgrading.** gatedtrain 0.7.0 refuses a host file that holds any key new in 0.7.1 (it lists the keys it knows);
+  remove the new keys before going back.
 
-Constants that were copied or tied to one machine now have one name and one place ; nothing here changes a registration, a signature, a ledger or a report, except where marked as a change:
+Constants that were copied or tied to one machine now have one name and one place. Nothing here changes a registration,
+a signature, a ledger or a report, except where marked as a change:
 
 - **One source for each shared constant.** The alpha-investing starting wealth and payout are computed from
   `TARGET_ALPHA`, and the guarantee texts quote it; `PILOT_SIGMA` is the scorers' `PLANNING_SD_BOUND`; the keeper's long
