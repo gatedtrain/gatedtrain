@@ -50,6 +50,16 @@ def _check_str(s: str) -> None:
             raise ValueError("lone surrogate in string (canonical-JSON rule C3)")
 
 
+def plain_decimal(value: float) -> str:
+    """`value` as a plain decimal for a command line or a unit: a whole number without `.0`, any other as Python's
+    shortest exact `repr`, spelled without an exponent (`1e-05` is `0.00001`). Never rounded, so the printed number is the
+    value that was checked and hashed: `float(plain_decimal(x)) == x` for a finite `x`."""
+    x = float(value)
+    if x.is_integer():
+        return str(int(x))
+    return format(Decimal(repr(x)), "f")
+
+
 def _encode_str(s: str) -> str:
     _check_str(s)
     out = ['"']

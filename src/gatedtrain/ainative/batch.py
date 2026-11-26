@@ -48,10 +48,16 @@ CRASH = "the inference output is not one prediction per item and seed (crash)"
 CRASH_FIX = "fix the scenario pack's batch generator so it writes only /out/predictions.jsonl, one line per item and seed"
 
 
+# A sealed evaluation compares a baseline and a candidate arm and runs one generator container per arm, one after the
+# other, so the waiting client must cover this many time limits. The count of the gate's two arms, named once.
+ARMS_PER_EVALUATION = 2
+MIN_GENERATOR_TIME_LIMIT_S = 1      # the smallest time limit a generator may declare (a positive whole number of seconds)
+
+
 def evaluation_wait_bound(gpu_wait_s: float, time_limit_s: float) -> float:
     """The longest a sealed evaluation of a batch generator takes (AN-25): the wait for the GPU, one container per arm
-    (two arms) of at most `time_limit_s`, and the keeper's slack. The client's deadline must cover it."""
-    return gpu_wait_s + 2 * time_limit_s + EVAL_SLACK_S
+    (`ARMS_PER_EVALUATION`) of at most `time_limit_s`, and the keeper's slack. The client's deadline must cover it."""
+    return gpu_wait_s + ARMS_PER_EVALUATION * time_limit_s + EVAL_SLACK_S
 
 
 @dataclass(frozen=True)
@@ -73,7 +79,7 @@ class BatchGenerator:
             raise ValueError("BatchGenerator.interpreter must be an absolute container path")
         if not (isinstance(self.gpu, bool) and isinstance(self.eval_trees, bool)):
             raise ValueError("BatchGenerator.gpu and eval_trees must be booleans")
-        if isinstance(self.time_limit_s, bool) or not isinstance(self.time_limit_s, int) or self.time_limit_s < 1:
+        if isinstance(self.time_limit_s, bool) or not isinstance(self.time_limit_s, int) or self.time_limit_s < MIN_GENERATOR_TIME_LIMIT_S:
             raise ValueError("BatchGenerator.time_limit_s must be a positive integer")
 
 

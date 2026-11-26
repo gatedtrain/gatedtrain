@@ -26,6 +26,7 @@ from .output import Result, emit, notice_scope
 from .paths import resolve
 
 EXIT_OK, EXIT_NOT_PASS, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
+EXT_COMMAND_PREFIX = "ext-"      # the commands that read the host layout and name its overrides (EXT-85)
 
 
 def _as_json(args) -> bool:
@@ -129,7 +130,10 @@ def cmd_impact(args) -> int:
 
 
 def _tierb_call(args, fn, warnings: list[str] | None = None) -> int:
-    """Run `fn() -> (data, human)`; a refusal becomes the refusal result."""
+    """Run `fn() -> (data, human)`; a refusal becomes the refusal result. An `ext-*` command carries the host-layout
+    override warnings (`_ext_warnings`) without its caller passing them."""
+    if warnings is None and _is_ext(args):
+        warnings = _ext_warnings(args)
     try:
         data, human = fn()
     except Refused as exc:
@@ -191,6 +195,10 @@ def cmd_tierb_collect(args) -> int:
     return _gate_result(args, run_dir, report, text)
 
 
+def _is_ext(args) -> bool:
+    return str(getattr(args, "command", "")).startswith(EXT_COMMAND_PREFIX)
+
+
 def _ext_warnings(args) -> list[str]:
     """EXT-85: a line per active `GATEDTRAIN_EXT_*` host-layout override. In text mode they go to stderr at once,
     before anything else the command prints (as before AN-1), and an empty list is returned so `emit` does not print
@@ -198,6 +206,8 @@ def _ext_warnings(args) -> list[str]:
     `main` puts them in the envelope of an uncaught exception too."""
     from .ext.launch import override_warnings
 
+    if hasattr(args, "ext_warnings"):                    # once per command: `main` primes it for every `ext-*` command
+        return list(args.ext_warnings) if _as_json(args) else []
     warnings = list(override_warnings())
     args.ext_warnings = warnings
     if _as_json(args):
@@ -766,10 +776,28 @@ def _krefuse(args, problems: list[Problem]) -> int:
                 human="")
 
 
+def _inference_field_flags() -> dict[str, tuple[str, str]]:
+    """`InferenceConfig` field -> (the flag that sets it, the fix to name for a bad value)."""
+    from .ainative.keeper import protocol
+    from .ainative.runtime import MAX_GPU_BUSY_MIB
+
+    absolute = "an absolute path without `:` or `,`"
+    return {"image_id": ("--inference-image", "pass the inference image ID, sha256:<64 hex>"),
+            "image_ref": ("--inference-ref", "pass a reference pinned by digest (name@sha256:<64 hex>)"),
+            "docker_host": ("--docker-host", "pass a Docker host URL that does not start with `-`"),
+            "eval_trees": ("--eval-tree", f"pass {absolute}"), "docker": ("--docker", f"pass {absolute}"),
+            "nvidia_smi": ("--nvidia-smi", f"pass {absolute}"), "eval_python": ("--eval-python", f"pass {absolute}"),
+            "gpu_wait_s": ("--gpu-wait-s", f"pass a number of seconds above 0 and at most {protocol.MAX_GPU_WAIT_S:g}"),
+            "gpu_busy_mib": ("--gpu-busy-mib", f"pass a whole number of MiB from 0 to {MAX_GPU_BUSY_MIB}")}
+
+
+_INFERENCE_FIELD_FLAGS = _inference_field_flags()
+
+
 def _inference_config(args):
     """AN-25: the keeper's inference options as an `InferenceConfig`, None without `--inference-image`; Refused
     (AN-13) for a malformed value or an inference option without the image."""
-    from .ainative.keeper.inference import DEFAULT_DOCKER, DEFAULT_NVIDIA_SMI, InferenceConfig
+    from .ainative.keeper.inference import DEFAULT_DOCKER, DEFAULT_NVIDIA_SMI, InferenceConfig, InferenceConfigError
     from .ext.launch import rootless_docker_host
 
     given = [name for name, value in (("--inference-ref", args.inference_ref), ("--eval-tree", args.eval_tree),
@@ -791,18 +819,19 @@ def _inference_config(args):
                                **{k: v for k, v in (("gpu_wait_s", args.gpu_wait_s), ("gpu_busy_mib", args.gpu_busy_mib),
                                                     ("eval_python", Path(args.eval_python) if args.eval_python else None))
                                   if v is not None})
-    except ValueError as exc:
-        raise Refused([Problem("AN-13", "inference_image", str(exc),
-                               "pass --inference-image sha256:<64 hex>, absolute --eval-tree, --docker and "
-                               "--nvidia-smi paths, and --inference-ref pinned by digest")]) from None
+    except InferenceConfigError as exc:
+        flag, fix = _INFERENCE_FIELD_FLAGS[exc.field]
+        raise Refused([Problem("AN-13", flag, str(exc), fix)]) from None
 
 
 def _add_keeper_gpu_options(c, where: str) -> None:
     """The keeper's owner-side GPU and eval-interpreter options (AN-23, AN-25), on `keeper serve` and `setup keeper`."""
+    from .ainative.runtime import GPU_BUSY_MIB, GPU_WAIT_S
+
     c.add_argument("--gpu-wait-s", type=float, metavar="S",
-                   help=f"how long to wait for a free GPU before a GPU generator is refused (default 900) {where}")
+                   help=f"how long to wait for a free GPU before a GPU generator is refused (default {GPU_WAIT_S:g}) {where}")
     c.add_argument("--gpu-busy-mib", type=int, metavar="MIB",
-                   help=f"GPU memory in use that still counts as a free GPU (default 1024) {where}")
+                   help=f"GPU memory in use that still counts as a free GPU (default {GPU_BUSY_MIB}) {where}")
     c.add_argument("--eval-python", metavar="PATH",
                    help=f"the eval venv's python that replaces the one a pack declares for an eval-tree generator {where}")
 
@@ -1365,6 +1394,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with notice_scope():          # warnings raised below the command are queued for `emit` (also for INTERNAL)
             try:
+                if _is_ext(args):                        # every `ext-*` command, a new one included, names the overrides
+                    _ext_warnings(args)
                 return args.func(args)
             except Exception as exc:
                 if not _as_json(args):

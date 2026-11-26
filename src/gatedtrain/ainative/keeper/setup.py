@@ -24,6 +24,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from ... import __version__
+from ...canonical import plain_decimal
 from ...errors import Problem, Refused
 from ..runtime import MAX_GPU_BUSY_MIB
 from . import protocol
@@ -90,9 +91,9 @@ def _absolute(field: str, value: str, rule: str = RULE) -> PurePosixPath:
 
 
 def format_seconds(value: float) -> str:
-    """`value` as printed in a unit: a whole number without `.0`, any other as Python's shortest exact `repr` (never rounded,
-    so the printed option is the value the keeper runs with)."""
-    return str(int(value)) if float(value).is_integer() else repr(float(value))
+    """`value` as printed in a unit (`canonical.plain_decimal`: never rounded, so the printed option is the value the
+    keeper runs with)."""
+    return plain_decimal(value)
 
 
 def serve_argv(venv: PurePosixPath, state: PurePosixPath, socket: PurePosixPath, owner_uid: int, *,

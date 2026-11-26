@@ -53,8 +53,8 @@ from ...canonical import canonical_json
 from ...errors import Problem, Refused
 from ...ext import launch
 from ..batch import (CONTAINER_ITEMS, CONTAINER_MODEL, CONTAINER_OUT, CONTAINER_SAMPLER, CONTAINER_SCRIPT_DIR,
-                     BatchGenerator, EVAL_SLACK_S, container_argv, evaluation_wait_bound, read_predictions, sampler_doc,
-                     write_items)
+                     ARMS_PER_EVALUATION, BatchGenerator, EVAL_SLACK_S, container_argv, evaluation_wait_bound,
+                     read_predictions, sampler_doc, write_items)
 from ..runtime import (GPU_BUSY_MIB, GPU_WAIT_S, MAX_GPU_BUSY_MIB, TIME_FORMAT, ContainerState, DockerCLIRuntime, GpuProbe, Mount,
                        NvidiaSmiProbe, RunSpec, Runtime, RuntimeFailure, wait_for_gpu)
 from . import envcheck, protocol
@@ -92,10 +92,18 @@ def _crash(detail: str) -> Refused:
     return Refused([_problem(RULE_CRASH, "inference", f"{detail}; the attempt settles as not passed", CRASH_FIX)])
 
 
-def _plain_abs(p: Path, what: str) -> Path:
+class InferenceConfigError(ValueError):
+    """A bad `InferenceConfig` value; `field` names the dataclass field, so a caller can name the offending option."""
+
+    def __init__(self, field: str, message: str) -> None:
+        super().__init__(message)
+        self.field = field
+
+
+def _plain_abs(p: Path, what: str, field: str) -> Path:
     s = os.fspath(p)
     if not os.path.isabs(s) or any(c in s for c in ":,") or any(ord(c) < 32 for c in s):
-        raise ValueError(f"the inference {what} {s!r} is not an absolute path without `:` or `,`")
+        raise InferenceConfigError(field, f"the inference {what} {s!r} is not an absolute path without `:` or `,`")
     return Path(s)
 
 
@@ -123,16 +131,20 @@ class InferenceConfig:
 
     def __post_init__(self) -> None:
         if not (isinstance(self.image_id, str) and _IMAGE_ID.fullmatch(self.image_id)):
-            raise ValueError(f"the inference image {self.image_id!r} is not an image ID sha256:<64 hex>")
+            raise InferenceConfigError("image_id", f"the inference image {self.image_id!r} is not an image ID sha256:<64 hex>")
         if not (isinstance(self.docker_host, str) and self.docker_host):
-            raise ValueError("the inference Docker host is empty")
-        launch.option_value(self.docker_host)
+            raise InferenceConfigError("docker_host", "the inference Docker host is empty")
+        try:
+            launch.option_value(self.docker_host)
+        except ValueError as exc:
+            raise InferenceConfigError("docker_host", str(exc)) from None
         if self.image_ref is not None:
             if not isinstance(self.image_ref, str) or not launch.IMAGE_RE.fullmatch(self.image_ref):
-                raise ValueError(f"the inference image reference {self.image_ref!r} is not pinned by digest")
-        object.__setattr__(self, "eval_trees", tuple(_plain_abs(Path(t), "eval tree") for t in self.eval_trees))
-        object.__setattr__(self, "docker", _plain_abs(Path(self.docker), "Docker CLI"))
-        object.__setattr__(self, "nvidia_smi", _plain_abs(Path(self.nvidia_smi), "nvidia-smi"))
+                raise InferenceConfigError("image_ref",
+                                           f"the inference image reference {self.image_ref!r} is not pinned by digest")
+        object.__setattr__(self, "eval_trees", tuple(_plain_abs(Path(t), "eval tree", "eval_trees") for t in self.eval_trees))
+        object.__setattr__(self, "docker", _plain_abs(Path(self.docker), "Docker CLI", "docker"))
+        object.__setattr__(self, "nvidia_smi", _plain_abs(Path(self.nvidia_smi), "nvidia-smi", "nvidia_smi"))
         w = self.gpu_wait_s
         try:
             wait_ok = (isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w)
@@ -140,12 +152,14 @@ class InferenceConfig:
         except OverflowError:
             wait_ok = False
         if not wait_ok:
-            raise ValueError(f"the GPU wait {w!r} is not a number of seconds above 0 and at most {protocol.MAX_GPU_WAIT_S:g}")
+            raise InferenceConfigError("gpu_wait_s", f"the GPU wait {w!r} is not a number of seconds above 0 and at most "
+                                                     f"{protocol.MAX_GPU_WAIT_S:g}")
         b = self.gpu_busy_mib
         if isinstance(b, bool) or not isinstance(b, int) or not 0 <= b <= MAX_GPU_BUSY_MIB:
-            raise ValueError(f"the GPU busy threshold {b!r} is not a whole number of MiB from 0 to {MAX_GPU_BUSY_MIB}")
+            raise InferenceConfigError("gpu_busy_mib", f"the GPU busy threshold {b!r} is not a whole number of MiB from 0 "
+                                                       f"to {MAX_GPU_BUSY_MIB}")
         if self.eval_python is not None:
-            object.__setattr__(self, "eval_python", _plain_abs(Path(self.eval_python), "eval interpreter"))
+            object.__setattr__(self, "eval_python", _plain_abs(Path(self.eval_python), "eval interpreter", "eval_python"))
 
 
 def _seconds(st: ContainerState | None) -> int | None:
@@ -469,10 +483,10 @@ class KeeperInference:
         bound = evaluation_wait_bound(gpu_wait_s, gen.time_limit_s)
         wait = protocol.LONG_OP_TIMEOUT_S
         if bound > wait:
-            most = int((wait - gpu_wait_s - EVAL_SLACK_S) // 2)
+            most = int((wait - gpu_wait_s - EVAL_SLACK_S) // ARMS_PER_EVALUATION)
             raise Refused([_problem(RULE_BATCH, "batch_generator.time_limit_s", f"the batch generator's time limit "
                                     f"of {gen.time_limit_s} s does not fit the driver's wait for an evaluation "
-                                    f"({gpu_wait_s:g} s GPU wait + 2 x {gen.time_limit_s} s + {EVAL_SLACK_S} s = "
+                                    f"({gpu_wait_s:g} s GPU wait + {ARMS_PER_EVALUATION} x {gen.time_limit_s} s + {EVAL_SLACK_S} s = "
                                     f"{bound} s, more than {wait:g} s)",
                                     f"give the scenario pack's batch generator a time limit of at most {most} s")])
         if gen.eval_trees and not self.config.eval_trees:

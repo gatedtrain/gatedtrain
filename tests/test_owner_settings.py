@@ -168,13 +168,38 @@ class LayoutKeysReplaceTheEnvironment(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(Refused):
                 launch.host_config(write_host(self.tmp, BASE + body))
 
-    def test_the_variable_still_wins_and_warns_with_a_removal_version(self) -> None:
-        env = {**write_host(self.tmp, BASE + 'mirror_root = "/m"\n'), launch.ENV_MIRROR_ROOT: "/env"}
+    def test_the_variable_alone_works_and_warns_with_a_removal_version(self) -> None:
+        env = {**write_host(self.tmp, BASE), launch.ENV_MIRROR_ROOT: "/env"}
         self.assertEqual(launch.host_config(env).mirror_root, "/env")
         [line] = launch.override_warnings(env)
         self.assertIn("deprecated", line)
         self.assertIn(launch.ENV_REMOVED_IN, line)
         self.assertIn("mirror_root", line)
+
+    def test_a_variable_and_a_file_key_that_differ_are_refused(self) -> None:
+        """A variable set by whoever controls the environment must not outrank the owner's file key: both set to
+        different values is refused, naming the key, the variable and the fix; equal values and either alone work."""
+        cases = {launch.ENV_INPUT_ROOTS: ("input_roots", f"/e1{os.pathsep}/e2", '["/i1"]', f"/i1"),
+                 launch.ENV_INTERPRETER_TREES: ("interpreter_trees", "/e", '["/t"]', "/t"),
+                 launch.ENV_INTERPRETER: ("interpreter", "/e/python", '"/t/python"', "/t/python"),
+                 launch.ENV_MIRROR_ROOT: ("mirror_root", "/e", '"/m"', "/m")}
+        self.assertEqual({v: c[0] for v, c in cases.items()},
+                         {v: k for v, k in launch.ENV_TO_FILE_KEY.items() if v not in (launch.ENV_HOST_WORK,
+                                                                                       launch.ENV_OUTPUT_ROOT)})
+        for var, (key, differing, toml, same) in cases.items():
+            with self.subTest(var=var):
+                env = {**write_host(self.tmp, BASE + f"{key} = {toml}\n"), var: differing}
+                with self.assertRaises(Refused) as cm:
+                    launch.host_config(env)
+                [problem] = cm.exception.problems
+                self.assertEqual((problem.rule, problem.field), ("EXT-HOST", key))
+                self.assertIn(var, problem.message)
+                self.assertIn("remove the variable", problem.fix)
+                self.assertIn(f"`{key}`", problem.fix)
+                equal = launch.host_config({**write_host(self.tmp, BASE + f"{key} = {toml}\n"), var: same})
+                alone = launch.host_config({**write_host(self.tmp, BASE), var: same})
+                self.assertEqual(launch.host_config_sha256(equal), launch.host_config_sha256(alone))
+                launch.host_config(write_host(self.tmp, BASE + f"{key} = {toml}\n"))      # the file alone
 
     def test_every_variable_has_a_file_key(self) -> None:
         named = {launch.ENV_HOST_WORK: "host_work", launch.ENV_OUTPUT_ROOT: "output_root",
@@ -247,10 +272,19 @@ class PackSettings(unittest.TestCase):
             self.assertEqual(rowkit.runtime_dir("X_RUNTIME", anchor, pack="p"), "/from-file")
             self.assertTrue(rowkit.runtime_dir("X_RUNTIME", anchor, pack="q").endswith("runtime"))
             rowkit._WARNED.discard("X_RUNTIME")
-            with mock.patch.dict(os.environ, {"X_RUNTIME": "/from-env"}), redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(rowkit.runtime_dir("X_RUNTIME", anchor, pack="p"), "/from-env")
+            with mock.patch.dict(os.environ, {"X_RUNTIME": "/from-file"}), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(rowkit.runtime_dir("X_RUNTIME", anchor, pack="p"), "/from-file")   # equal: no conflict
             self.assertIn("deprecated", err.getvalue())
             self.assertIn("X_RUNTIME", err.getvalue())
+            with mock.patch.dict(os.environ, {"X_RUNTIME": "/from-env"}), self.assertRaises(Refused) as cm:
+                rowkit.runtime_dir("X_RUNTIME", anchor, pack="p")      # the variable never outranks the owner's key
+            [problem] = cm.exception.problems
+            self.assertEqual((problem.rule, problem.field), ("EXT-HOST", "packs.p.runtime_dir"))
+            self.assertIn("X_RUNTIME", problem.message)
+            self.assertIn("remove the variable", problem.fix)
+        with mock.patch.dict(os.environ, {launch.ENV_HOST_CONFIG: os.devnull, "X_RUNTIME": "/from-env"}), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(rowkit.runtime_dir("X_RUNTIME", anchor, pack="p"), "/from-env")     # the variable alone
 
 
 class KeeperGpuAndInterpreter(unittest.TestCase):
@@ -370,3 +404,167 @@ class KeeperGpuAndInterpreter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundsOfTheOwnerNumbers(unittest.TestCase):
+    """The host file's two numbers have a top: without one, `1e308` switches the smoke check off."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def test_the_trust_constants_are_pinned(self) -> None:
+        # Owner decision to change: 1024 GB is about 3.5 times the largest single accelerator of 2026 (288 GB); 100000
+        # GPU hours exceed what an 8-GPU node can burn in a year (8 x 8760 = 70080).
+        self.assertEqual((launch.MAX_GPU_MEM_LIMIT_GB, launch.MAX_GPU_CAP_H), (1024, 100000))
+        self.assertEqual(launch.HOST_FILE_NUMBER_MAX,
+                         {"gpu_mem_limit_gb": launch.MAX_GPU_MEM_LIMIT_GB, "gpu_cap_h": launch.MAX_GPU_CAP_H})
+        self.assertEqual(set(launch.HOST_FILE_NUMBER_MAX), set(launch.HOST_FILE_NUMBER_KEYS))
+        self.assertLess(launch.GPU_MEM_LIMIT_GB, launch.MAX_GPU_MEM_LIMIT_GB)
+        self.assertLess(launch.GPU_CAP_H, launch.MAX_GPU_CAP_H)
+        self.assertGreater(launch.MAX_GPU_CAP_H, 8 * 365 * 24)
+
+    def test_the_top_is_accepted_and_above_it_is_refused(self) -> None:
+        for key, top in launch.HOST_FILE_NUMBER_MAX.items():
+            launch.host_config(write_host(self.tmp, BASE + f"{key} = {top}\n"))
+            for bad in (top + 1, top * 1.0001, "1e308", "1" + "0" * 400):
+                with self.subTest(key=key, bad=bad), self.assertRaises(Refused) as cm:
+                    launch.host_config(write_host(self.tmp, BASE + f"{key} = {bad}\n"))
+                [problem] = cm.exception.problems
+                self.assertTrue(problem.field.endswith(f".{key}"))
+                self.assertIn(f"at most {top:g}", problem.message)
+                self.assertIn(f"at most {top:g}", problem.fix)
+                with self.assertRaises(Refused):                 # the bounds read without a layout refuse too
+                    launch.owner_gpu_bounds(write_host(self.tmp, f"{key} = {bad}\n"))
+
+
+class PrintedCapIsTheValueGiven(unittest.TestCase):
+    AWKWARD = (1000, 1000.4, 1234567.8, 0.1, 22.5, 99999.99, 0.00001, 1e-7, 123456.789012, 3.0, 1e22, 0.3)
+
+    def test_the_printed_number_is_the_exact_value_in_plain_decimal(self) -> None:
+        for value in self.AWKWARD:
+            with self.subTest(value=value):
+                text = launch._g(value)
+                self.assertEqual(float(text), value)               # nothing rounded
+                self.assertNotIn("e", text.lower())                # nothing in exponent form
+                self.assertFalse(text.endswith(".0"))
+
+    def test_the_command_prints_the_cap_the_hash_and_the_smoke_use(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rec = CapIsPrinted().record(Path(d))
+            for cap in (1000.4, 99999.99, 1e-5):
+                with self.subTest(cap=cap):
+                    cmd = launch.build_command(rec, {}, est_h=1.0, gpu_cap_h=cap)
+                    printed = cmd.split("GATEDTRAIN_GPU_CAP_H=")[1].split(" ")[0]
+                    self.assertEqual(float(printed), cap)
+                    self.assertNotIn("e", printed.lower())
+
+    def test_the_unit_and_the_command_share_one_helper(self) -> None:
+        from gatedtrain.canonical import plain_decimal
+        for value in self.AWKWARD:
+            self.assertEqual(setup.format_seconds(value), plain_decimal(value))
+            self.assertEqual(launch._g(value), plain_decimal(value))
+
+
+class OverrideWarningsOfEveryExtCommand(unittest.TestCase):
+    """EXT-85: every `ext-*` command names the deprecated layout variables, by one route: a new command cannot forget."""
+
+    def argv(self, name: str) -> list[str]:
+        import argparse
+        sub = next(a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+        parser = sub.choices[name]
+        out = [name]
+        for action in parser._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            if action.option_strings:
+                if not action.required:
+                    continue
+                out += [action.option_strings[0], *self.values(action)]
+            else:
+                out += self.values(action)
+        return out
+
+    @staticmethod
+    def values(action) -> list[str]:
+        if action.choices:
+            return [str(next(iter(action.choices)))]
+        if action.type in (int, float):
+            return ["1"]
+        return ["x"]
+
+    def ext_commands(self) -> list[str]:
+        import argparse
+        sub = next(a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+        return sorted(n for n in sub.choices if n.startswith(cli.EXT_COMMAND_PREFIX))
+
+    def test_the_commands_are_these(self) -> None:
+        self.assertEqual(self.ext_commands(), ["ext-arm-fill", "ext-collect", "ext-from-nel", "ext-launch",
+                                               "ext-merge-eval"])
+
+    def test_each_names_the_variable_in_json_and_in_text(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = {**write_host(Path(tmp.name), BASE), launch.ENV_MIRROR_ROOT: "/m"}
+        for name in self.ext_commands():
+            for as_json in (True, False):
+                with self.subTest(command=name, json=as_json), mock.patch.dict(os.environ, env), \
+                        redirect_stderr(io.StringIO()) as err, mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    argv = (["--json"] if as_json else []) + self.argv(name)
+                    try:
+                        cli.main(argv)
+                    except Exception:                       # text mode lets an uncaught error through; the line came first
+                        pass
+                    seen = json.loads(out.getvalue())["warnings"] if as_json else err.getvalue().splitlines()
+                    self.assertEqual(sum(launch.ENV_MIRROR_ROOT in line for line in seen), 1, (name, seen))
+
+
+class InferenceFlagsNameTheirFlag(unittest.TestCase):
+    def refused(self, **flags):
+        import argparse
+        args = argparse.Namespace(inference_image=IMAGE, inference_ref=None, eval_tree=None, docker_host="unix:///x/d.sock",
+                                  docker=None, nvidia_smi=None, gpu_wait_s=None, gpu_busy_mib=None, eval_python=None)
+        for k, v in flags.items():
+            setattr(args, k, v)
+        with self.assertRaises(Refused) as cm:
+            cli._inference_config(args)
+        [problem] = cm.exception.problems
+        return problem
+
+    def test_a_bad_value_names_its_flag_and_a_specific_fix(self) -> None:
+        for flags, flag, word in (({"gpu_wait_s": 0.0}, "--gpu-wait-s", "seconds"),
+                                  ({"gpu_busy_mib": -1}, "--gpu-busy-mib", "MiB"),
+                                  ({"eval_python": "rel/python"}, "--eval-python", "absolute"),
+                                  ({"docker": "rel/docker"}, "--docker", "absolute"),
+                                  ({"nvidia_smi": "rel"}, "--nvidia-smi", "absolute"),
+                                  ({"eval_tree": ["rel"]}, "--eval-tree", "absolute"),
+                                  ({"inference_ref": "name:tag"}, "--inference-ref", "digest"),
+                                  ({"inference_image": "sha256:zz"}, "--inference-image", "sha256")):
+            with self.subTest(flags=flags):
+                problem = self.refused(**flags)
+                self.assertEqual((problem.rule, problem.field), ("AN-13", flag))
+                self.assertIn(word, problem.fix)
+
+    def test_every_config_field_has_a_flag(self) -> None:
+        import dataclasses
+        self.assertEqual(set(cli._INFERENCE_FIELD_FLAGS), {f.name for f in dataclasses.fields(inference.InferenceConfig)})
+
+
+class NamedArmCount(unittest.TestCase):
+    def test_the_arm_count_is_one_name_used_everywhere(self) -> None:
+        from gatedtrain.ainative.keeper import protocol
+        self.assertEqual((batch.ARMS_PER_EVALUATION, batch.MIN_GENERATOR_TIME_LIMIT_S), (2, 1))
+        self.assertEqual(batch.evaluation_wait_bound(10, 100), 10 + 2 * 100 + batch.EVAL_SLACK_S)
+        self.assertEqual(protocol.MAX_GPU_WAIT_S, protocol.LONG_OP_TIMEOUT_S - batch.EVAL_SLACK_S - 2)
+        # the largest wait leaves exactly one smallest time limit per arm
+        self.assertEqual(batch.evaluation_wait_bound(protocol.MAX_GPU_WAIT_S, batch.MIN_GENERATOR_TIME_LIMIT_S),
+                         protocol.LONG_OP_TIMEOUT_S)
+
+    def test_the_help_text_quotes_the_defaults(self) -> None:
+        import argparse
+        parser = argparse.ArgumentParser()
+        cli._add_keeper_gpu_options(parser, "x")
+        text = parser.format_help()
+        self.assertIn(f"(default {runtime.GPU_WAIT_S:g})", text)
+        self.assertIn(f"(default {runtime.GPU_BUSY_MIB})", text)

@@ -21,20 +21,31 @@ The host file is the channel for every host setting. Besides `host_work` and `ou
 |---|---|---|
 | `input_roots`, `interpreter_trees` | arrays of absolute paths | the launch rules' input roots and interpreter trees (EXT-79, EXT-113) |
 | `interpreter`, `mirror_root` | absolute paths | the pinned interpreter and the identity-mount root (EXT-112, EXT-113) |
-| `gpu_mem_limit_gb` | number above 0 | the smoke GPU-memory bound in GB; default 22.5, a 24 GB card's |
-| `gpu_cap_h` | number above 0 | the GPU-hour ceiling passed to `gpu-step.sh`; default 1000 |
+| `gpu_mem_limit_gb` | number above 0, at most 1024 | the smoke GPU-memory bound in GB; default 22.5, a 24 GB card's |
+| `gpu_cap_h` | number above 0, at most 100000 | the GPU-hour ceiling passed to `gpu-step.sh`, printed as given; default 1000 |
 | `[packs.<pack name>]` | table of absolute paths | a scenario pack's owner-side settings, for example `runtime_dir` |
 
 `gpu_mem_limit_gb`, `gpu_cap_h` and the `[packs]` tables enter `host_config_sha256` only when the file sets them, so the
 launch record binds them (`ext-collect` refuses a record whose host hash is not this host's, so a bound changed after the
-launch is refused) and the hash of a host that sets none is unchanged. No gatedtrain environment variable sets them
-(`GATEDTRAIN_GPU_CAP_H` is the wrapper's own variable, which `gpu_cap_h` is printed into).
+launch is refused) and the hash of a host that sets none is unchanged. The two numbers are owner-side: no gatedtrain
+environment variable or flag sets them (`GATEDTRAIN_GPU_CAP_H` is the wrapper's own variable, which `gpu_cap_h` is
+printed into), and they are bounded. The tops (1024 GB is about 3.5 times the memory of the largest single accelerator
+of 2026; 100000 GPU hours is more than an 8-GPU node can burn in a year) are fixed trust values, not settings: a larger
+value would make the check mean nothing, so the file is refused.
+
+**Downgrading.** gatedtrain 0.7.0 refuses a host file that holds any key new in 0.7.1 (it names the keys it knows).
+Remove the new keys before going back to 0.7.0.
 
 **Deprecated environment variables.** `GATEDTRAIN_EXT_HOST_WORK`, `_OUTPUT_ROOT`, `_INPUT_ROOTS`, `_INTERPRETER_TREES`,
-`_INTERPRETER` and `_MIRROR_ROOT` still override the file, because tests and some hosts rely on them, and each one that is
-set prints a deprecation line on stderr naming the file key that replaces it. They are removed in 0.9.0. A pack's own
-runtime variable (for example `GATEDTRAIN_PACK_TEXT_GSM8K_RUNTIME`) is the same kind of workaround for the
-`[packs.<name>] runtime_dir` key.
+`_INTERPRETER` and `_MIRROR_ROOT` are still read, because tests and some hosts rely on them, and each one that is set
+prints a deprecation line on stderr naming the file key that replaces it; every `ext-*` command prints them. They are
+removed in 0.9.0. A pack's own runtime variable (for example `GATEDTRAIN_PACK_TEXT_GSM8K_RUNTIME`) is the same kind of
+workaround for the `[packs.<name>] runtime_dir` key, and is removed in 0.9.0 too.
+
+A variable never outranks the owner's file: for `input_roots`, `interpreter_trees`, `interpreter`, `mirror_root` and a
+pack's `runtime_dir`, a variable and a file key set to different values is refused (EXT-HOST), naming the key, the
+variable and the fix (remove one of them). Equal values, or either alone, work. `GATEDTRAIN_EXT_HOST_WORK` and
+`GATEDTRAIN_EXT_OUTPUT_ROOT` keep overriding the file, as they did in 0.7.0.
 
 **A pack in the keeper's process.** A pack's rows module reads the host file when it is imported (`runtime_dir`). In the
 keeper's process that is the keeper user's own home, not yours, and a malformed file there degrades to the package default
