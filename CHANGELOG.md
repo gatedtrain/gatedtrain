@@ -4,9 +4,9 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
-## Changes in 0.7.1 (Unreleased)
+## Changes in 0.7.1
 
-Not released yet; on top of 0.7.0. Design revision 28.
+On top of 0.7.0. Implements design revision 28 (tag `rev-28` of gatedtrain-design).
 
 Owner-side settings (the audit's open items; defaults and every recorded hash unchanged):
 
