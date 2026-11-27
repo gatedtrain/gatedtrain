@@ -12,7 +12,8 @@ version supports it, and the line of documentation `gatedtrain setup layout` pri
 `setup host` or `setup keeper` means adding a row (or an entry in `NOT_LAYOUT_FLAGS` with the reason); a test compares
 the registry with both commands' argparse flags in both directions, so a flag cannot be forgotten.
 
-A *scope* is what a layout is read for: `host` (`setup host`), `separate-user` or `same-user` (`setup keeper --mode`).
+A *scope* is what a layout is read for: `host` (`setup host`), `separate-user` or `same-user` (`setup keeper --mode`), or
+`eval-tree` (`setup eval-tree`, AN-36).
 Tables that do not apply to the scope are refused with the scope named.
 """
 
@@ -29,7 +30,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from ..errors import Problem, Refused
-from . import hostsetup
+from . import evaltree, hostsetup
 from .keeper import protocol, setup, setup_user
 
 RULE = "AN-34"
@@ -40,12 +41,12 @@ MAX_LAYOUT_BYTES = 64 * 1024
 UNSUPPORTED = "not supported by this version (the keeper has no such option yet)"
 SOURCES = ("flag", "layout", "default")
 
-HOST, SEPARATE, SAME = "host", "separate-user", "same-user"
-SCOPES = (HOST, SEPARATE, SAME)
+HOST, SEPARATE, SAME, EVAL = "host", "separate-user", "same-user", "eval-tree"
+SCOPES = (HOST, SEPARATE, SAME, EVAL)
 SCOPE_LABEL = {HOST: "`setup host`", SEPARATE: "`setup keeper --mode separate-user`",
-               SAME: "`setup keeper --mode same-user`"}
+               SAME: "`setup keeper --mode same-user`", EVAL: "`setup eval-tree`"}
 
-TABLES = ("keeper", "same_user", "host", "inference", "gpu")
+TABLES = ("keeper", "same_user", "host", "inference", "gpu", "eval_tree")
 # Why a flag of `setup host` or `setup keeper` has no layout key (the registry test requires every other flag to have
 # one). `--layout` itself is the file.
 NOT_LAYOUT_FLAGS: dict[tuple[str, str], str] = {
@@ -54,6 +55,10 @@ NOT_LAYOUT_FLAGS: dict[tuple[str, str], str] = {
     ("host", "--owner"): "who runs the setup is a fact of this invocation, not of the machine's layout",
     ("host", "--owner-uid"): "who runs the setup is a fact of this invocation, not of the machine's layout",
     ("keeper", "--owner-uid"): "who the keeper serves is a fact of this invocation, not of the machine's layout",
+    ("eval-tree", "--layout"): "names the layout file itself",
+    ("eval-tree", "--python-version"): "the CPython the pack's eval lock names; a fact of the pack, given per invocation",
+    ("eval-tree", "--check"): "a switch for this one run (a read-only check of a built tree)",
+    ("eval-tree", "--executable"): "the gatedtrain command of this environment, a fact of this invocation",
     ("host", "--confirm-group-removal"): "a switch for this one run",
     ("keeper", "--mode"): "chooses which tables of the layout apply",
     ("keeper", "--packages"): "the packs to install are decided when the command runs (default: those installed)",
@@ -64,7 +69,7 @@ NOT_LAYOUT_FLAGS: dict[tuple[str, str], str] = {
 
 
 def _scope_command(scope: str) -> str:
-    return "host" if scope == HOST else "keeper"
+    return {HOST: "host", EVAL: "eval-tree"}.get(scope, "keeper")
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,10 @@ def _same_user_socket(value: str, scope: str) -> None:
     if len(value.encode()) > protocol.MAX_SOCKET_PATH:
         raise setup._refuse("socket", f"the socket path is longer than {protocol.MAX_SOCKET_PATH} bytes",
                             "use a shorter path")
+
+
+def _eval_root(value: str, scope: str) -> None:
+    evaltree.check_root(value, "root")
 
 
 def _same_user_executable(value: str, scope: str) -> None:
@@ -188,14 +197,17 @@ LAYOUT_KEYS: tuple[Key, ...] = (
     Key("inference", "image", "str", _image, {HOST: "--inference-image"},
         "the inference base image, pinned by digest, the keeper's daemon pulls",
         placeholder='"NAME@sha256:<64 hex>"'),
-    Key("inference", "eval_requirements", "str", _file, {HOST: "--eval-requirements"},
-        "absolute path of the hash-pinned requirements of the keeper's eval venv (needs eval_python)",
+    Key("eval_tree", "root", "str", _eval_root, {EVAL: "--root"},
+        "the directory the user-owned eval tree is built in, for a same-user keeper (default: beside the keeper's "
+        "state directory under your XDG data directory)", computed="eval_root"),
+    Key("inference", "eval_requirements", "str", _file, {HOST: "--eval-requirements", EVAL: "--requirements"},
+        "absolute path of the hash-pinned requirements of the keeper's eval venv (`setup host`: needs eval_python)",
         placeholder='"FILE"'),
     Key("inference", "eval_python", "str", _path, {HOST: "--eval-python"},
         "the interpreter the eval venv is created from, under eval_python_root (needs eval_requirements)",
         placeholder='"PATH"'),
     Key("inference", "eval_trees", "list", _tree, {SEPARATE: "--eval-tree", SAME: "--eval-tree"},
-        "root-owned eval trees printed into ExecStart= (the flag needs --inference-image)",
+        "eval trees printed into ExecStart=, owned by the keeper's uid or root (the flag needs --inference-image)",
         placeholder='["DIR"]'),
     Key("inference", "keeper_eval_python", "str", _keeper_eval_python, {SEPARATE: "--eval-python", SAME: "--eval-python"},
         "the eval venv's python that replaces the one a pack declares (keeper serve option; needs image)",
@@ -335,7 +347,9 @@ def load(path: str, scope: str) -> Layout:
 
 def _computed_defaults(env: Mapping[str, str] | None, uid: int | None, home: str | None) -> dict[str, str]:
     paths = setup_user.default_paths(os.getuid() if uid is None else uid, os.environ if env is None else env, home)
-    return {"state": paths["state"], "socket": paths["socket"]}
+    return {"state": paths["state"], "socket": paths["socket"],
+            "eval_root": evaltree.default_root(os.environ if env is None else env, home,
+                                               os.getuid() if uid is None else uid)}
 
 
 def effective_layout(scope: str, *, flags: Mapping[str, Any] | None = None, layout: Layout | None = None,

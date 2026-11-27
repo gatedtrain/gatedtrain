@@ -77,20 +77,24 @@ def check_inference_ref(ref: object) -> None:
                       "(<name>@sha256:<64 hex>)", "pass the public CUDA base image as <name>@sha256:<digest>")
 
 
-def _requirements(data: bytes) -> str:
+def requirements_text(data: bytes, field: str = "--eval-requirements", rule: str = RULE) -> str:
     """The requirements text, refused unless every requirement carries `--hash=sha256:` (pip `--require-hashes`
-    needs one for each; PyPI's hashes are the integrity anchor, design 5.8.1)."""
+    needs one for each; PyPI's hashes are the integrity anchor, design 5.8.1). The one validator of `setup host`
+    (AN-20) and `setup eval-tree` (AN-36); `field` and `rule` name the caller in a refusal."""
+    def refuse(message: str, fix: str) -> Refused:
+        return setup._refuse(field, message, fix, rule)
+
     fix = ("export the pack's lock with hashes: `uv export --format requirements-txt --no-emit-project` (every "
            "requirement pinned with --hash=sha256:)")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        raise _refuse("--eval-requirements", "the requirements file is not UTF-8 text", fix) from None
+        raise refuse("the requirements file is not UTF-8 text", fix) from None
     if _CONTROL.search(text):
-        raise _refuse("--eval-requirements", "the requirements file holds a control character", fix)
+        raise refuse("the requirements file holds a control character", fix)
     if REQUIREMENTS_EOF in text.splitlines():
-        raise _refuse("--eval-requirements", f"a line of the requirements file is {REQUIREMENTS_EOF}, the end marker "
-                      "of the script's here-document", fix)
+        raise refuse(f"a line of the requirements file is {REQUIREMENTS_EOF}, the end marker "
+                     "of the script's here-document", fix)
     logical, count = "", 0
     for line in (text + "\n").splitlines():
         if line.rstrip().endswith("\\"):
@@ -101,15 +105,18 @@ def _requirements(data: bytes) -> str:
         if not req:
             continue
         if req.startswith("-"):
-            raise _refuse("--eval-requirements", f"the requirements file holds an option line ({req.split()[0]})",
-                          fix)
+            raise refuse(f"the requirements file holds an option line ({req.split()[0]})", fix)
         if not _HASH.search(req):
-            raise _refuse("--eval-requirements", f"the requirement {req.split()[0]!r} is not pinned with "
-                          "--hash=sha256:", fix)
+            raise refuse(f"the requirement {req.split()[0]!r} is not pinned with --hash=sha256:", fix)
         count += 1
     if logical or not count:
-        raise _refuse("--eval-requirements", "the requirements file is empty or ends in a line continuation", fix)
+        raise refuse("the requirements file is empty or ends in a line continuation", fix)
     return text if text.endswith("\n") else text + "\n"
+
+
+def _requirements(data: bytes) -> str:
+    """`requirements_text` as `setup host` calls it (AN-20, `--eval-requirements`)."""
+    return requirements_text(data)
 
 
 def host_script(*, owner: str, owner_uid: int, keeper_user: str = setup.DEFAULT_USER,

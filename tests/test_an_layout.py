@@ -258,7 +258,7 @@ class ModeTest(Base):                                                   # AN-34
                     self.assertTrue(any(word in x for x in lines), lines)
         self.assertTrue(any("[gpu]" in x and "does not apply" in x for x in self.refused(good, layout.HOST)))
         for scope in layout.SCOPES:
-            if scope != layout.HOST:
+            if scope not in (layout.HOST, layout.EVAL):                      # `setup eval-tree` has no GPU table
                 text = layout.render(scope, env={"HOME": str(self.tmp / "h")}, uid=4321)
                 self.assertNotIn("reserved", text)
                 self.assertIn("# wait_s = N", text)

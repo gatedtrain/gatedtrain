@@ -20,7 +20,7 @@ def add_layout_option(parser: argparse.ArgumentParser) -> None:
 def add_parser(ss) -> None:
     c = ss.add_parser("layout", help="print a complete, commented layout file showing the effective defaults "
                                      "(AN-34); writes nothing")
-    c.add_argument("--for", dest="for_command", choices=("host", "keeper"), default="keeper",
+    c.add_argument("--for", dest="for_command", choices=("host", "keeper", "eval-tree"), default="keeper",
                    help="the command the layout is for (default: keeper)")
     c.add_argument("--mode", choices=(layout.SAME, layout.SEPARATE), default=None,
                    help="with --for keeper: the keeper mode (default: same-user, as `setup keeper`)")
@@ -35,6 +35,11 @@ def cmd_setup_layout(args) -> int:
             return _krefuse(args, [Problem(layout.RULE, "--mode", "--mode applies to --for keeper; `setup host` has "
                                            "no mode", "drop --mode, or use --for keeper")])
         scope = layout.HOST
+    elif args.for_command == "eval-tree":
+        if args.mode is not None:
+            return _krefuse(args, [Problem(layout.RULE, "--mode", "--mode applies to --for keeper; `setup eval-tree` "
+                                           "has no mode", "drop --mode, or use --for keeper")])
+        scope = layout.EVAL
     else:
         scope = args.mode or layout.SAME
     try:

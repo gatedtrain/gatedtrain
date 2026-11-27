@@ -973,6 +973,50 @@ def _cmd_setup_keeper_same_user(args, owner: int, lay, warnings: list[str]) -> i
     return _kfinish(args, {**out, **({"layout": lay.info} if lay.info else {})}, human, warnings=warnings)
 
 
+def cmd_setup_eval_tree(args) -> int:
+    """AN-36: print the user-level script that builds a same-user keeper's eval tree (runs and writes nothing), or with
+    `--check` verify a built tree (read-only)."""
+    import os
+
+    from .ainative import evaltree, layout
+    from .ainative.keeper import setup_user
+
+    RULE = evaltree.RULE
+    try:
+        setup_user.refuse_empty(root=args.root, executable=args.executable)
+        lay = layout.resolve(layout.EVAL, args, args.layout)         # AN-34: flag > layout file > default
+        root = lay.values["root"]
+        uid = os.getuid()
+        if args.check:
+            out = evaltree.check(root if root is not None else evaltree.default_root(os.environ, None, uid))
+            return _kfinish(args, out, f"eval tree ok as uid {out['checked_as_uid']}: {', '.join(out['trees'])}\n"
+                                           f"applies to {out['applies_to']}\n")
+        missing = [(flag, fix) for flag, value, fix in (
+            ("--requirements", lay.values["eval_requirements"], "pass the pack's hash-pinned eval-requirements.txt "
+             "(in the installed package; the pack's README names it)"),
+            ("--python-version", args.python_version, "pass the CPython version the pack's eval lock names, such as "
+             "3.12")) if value is None]
+        if missing:
+            raise Refused([Problem(RULE, flag, f"{flag} is required to print the build script", fix)
+                           for flag, fix in missing])
+        try:
+            requirements = Path(lay.values["eval_requirements"]).read_bytes()
+        except OSError as exc:
+            raise Refused([Problem(RULE, "--requirements", f"the requirements file cannot be read "
+                                   f"({type(exc).__name__})", "pass a readable requirements file")]) from None
+        exe = args.executable if args.executable is not None else setup_user.keeper_executable()
+        if exe is None:
+            raise setup_user._no_executable()
+        out = evaltree.eval_tree_script(requirements=requirements, python_version=args.python_version, root=root,
+                                        env=os.environ, home=None, owner_uid=uid, executable=exe)
+    except Refused as exc:
+        return _krefuse(args, exc.problems)
+    if lay.info:                                   # the header goes after the shebang
+        first, _, rest = out["script"].partition("\n")
+        out = {**out, "script": first + "\n" + "".join(h + "\n" for h in lay.header) + rest, "layout": lay.info}
+    return _kfinish(args, out, printable(out["script"], keep="\n\t"))
+
+
 def cmd_setup_host(args) -> int:
     """AN-20: print the root script that sets up rootless Docker for the owner and the keeper; run and write
     nothing. Plain mode prints the script only, so stdout is the file."""
@@ -1105,7 +1149,7 @@ def _add_keeper(sub) -> None:
     c.add_argument("--inference-ref", metavar="REF",
                    help="the reference (pinned by digest) the daemon holds the image under (default: the ID)")
     c.add_argument("--eval-tree", action="append", metavar="DIR",
-                   help="a root-owned tree mounted read-only at its own path into the container (repeatable)")
+                   help="a tree mounted read-only at its own path into the container, owned by the keeper uid or root and writable by no one else (repeatable)")
     c.add_argument("--docker-host", metavar="URL",
                    help="the keeper's rootless daemon (default unix:///run/user/<keeper uid>/docker.sock)")
     c.add_argument("--docker", metavar="PATH", help="the Docker CLI's absolute path (default /usr/bin/docker)")
@@ -1149,7 +1193,8 @@ def _add_keeper(sub) -> None:
     c.add_argument("--inference-image", metavar="ID",
                    help="the inference image ID (sha256:<64 hex>) printed into ExecStart= (AN-25)")
     c.add_argument("--eval-tree", action="append", metavar="DIR",
-                   help="a root-owned eval tree printed into ExecStart= (repeatable; needs --inference-image)")
+                   help="an eval tree printed into ExecStart=: owned by the keeper's uid or root, writable by no one else "
+                        "(repeatable; needs --inference-image)")
     c.add_argument("--docker-host", metavar="URL",
                    help="the keeper's rootless daemon printed into ExecStart= (needs --inference-image)")
     _add_keeper_gpu_options(c, "printed into ExecStart= (needs --inference-image)")
@@ -1186,6 +1231,25 @@ def _add_keeper(sub) -> None:
     c.add_argument("--confirm-group-removal", action="store_true",
                    help="pause before removing you from the docker group")
     c.set_defaults(func=cmd_setup_host)
+
+    c = ss.add_parser("eval-tree", help="print the user-level script that builds a same-user keeper's eval tree "
+                                        "(AN-36), or --check a built one; runs nothing",
+                       description="Prints a script you run as yourself (no sudo) that builds the eval tree a "
+                                   "same-user keeper mounts for a pack's batch generator. Same-user keeper only: a "
+                                   "separate-user keeper refuses a tree you own (use `setup host` for that).")
+    c.add_argument("--requirements", metavar="FILE",
+                   help="the pack's hash-pinned eval requirements (eval-requirements.txt in the installed package)")
+    c.add_argument("--python-version", metavar="X.Y",
+                   help="the CPython version the pack's eval lock names, such as 3.12; uv installs it")
+    cli_layout.add_layout_option(c)
+    c.add_argument("--root", metavar="DIR",
+                   help="where the tree is built (default: beside the keeper's state directory under your XDG data "
+                        "directory); same-user keeper only: a separate-user keeper refuses a tree you own")
+    c.add_argument("--executable", metavar="PATH",
+                   help="the gatedtrain command the script's final check runs (default: the one next to this Python)")
+    c.add_argument("--check", action="store_true",
+                   help="read-only: verify the tree under --root with the keeper's own rule (AN-13) and exit")
+    c.set_defaults(func=cmd_setup_eval_tree)
 
     from . import cli_setup_check
 
