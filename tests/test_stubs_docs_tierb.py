@@ -33,7 +33,7 @@ class TestStubModulesMarked(unittest.TestCase):
     def test_version(self):
         import gatedtrain
 
-        self.assertEqual(gatedtrain.__version__, "0.7.1")
+        self.assertEqual(gatedtrain.__version__, "0.7.2")
 
 
 class TestDocs(unittest.TestCase):
