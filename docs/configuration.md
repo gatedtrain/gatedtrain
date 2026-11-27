@@ -105,7 +105,7 @@ can pass one TOML file, `--layout FILE`. It is **printed input**: gatedtrain rea
 its values, and writes nothing; the keeper never reads it, and nothing finds it for you (there is no default location
 and no environment variable; the owner names the file on every run).
 
-`gatedtrain setup layout [--for host|keeper] [--mode same-user|separate-user]` prints a complete, commented, valid
+`gatedtrain setup layout [--for host|keeper|eval-tree] [--mode same-user|separate-user]` prints a complete, commented, valid
 layout with the effective defaults. `--for keeper` is the default and `--mode` defaults to `same-user`, as in `setup
 keeper`.
 
@@ -120,7 +120,7 @@ layout). Unknown tables and keys, a wrong type, an invalid TOML file, a symlink 
 64 KiB are refused (rule AN-34); every problem found in the document is reported at once. Values pass the same checks
 as the flags (a path or value with a non-printable character is refused, and so is TOML nested too deeply to read). A table that does not apply to the command or mode is refused with the mode named: `[keeper]` is for
 `setup host` and `setup keeper --mode separate-user`; `[same_user]` is for `setup keeper --mode same-user`; `[host]`
-is for `setup host`. Defaults are the built-in ones of each command (`gatedtrain setup layout` shows them; the
+is for `setup host`; `[eval_tree]` is for `setup eval-tree`. Defaults are the built-in ones of each command (`gatedtrain setup layout` shows them; the
 same-user ones come from your XDG directories).
 
 | Table | Key | Replaces | Applies to | Default |
@@ -133,6 +133,8 @@ same-user ones come from your XDG directories).
 | `[host]` | `eval_python_root` | none (layout only) | host | built-in; the root-owned tree the eval interpreter must be under |
 | `[inference]` | `image` | `--inference-image` | host | none; a reference pinned by digest (`name@sha256:...`) |
 | `[inference]` | `eval_requirements`, `eval_python` | the flag of the same name | host | none; `eval_requirements` is an absolute path |
+| `[inference]` | `eval_requirements` | `--requirements` | eval-tree | none; an absolute path |
+| `[eval_tree]` | `root` | `--root` | eval-tree | `gatedtrain-keeper-eval` beside the keeper's state directory, under your XDG data directory |
 | `[inference]` | `eval_trees` (list) | `--eval-tree` | separate-user, same-user | none |
 | `[gpu]` | `wait_s`, `busy_mib` | `--gpu-wait-s`, `--gpu-busy-mib` | separate-user, same-user | none (the keeper's 900 s and 1024 MiB); they need the inference image, as the flags do |
 | `[inference]` | `keeper_eval_python` | `--eval-python` of `setup keeper` | separate-user, same-user | none; an absolute path of the eval venv's python |

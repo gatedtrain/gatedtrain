@@ -88,6 +88,28 @@ container of the keeper's own rootless Docker, in same-user mode as well. Run `g
 sha256:<64 hex>` (and see `gatedtrain setup check` for rootless Docker) to print a unit that starts the keeper with
 it; a keeper without one refuses a batch generator (AN-8). Per-item packs need none.
 
+**Packs with a batch generator also need an eval tree.** The text and VLM packs run their generator with the python of
+an eval venv that the keeper mounts read-only into its container. In same-user mode you build it yourself, without sudo
+(`gatedtrain setup host` builds the root-owned tree of a separate-user keeper and is not needed here):
+
+```sh
+gatedtrain setup eval-tree --requirements <pack>/eval-requirements.txt --python-version 3.12 > gatedtrain-eval-tree.sh
+sh gatedtrain-eval-tree.sh                        # after reading it; needs uv; changes only files under the eval root
+gatedtrain setup eval-tree --check                # read-only: the keeper's own rule, for the tree under the same root
+```
+
+The command prints a script and runs nothing. The script installs a standalone CPython with `uv`, creates the venv from
+the pack's hash-pinned requirements (binary wheels only), removes group and other write bits, and ends with `--check`
+and the `--eval-tree` and `--eval-python` options to add to the keeper's setup command, next to its
+`--inference-image`. The root
+is `gatedtrain-keeper-eval` beside the keeper's state directory (`--root DIR`, or `[eval_tree] root` in a layout file).
+A rerun with the same requirements and CPython version changes nothing; other ones, an interrupted build, or a root that
+holds other files stop it, and it never clears a directory (`rm -rf <root>` undoes it). The pack's README says which file and which CPython version.
+
+What this tree is: **yours**. Like the rest of a same-user keeper it is not sealed from your account (anything running as
+you can change it), and the keeper checks and hashes it at start only, so restart the keeper after changing it. A
+separate-user keeper refuses a tree you own (the check fails closed); it needs the root-owned tree from `setup host`.
+
 **Customising paths.** To change the state directory or the socket without flags, put them in a layout file
 (`gatedtrain setup layout > layout.toml`, edit, then `gatedtrain setup keeper --layout layout.toml`). The file is only
 printed into the commands; see [the setup layout file](configuration.md#the-setup-layout-file).

@@ -402,7 +402,10 @@ only). The owner and the keeper each run their own rootless Docker daemon, and t
 group, through which anything running as the owner could otherwise read the keeper's state.
 
 The host script and the group removal belong to the hardened [separate-user mode](#keeper-modes); a same-user keeper needs
-no root step, only the outside prerequisites that `gatedtrain setup check` names.
+no root step, only the outside prerequisites that `gatedtrain setup check` names. That includes the eval tree of a pack
+with a batch generator: `gatedtrain setup eval-tree` prints the user-level script that builds it
+([Quickstart without sudo](sudo-free-quickstart.md)); only a separate-user keeper needs the root-owned tree from
+`setup host --eval-requirements` (below).
 
 ```sh
 gatedtrain setup host [--inference-image REF@sha256:...] [--eval-requirements FILE --eval-python PATH] \

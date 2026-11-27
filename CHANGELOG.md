@@ -4,6 +4,30 @@ Release notes, newest first. Each release lists what is new and what changes for
 "Rules" line at the end of a release names the rules behind the changes; the [test reference](tests/README.md) maps
 each rule to its tests.
 
+## Changes in 0.7.2
+
+On top of 0.7.1. Additive: no signed text, schema or recorded hash changes, and `setup host` prints the same script.
+
+- **`gatedtrain setup eval-tree` (AN-36).** A pack with a batch generator (the text and VLM packs) needs an eval tree
+  mounted into the keeper's container, and the only builder was the root script of `setup host`. For a same-user keeper
+  the command prints a user-level script (no sudo; it needs `uv`) that installs a standalone CPython and builds the eval
+  venv from the pack's hash-pinned requirements under `gatedtrain-keeper-eval` beside the keeper's state directory
+  (`--root`, or the layout key `[eval_tree] root`). The requirements are validated by the code `setup host` uses. The
+  script never clears a directory and never adopts a root that holds other files (a symbolic link or a non-empty directory it did not make is refused), is idempotent (a record of the requirements' sha256 and the CPython version is written last; either one changing stops it), removes group
+  and other write bits (uv leaves a mode 0666 `.lock` file, which the keeper refuses), and ends with `setup eval-tree
+  --check`, a read-only check by the keeper's own rule (AN-13), run as your uid and saying so (it answers for a same-user keeper only), that lists at most 20 problems and counts the rest. The CPython comes from uv's download and is not pinned by gatedtrain; the keeper's start-time hash of the tree is what records it.
+- **What does not change.** The keeper's rule for an eval tree (owned by its uid or root, writable by no one else) is
+  the only authority and gets no new switch. A separate-user keeper refuses a tree you own at start, so the command
+  cannot weaken that mode. A user-owned tree is part of same-user mode: it is not sealed from your account and the
+  keeper checks and hashes it at start only. The default eval root is a sibling of the state directory, never inside it.
+- **Layout.** `setup layout --for eval-tree`; the new table `[eval_tree]` and the `--requirements` flag of the
+  existing `[inference] eval_requirements` key.
+- **Help text.** `--eval-tree` no longer calls the tree "root-owned": a same-user keeper's tree is owned by the user.
+- **Not done.** A sudo-free eval tree for a separate-user keeper (the keeper's tree must be owned by its uid or root).
+  Container images for the NeMo RL packs are not part of this release.
+
+Rules: AN-36 (new), AN-20 (the requirements validator is shared), AN-34 (a new scope).
+
 ## Changes in 0.7.1
 
 On top of 0.7.0. Implements design revision 28 (tag `rev-28` of gatedtrain-design).
